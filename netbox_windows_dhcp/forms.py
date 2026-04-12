@@ -7,7 +7,7 @@ from utilities.forms.fields import (
     DynamicModelMultipleChoiceField,
     TagFilterField,
 )
-from utilities.forms.rendering import FieldSet
+from utilities.forms.rendering import FieldSet, InlineFields
 
 from .models import (
     DHCPFailover,
@@ -164,10 +164,29 @@ class DHCPOptionValueFilterForm(NetBoxModelFilterSetForm):
 # DHCPScope
 # ---------------------------------------------------------------------------
 
+LEASE_LIFETIME_UNIT_CHOICES = [
+    ('seconds', 'Seconds'),
+    ('minutes', 'Minutes'),
+    ('hours',   'Hours'),
+    ('days',    'Days'),
+]
+
+LEASE_LIFETIME_UNIT_MULTIPLIERS = {
+    'seconds': 1,
+    'minutes': 60,
+    'hours':   3600,
+    'days':    86400,
+}
+
+
 class DHCPScopeForm(NetBoxModelForm):
     fieldsets = (
         FieldSet('name', 'prefix', name='Scope Identity'),
-        FieldSet('start_ip', 'end_ip', 'router', 'lease_lifetime', name='IP Range'),
+        FieldSet(
+            'start_ip', 'end_ip', 'router',
+            InlineFields('lease_lifetime_value', 'lease_lifetime_unit', label='Lease Lifetime'),
+            name='IP Range',
+        ),
         FieldSet('failover', 'option_values', name='DHCP Configuration'),
         FieldSet('tags', name='Tags'),
     )
@@ -186,6 +205,14 @@ class DHCPScopeForm(NetBoxModelForm):
         required=False,
         label='Option Values',
     )
+    lease_lifetime_value = forms.IntegerField(
+        min_value=1,
+        label='Lease Lifetime',
+    )
+    lease_lifetime_unit = forms.ChoiceField(
+        choices=LEASE_LIFETIME_UNIT_CHOICES,
+        label='Unit',
+    )
 
     class Meta:
         model = DHCPScope
@@ -195,11 +222,31 @@ class DHCPScopeForm(NetBoxModelForm):
             'start_ip',
             'end_ip',
             'router',
-            'lease_lifetime',
             'failover',
             'option_values',
             'tags',
         )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Pre-populate value+unit from the stored seconds when editing
+        if self.instance and self.instance.pk:
+            from .utils import decompose_lease_lifetime
+            value, unit = decompose_lease_lifetime(self.instance.lease_lifetime)
+            self.initial['lease_lifetime_value'] = value
+            self.initial['lease_lifetime_unit'] = unit
+        else:
+            self.initial.setdefault('lease_lifetime_value', 1)
+            self.initial.setdefault('lease_lifetime_unit', 'days')
+
+    def clean(self):
+        cleaned = super().clean()
+        value = cleaned.get('lease_lifetime_value')
+        unit = cleaned.get('lease_lifetime_unit', 'seconds')
+        if value is not None:
+            multiplier = LEASE_LIFETIME_UNIT_MULTIPLIERS.get(unit, 1)
+            self.instance.lease_lifetime = value * multiplier
+        return cleaned
 
 
 class DHCPScopeFilterForm(NetBoxModelFilterSetForm):
@@ -215,7 +262,12 @@ class DHCPScopeBulkEditForm(NetBoxModelBulkEditForm):
     model = DHCPScope
 
     fieldsets = (
-        FieldSet('router', 'lease_lifetime', 'failover', name='Scope'),
+        FieldSet(
+            'router',
+            InlineFields('lease_lifetime_value', 'lease_lifetime_unit', label='Lease Lifetime'),
+            'failover',
+            name='Scope',
+        ),
         FieldSet('add_option_values', 'remove_option_values', name='Option Values'),
     )
 
@@ -223,11 +275,33 @@ class DHCPScopeBulkEditForm(NetBoxModelBulkEditForm):
         required=False,
         label='Router (Option 3)',
     )
-    lease_lifetime = forms.IntegerField(
+    lease_lifetime_value = forms.IntegerField(
         required=False,
         min_value=1,
-        label='Lease Lifetime (s)',
+        label='Lease Lifetime',
     )
+    lease_lifetime_unit = forms.ChoiceField(
+        choices=[('', '--------')] + LEASE_LIFETIME_UNIT_CHOICES,
+        required=False,
+        label='Unit',
+    )
+    # Hidden field — computed in clean() so BulkEditView can apply it to each object
+    lease_lifetime = forms.IntegerField(
+        required=False,
+        widget=forms.HiddenInput(),
+    )
+
+    def clean(self):
+        cleaned = super().clean()
+        value = cleaned.get('lease_lifetime_value')
+        unit = cleaned.get('lease_lifetime_unit')
+        if value and unit:
+            multiplier = LEASE_LIFETIME_UNIT_MULTIPLIERS.get(unit, 1)
+            cleaned['lease_lifetime'] = value * multiplier
+        else:
+            # Neither provided — don't touch lease_lifetime on any object
+            cleaned.pop('lease_lifetime', None)
+        return cleaned
     failover = DynamicModelChoiceField(
         queryset=DHCPFailover.objects.all(),
         required=False,

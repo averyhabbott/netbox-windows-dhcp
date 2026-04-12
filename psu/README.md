@@ -12,13 +12,14 @@ PowerShell Universal endpoint definitions for the `netbox-windows-dhcp` plugin.
 
 ### Step 1 — Add the script to PSU
 
-In the PowerShell Universal admin UI:
+The recommended approach is to place `dhcp_api_endpoints.ps1` in your PSU Git repository so it is version-controlled and automatically picked up on sync.
+
+Alternatively, in the PowerShell Universal admin UI:
 
 1. Go to **APIs → Scripts**
-2. Create a new script, or place `dhcp_api_endpoints.ps1` directly in your PSU repository folder
-3. Paste or import the contents of `dhcp_api_endpoints.ps1`
+2. Create a new script and paste in the contents of `dhcp_api_endpoints.ps1`
 
-Alternatively, if using a PSU Git repository, commit `dhcp_api_endpoints.ps1` to the repository root and PSU will pick it up on the next sync.
+PSU will register all endpoints defined in the script on the next restart or reload.
 
 ### Step 2 — Configure Authentication (recommended)
 
@@ -26,10 +27,10 @@ PSU v5 uses JWT App Tokens for authentication.
 
 1. In the PSU admin console, go to **Security → App Tokens** and generate a new token
 2. Copy the token value
-3. In NetBox, edit the **DHCP Server** object and paste the token in the **App Token** field
+3. In NetBox, edit the **DHCP Server** object and paste the token into the **App Token** field
 4. Add `-Authentication` to each `New-PSUEndpoint` call in the script to enforce the token
 
-Without `-Authentication`, the endpoints are unauthenticated and accessible to anyone who can reach the server.
+Without `-Authentication`, the endpoints are unauthenticated and accessible to anyone who can reach the PSU server.
 
 The plugin sends the token as:
 
@@ -52,7 +53,7 @@ Invoke-RestMethod -Uri "$base/scopes" -Headers $headers | ConvertTo-Json -Depth 
 Invoke-RestMethod -Uri "$base/leases?scope_id=10.0.1.0" -Headers $headers | ConvertTo-Json -Depth 4
 ```
 
-Or trigger **Sync Now** from the plugin's Server detail page in NetBox.
+Or trigger **Sync Now** from the plugin's Server detail page in NetBox and view the job log.
 
 ## Script Architecture
 
@@ -61,7 +62,7 @@ PSU v5 runs each endpoint in an isolated runspace, so functions defined in one e
 Shared helpers defined in `$H`:
 
 - `ConvertTo-ScopeObject` — maps a DHCP scope CIM object to the API response shape
-- `ConvertTo-LeaseObject` — maps a lease CIM object
+- `ConvertTo-LeaseObject` — maps a lease CIM object; only returns leases with `address_state` of `Active` or `ActiveReservation`
 - `ConvertTo-ReservationObject` — maps a reservation CIM object
 - `ConvertTo-FailoverObject` — maps a failover CIM object; resolves the local server's FQDN for `primary_server`
 - `ConvertTo-OptionValueObject` — maps a DHCP option value CIM object
@@ -69,6 +70,8 @@ Shared helpers defined in `$H`:
 - `Write-ApiError` — returns a JSON error response with a given HTTP status code
 
 All list endpoints use `ConvertTo-Json -InputObject $result` (not `$result | ConvertTo-Json`) to prevent PowerShell's pipeline from unwrapping single-element arrays into bare objects.
+
+URL path parameters (`:param`) and the `$Body` variable are injected automatically by PSU — no `param()` declaration is required inside endpoint scriptblocks.
 
 ## Endpoint Reference
 
@@ -107,7 +110,7 @@ All list endpoints use `ConvertTo-Json -InputObject $result` (not `$result | Con
 }
 ```
 
-`router` is read from DHCP Option 3 on the scope and is `null` if not set. `failover_name` is `null` if the scope is not part of a failover relationship.
+`router` is read from DHCP Option 3 on the scope; `null` if not set. `failover_name` is `null` if the scope is not part of a failover relationship.
 
 ### Lease
 
@@ -175,4 +178,4 @@ Only leases with `address_state` of `Active` or `ActiveReservation` are returned
 - **`client_id`** uses Windows DHCP hyphen-separated hex format: `00-11-22-33-44-55`. The `POST /reservations` endpoint normalises any MAC format to this convention automatically.
 - **Failover creation** (`POST /api/dhcp/failover`) must be run against the **primary** server. The `Add-DhcpServerv4Failover` cmdlet contacts the secondary server directly from the primary.
 - **Option 3 (Router)** is not returned in scope-level option value responses — it is included directly in the scope object as `router`. The NetBox plugin stores it on the Scope's `router` field and skips it during option value import.
-- **Option 51 (Lease Time)** is also skipped during import — it is stored on the Scope's `lease_lifetime` field.
+- **Option 51 (Lease Time)** is also skipped during option value import — it is stored on the Scope's `lease_lifetime` field (in seconds) and displayed in the NetBox UI as the most readable exact unit (e.g. `3 Days`, `73 Hours`).

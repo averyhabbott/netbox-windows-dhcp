@@ -292,8 +292,8 @@ class DHCPScope(NetBoxModel):
     )
     lease_lifetime = models.PositiveIntegerField(
         default=86400,
-        verbose_name='Lease Lifetime (s)',
-        help_text='Lease duration in seconds (default 86400 = 1 day)',
+        verbose_name='Lease Lifetime',
+        help_text='Lease duration in seconds',
     )
     failover = models.ForeignKey(
         DHCPFailover,
@@ -320,6 +320,11 @@ class DHCPScope(NetBoxModel):
 
     def get_absolute_url(self):
         return reverse('plugins:netbox_windows_dhcp:dhcpscope', args=[self.pk])
+
+    @property
+    def lease_lifetime_display(self) -> str:
+        from .utils import lease_lifetime_display
+        return lease_lifetime_display(self.lease_lifetime)
 
     def clean(self):
         super().clean()

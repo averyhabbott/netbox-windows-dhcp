@@ -97,7 +97,11 @@ class DHCPScopeTable(NetBoxTable):
     end_ip = tables.Column(verbose_name='End IP')
     router = tables.Column(verbose_name='Router')
     failover = tables.Column(linkify=True)
-    lease_lifetime = tables.Column(verbose_name='Lease Life (s)')
+    lease_lifetime = tables.Column(verbose_name='Lease Life')
+
+    def render_lease_lifetime(self, value):
+        from .utils import lease_lifetime_display
+        return lease_lifetime_display(value)
     tags = TagColumn(url_name='plugins:netbox_windows_dhcp:dhcpscope_list')
 
     class Meta(NetBoxTable.Meta):
