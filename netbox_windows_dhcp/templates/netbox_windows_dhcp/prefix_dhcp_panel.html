@@ -1,0 +1,49 @@
+{% load helpers %}
+<div class="card mb-3">
+  <h5 class="card-header d-flex justify-content-between align-items-center">
+    <span><i class="mdi mdi-server-network me-1"></i> DHCP Scopes</span>
+    <a href="{% url 'plugins:netbox_windows_dhcp:dhcpscope_add' %}?prefix={{ object.pk }}"
+       class="btn btn-sm btn-primary"
+       title="Add DHCP Scope">
+      <i class="mdi mdi-plus-thick"></i>
+    </a>
+  </h5>
+  <div class="card-body p-0">
+    {% if dhcp_scopes %}
+    <table class="table table-hover mb-0">
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Range</th>
+          <th>Router</th>
+          <th>Failover</th>
+          <th>Lease (s)</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for scope in dhcp_scopes %}
+        <tr>
+          <td><a href="{{ scope.get_absolute_url }}">{{ scope.name }}</a></td>
+          <td><code>{{ scope.start_ip }} – {{ scope.end_ip }}</code></td>
+          <td>{% if scope.router %}<code>{{ scope.router }}</code>{% else %}<span class="text-muted">—</span>{% endif %}</td>
+          <td>{% if scope.failover %}<a href="{{ scope.failover.get_absolute_url }}">{{ scope.failover }}</a>{% else %}<span class="text-muted">—</span>{% endif %}</td>
+          <td>{{ scope.lease_lifetime }}</td>
+          <td class="text-end">
+            <a href="{{ scope.get_absolute_url }}" class="btn btn-sm btn-outline-secondary" title="View">
+              <i class="mdi mdi-eye"></i>
+            </a>
+            <a href="{% url 'plugins:netbox_windows_dhcp:dhcpscope_edit' scope.pk %}"
+               class="btn btn-sm btn-outline-warning" title="Edit">
+              <i class="mdi mdi-pencil"></i>
+            </a>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="p-3 text-muted">No DHCP scopes are associated with this prefix.</div>
+    {% endif %}
+  </div>
+</div>

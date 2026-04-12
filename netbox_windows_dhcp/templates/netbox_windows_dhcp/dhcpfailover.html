@@ -1,0 +1,64 @@
+{% extends 'generic/object.html' %}
+{% load helpers %}
+
+{% block content %}
+<div class="row mb-3">
+  <div class="col col-md-6">
+    <div class="card">
+      <h5 class="card-header">Failover Relationship</h5>
+      <div class="card-body">
+        <table class="table table-hover attr-table">
+          <tr>
+            <th scope="row">Name</th>
+            <td>{{ object.name }}</td>
+          </tr>
+          <tr>
+            <th scope="row">Primary Server</th>
+            <td><a href="{{ object.primary_server.get_absolute_url }}">{{ object.primary_server }}</a></td>
+          </tr>
+          <tr>
+            <th scope="row">Secondary Server</th>
+            <td><a href="{{ object.secondary_server.get_absolute_url }}">{{ object.secondary_server }}</a></td>
+          </tr>
+          <tr>
+            <th scope="row">Mode</th>
+            <td>{{ object.get_mode_display }}</td>
+          </tr>
+          <tr>
+            <th scope="row">Max Client Lead Time</th>
+            <td>{{ object.max_client_lead_time }}s</td>
+          </tr>
+          <tr>
+            <th scope="row">Max Response Delay</th>
+            <td>{{ object.max_response_delay }}s</td>
+          </tr>
+          <tr>
+            <th scope="row">State Switchover Interval</th>
+            <td>{% if object.state_switchover_interval %}{{ object.state_switchover_interval }}s{% else %}<span class="text-muted">Disabled</span>{% endif %}</td>
+          </tr>
+          <tr>
+            <th scope="row">Authentication</th>
+            <td>{% if object.enable_auth %}<span class="badge bg-success">Enabled</span>{% else %}<span class="badge bg-secondary">Disabled</span>{% endif %}</td>
+          </tr>
+        </table>
+      </div>
+    </div>
+    {% include 'inc/panels/tags.html' %}
+    {% include 'inc/panels/custom_fields.html' %}
+  </div>
+</div>
+
+{% if scope_table.rows %}
+<div class="row mb-3">
+  <div class="col">
+    <div class="card">
+      <h5 class="card-header">Associated Scopes</h5>
+      <div class="card-body">
+        {% include 'inc/table.html' with table=scope_table %}
+      </div>
+    </div>
+  </div>
+</div>
+{% endif %}
+
+{% endblock %}

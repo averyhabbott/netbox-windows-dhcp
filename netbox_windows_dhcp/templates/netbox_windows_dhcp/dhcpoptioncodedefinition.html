@@ -1,0 +1,56 @@
+{% extends 'generic/object.html' %}
+{% load helpers %}
+
+{% block content %}
+<div class="row mb-3">
+  <div class="col col-md-6">
+    <div class="card">
+      <h5 class="card-header">Option Code Definition</h5>
+      <div class="card-body">
+        <table class="table table-hover attr-table">
+          <tr>
+            <th scope="row">Code</th>
+            <td>{{ object.code }}</td>
+          </tr>
+          <tr>
+            <th scope="row">Name</th>
+            <td>{{ object.name }}</td>
+          </tr>
+          <tr>
+            <th scope="row">Data Type</th>
+            <td>{{ object.get_data_type_display }}</td>
+          </tr>
+          <tr>
+            <th scope="row">Description</th>
+            <td>{{ object.description|default:'—' }}</td>
+          </tr>
+          <tr>
+            <th scope="row">Vendor Class</th>
+            <td>{{ object.vendor_class|default:'—' }}</td>
+          </tr>
+          <tr>
+            <th scope="row">Built-in</th>
+            <td>{% if object.is_builtin %}<span class="badge bg-secondary">Yes</span>{% else %}<span class="badge bg-primary">No</span>{% endif %}</td>
+          </tr>
+        </table>
+      </div>
+    </div>
+    {% include 'inc/panels/tags.html' %}
+    {% include 'inc/panels/custom_fields.html' %}
+  </div>
+</div>
+
+{% if value_table.rows %}
+<div class="row mb-3">
+  <div class="col">
+    <div class="card">
+      <h5 class="card-header">Option Values Using This Definition</h5>
+      <div class="card-body">
+        {% include 'inc/table.html' with table=value_table %}
+      </div>
+    </div>
+  </div>
+</div>
+{% endif %}
+
+{% endblock %}

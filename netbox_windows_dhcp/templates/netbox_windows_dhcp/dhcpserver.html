@@ -1,0 +1,88 @@
+{% extends 'generic/object.html' %}
+{% load helpers %}
+
+{% block content %}
+<div class="row mb-3">
+  <div class="col col-md-6">
+    <div class="card">
+      <h5 class="card-header">DHCP Server</h5>
+      <div class="card-body">
+        <table class="table table-hover attr-table">
+          <tr>
+            <th scope="row">Name</th>
+            <td>{{ object.name }}</td>
+          </tr>
+          <tr>
+            <th scope="row">Hostname / IP</th>
+            <td>{{ object.hostname }}</td>
+          </tr>
+          <tr>
+            <th scope="row">Port</th>
+            <td>{{ object.port }}</td>
+          </tr>
+          <tr>
+            <th scope="row">Protocol</th>
+            <td>{% if object.use_https %}HTTPS{% else %}HTTP{% endif %}</td>
+          </tr>
+          <tr>
+            <th scope="row">API Key</th>
+            <td>{% if object.api_key %}<span class="text-muted">(configured)</span>{% else %}<span class="text-muted">None</span>{% endif %}</td>
+          </tr>
+          <tr>
+            <th scope="row">Base URL</th>
+            <td><code>{{ object.base_url }}</code></td>
+          </tr>
+        </table>
+      </div>
+    </div>
+    {% include 'inc/panels/tags.html' %}
+    {% include 'inc/panels/custom_fields.html' %}
+  </div>
+  <div class="col col-md-6">
+    <div class="card">
+      <h5 class="card-header">Actions</h5>
+      <div class="card-body">
+        <form method="post" action="{% url 'plugins:netbox_windows_dhcp:dhcpserver_sync' object.pk %}">
+          {% csrf_token %}
+          <button type="submit" class="btn btn-primary">
+            <i class="mdi mdi-sync"></i> Sync Now
+          </button>
+          <span class="text-muted ms-2">Immediately pull data from this server</span>
+        </form>
+        <hr>
+        <a href="{% url 'plugins:netbox_windows_dhcp:dhcpserver_import' object.pk %}" class="btn btn-warning">
+          <i class="mdi mdi-import"></i> Import from Server
+        </a>
+        <span class="text-muted ms-2">One-time import of scopes, failovers, and option values</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+{% if failover_table.rows %}
+<div class="row mb-3">
+  <div class="col">
+    <div class="card">
+      <h5 class="card-header">Failover Relationships</h5>
+      <div class="card-body">
+        {% include 'inc/table.html' with table=failover_table %}
+      </div>
+    </div>
+  </div>
+</div>
+{% endif %}
+
+{% if scope_table.rows %}
+<div class="row mb-3">
+  <div class="col">
+    <div class="card">
+      <h5 class="card-header">Associated Scopes</h5>
+      <div class="card-body">
+        {% include 'inc/table.html' with table=scope_table %}
+      </div>
+    </div>
+  </div>
+</div>
+{% endif %}
+
+{% endblock %}

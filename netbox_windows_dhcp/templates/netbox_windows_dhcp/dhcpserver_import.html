@@ -1,0 +1,131 @@
+{% extends 'generic/object.html' %}
+{% load helpers %}
+
+{% block content %}
+<div class="row mb-3">
+  <div class="col col-md-8">
+
+    {% if results is None %}
+    {# ── Confirmation form ── #}
+    <div class="card">
+      <h5 class="card-header">Import from {{ object.name }}</h5>
+      <div class="card-body">
+        <p>
+          This will connect to <strong>{{ object.hostname }}</strong> and perform a one-time import of:
+        </p>
+        <ul>
+          <li>Failover relationships (matched to existing DHCP Server objects by hostname)</li>
+          <li>Scopes (NetBox Prefixes will be created if they do not already exist)</li>
+          <li>Scope-level option values (unknown option codes will be created automatically)</li>
+        </ul>
+        <p class="text-muted">
+          Existing records are skipped — this import will not overwrite any data already in NetBox.
+        </p>
+        <form method="post">
+          {% csrf_token %}
+          <button type="submit" class="btn btn-warning">
+            <i class="mdi mdi-import"></i> Run Import
+          </button>
+          <a href="{{ object.get_absolute_url }}" class="btn btn-secondary ms-2">Cancel</a>
+        </form>
+      </div>
+    </div>
+
+    {% else %}
+    {# ── Results ── #}
+
+    {# Failovers #}
+    <div class="card mb-3">
+      <h5 class="card-header">
+        Failover Relationships
+        <span class="badge bg-success ms-2">{{ results.failovers.created|length }} created</span>
+        <span class="badge bg-secondary ms-1">{{ results.failovers.skipped|length }} skipped</span>
+        {% if results.failovers.errors %}<span class="badge bg-danger ms-1">{{ results.failovers.errors|length }} errors</span>{% endif %}
+      </h5>
+      <div class="card-body">
+        {% if results.failovers.created %}
+          <p class="text-success fw-semibold">Created:</p>
+          <ul>
+            {% for item in results.failovers.created %}<li>{{ item }}</li>{% endfor %}
+          </ul>
+        {% endif %}
+        {% if results.failovers.skipped %}
+          <p class="text-muted fw-semibold">Skipped (already exist):</p>
+          <ul class="text-muted">
+            {% for item in results.failovers.skipped %}<li>{{ item }}</li>{% endfor %}
+          </ul>
+        {% endif %}
+        {% if results.failovers.errors %}
+          <p class="text-danger fw-semibold">Errors:</p>
+          <ul class="text-danger">
+            {% for item in results.failovers.errors %}<li>{{ item }}</li>{% endfor %}
+          </ul>
+        {% endif %}
+        {% if not results.failovers.created and not results.failovers.skipped and not results.failovers.errors %}
+          <span class="text-muted">No failover data returned by the server.</span>
+        {% endif %}
+      </div>
+    </div>
+
+    {# Scopes #}
+    <div class="card mb-3">
+      <h5 class="card-header">
+        Scopes
+        <span class="badge bg-success ms-2">{{ results.scopes.created|length }} created</span>
+        <span class="badge bg-secondary ms-1">{{ results.scopes.skipped|length }} skipped</span>
+        {% if results.scopes.errors %}<span class="badge bg-danger ms-1">{{ results.scopes.errors|length }} errors</span>{% endif %}
+      </h5>
+      <div class="card-body">
+        {% if results.scopes.created %}
+          <p class="text-success fw-semibold">Created:</p>
+          <ul>
+            {% for item in results.scopes.created %}<li>{{ item }}</li>{% endfor %}
+          </ul>
+        {% endif %}
+        {% if results.scopes.skipped %}
+          <p class="text-muted fw-semibold">Skipped (already exist):</p>
+          <ul class="text-muted">
+            {% for item in results.scopes.skipped %}<li>{{ item }}</li>{% endfor %}
+          </ul>
+        {% endif %}
+        {% if results.scopes.errors %}
+          <p class="text-danger fw-semibold">Errors:</p>
+          <ul class="text-danger">
+            {% for item in results.scopes.errors %}<li>{{ item }}</li>{% endfor %}
+          </ul>
+        {% endif %}
+        {% if not results.scopes.created and not results.scopes.skipped and not results.scopes.errors %}
+          <span class="text-muted">No scope data returned by the server.</span>
+        {% endif %}
+      </div>
+    </div>
+
+    {# Option Values #}
+    <div class="card mb-3">
+      <h5 class="card-header">
+        Option Values
+        <span class="badge bg-success ms-2">{{ results.option_values.created }} created</span>
+        <span class="badge bg-secondary ms-1">{{ results.option_values.skipped }} skipped</span>
+        {% if results.option_values.errors %}<span class="badge bg-danger ms-1">{{ results.option_values.errors|length }} errors</span>{% endif %}
+      </h5>
+      <div class="card-body">
+        {% if results.option_values.errors %}
+          <p class="text-danger fw-semibold">Errors:</p>
+          <ul class="text-danger">
+            {% for item in results.option_values.errors %}<li>{{ item }}</li>{% endfor %}
+          </ul>
+        {% endif %}
+        {% if not results.option_values.errors and results.option_values.created == 0 and results.option_values.skipped == 0 %}
+          <span class="text-muted">No option value data returned by the server.</span>
+        {% endif %}
+      </div>
+    </div>
+
+    <a href="{{ object.get_absolute_url }}" class="btn btn-secondary">
+      <i class="mdi mdi-arrow-left"></i> Back to {{ object.name }}
+    </a>
+    {% endif %}
+
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,48 @@
+{% extends 'generic/object.html' %}
+{% load helpers %}
+
+{% block content %}
+<div class="row mb-3">
+  <div class="col col-md-6">
+    <div class="card">
+      <h5 class="card-header">Option Value</h5>
+      <div class="card-body">
+        <table class="table table-hover attr-table">
+          <tr>
+            <th scope="row">Display Name</th>
+            <td>{{ object }}</td>
+          </tr>
+          <tr>
+            <th scope="row">Option Definition</th>
+            <td><a href="{{ object.option_definition.get_absolute_url }}">{{ object.option_definition }}</a></td>
+          </tr>
+          <tr>
+            <th scope="row">Value</th>
+            <td><code>{{ object.value }}</code></td>
+          </tr>
+          <tr>
+            <th scope="row">Friendly Name</th>
+            <td>{{ object.friendly_name|default:'<span class="text-muted">—</span>'|safe }}</td>
+          </tr>
+        </table>
+      </div>
+    </div>
+    {% include 'inc/panels/tags.html' %}
+    {% include 'inc/panels/custom_fields.html' %}
+  </div>
+</div>
+
+{% if scope_table.rows %}
+<div class="row mb-3">
+  <div class="col">
+    <div class="card">
+      <h5 class="card-header">Scopes Using This Option Value</h5>
+      <div class="card-body">
+        {% include 'inc/table.html' with table=scope_table %}
+      </div>
+    </div>
+  </div>
+</div>
+{% endif %}
+
+{% endblock %}
