@@ -6,7 +6,7 @@ class PrefixDHCPScopesPanel(PluginTemplateExtension):
 
     models = ['ipam.prefix']
 
-    def right_page(self):
+    def left_page(self):
         prefix = self.context['object']
         scopes = prefix.dhcp_scopes.select_related('failover').prefetch_related(
             'option_values__option_definition'

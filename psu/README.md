@@ -5,7 +5,7 @@ PowerShell Universal endpoint definitions for the `netbox-windows-dhcp` plugin.
 ## Prerequisites
 
 - Windows Server with the **DHCP Server** role installed
-- **PowerShell Universal** (v3.x or v4.x) running on the DHCP server
+- **PowerShell Universal v5.x** (tested on 5.6.11+) running on the DHCP server
 - The `DhcpServer` PowerShell module (ships with the DHCP Server role)
 
 ## Deployment
@@ -15,43 +15,66 @@ PowerShell Universal endpoint definitions for the `netbox-windows-dhcp` plugin.
 In the PowerShell Universal admin UI:
 
 1. Go to **APIs → Scripts**
-2. Create a new script (or place `dhcp_api_endpoints.ps1` directly in your PSU repository folder under `endpoints/`)
+2. Create a new script, or place `dhcp_api_endpoints.ps1` directly in your PSU repository folder
 3. Paste or import the contents of `dhcp_api_endpoints.ps1`
 
-Alternatively, if using a PSU Git repository, commit `dhcp_api_endpoints.ps1` to the root of the repo and PSU will pick it up on the next sync.
+Alternatively, if using a PSU Git repository, commit `dhcp_api_endpoints.ps1` to the repository root and PSU will pick it up on the next sync.
 
 ### Step 2 — Configure Authentication (recommended)
 
-1. In PSU, go to **Security → API Keys** and create a new key
-2. Copy the key value
-3. In NetBox, edit the **DHCP Server** object and paste the key in the **API Key** field
-4. Add `-Authentication` to each `New-PSUEndpoint` call in the script to enforce the key
+PSU v5 uses JWT App Tokens for authentication.
+
+1. In the PSU admin console, go to **Security → App Tokens** and generate a new token
+2. Copy the token value
+3. In NetBox, edit the **DHCP Server** object and paste the token in the **App Token** field
+4. Add `-Authentication` to each `New-PSUEndpoint` call in the script to enforce the token
 
 Without `-Authentication`, the endpoints are unauthenticated and accessible to anyone who can reach the server.
+
+The plugin sends the token as:
+
+```http
+Authorization: Bearer <token>
+```
 
 ### Step 3 — Verify
 
 Test from a machine that can reach the PSU server:
 
 ```powershell
-# PSU v5: App Token passed as a Bearer token
 $headers = @{ Authorization = 'Bearer your-app-token-here' }
 $base    = 'https://dhcp01.example.com:443/api/dhcp'
 
 # List all scopes
-Invoke-RestMethod -Uri "$base/scopes" -Headers $headers | ConvertTo-Json
+Invoke-RestMethod -Uri "$base/scopes" -Headers $headers | ConvertTo-Json -Depth 4
 
-# List leases for a scope
-Invoke-RestMethod -Uri "$base/leases?scope_id=10.0.1.0" -Headers $headers | ConvertTo-Json
+# List leases for a specific scope
+Invoke-RestMethod -Uri "$base/leases?scope_id=10.0.1.0" -Headers $headers | ConvertTo-Json -Depth 4
 ```
 
-Or trigger a **Sync Now** from the plugin's Server detail page inside NetBox.
+Or trigger **Sync Now** from the plugin's Server detail page in NetBox.
+
+## Script Architecture
+
+PSU v5 runs each endpoint in an isolated runspace, so functions defined in one endpoint are not available in another. The script handles this by storing shared helper functions in the `$H` string and prepending them to every endpoint's scriptblock via `[scriptblock]::Create($H + {...}.ToString())`. This makes each endpoint fully self-contained.
+
+Shared helpers defined in `$H`:
+
+- `ConvertTo-ScopeObject` — maps a DHCP scope CIM object to the API response shape
+- `ConvertTo-LeaseObject` — maps a lease CIM object
+- `ConvertTo-ReservationObject` — maps a reservation CIM object
+- `ConvertTo-FailoverObject` — maps a failover CIM object; resolves the local server's FQDN for `primary_server`
+- `ConvertTo-OptionValueObject` — maps a DHCP option value CIM object
+- `Find-ReservationByClientId` — searches all scopes for a reservation by client MAC address
+- `Write-ApiError` — returns a JSON error response with a given HTTP status code
+
+All list endpoints use `ConvertTo-Json -InputObject $result` (not `$result | ConvertTo-Json`) to prevent PowerShell's pipeline from unwrapping single-element arrays into bare objects.
 
 ## Endpoint Reference
 
 | Method | URL | Description |
-|--------|-----|-------------|
-| GET | `/api/dhcp/scopes` | List all scopes |
+| --- | --- | --- |
+| GET | `/api/dhcp/scopes` | List all scopes (includes `router` and `failover_name`) |
 | GET | `/api/dhcp/scopes/:scope_id` | Get single scope by network address |
 | POST | `/api/dhcp/scopes` | Create a scope |
 | PUT | `/api/dhcp/scopes/:scope_id` | Update a scope |
@@ -59,7 +82,7 @@ Or trigger a **Sync Now** from the plugin's Server detail page inside NetBox.
 | GET | `/api/dhcp/reservations` | List reservations (optional `?scope_id=`) |
 | POST | `/api/dhcp/reservations` | Create a reservation |
 | PUT | `/api/dhcp/reservations/:client_id` | Update reservation by MAC |
-| DELETE | `/api/dhcp/reservations/:client_id` | Delete reservation by MAC |
+| DELETE | `/api/dhcp/reservations/:client_id` | Delete reservation by MAC — returns 204 |
 | GET | `/api/dhcp/failover` | List failover relationships |
 | POST | `/api/dhcp/failover` | Create a failover relationship |
 | GET | `/api/dhcp/options/server` | Server-level option values |
@@ -68,6 +91,7 @@ Or trigger a **Sync Now** from the plugin's Server detail page inside NetBox.
 ## Response Shapes
 
 ### Scope
+
 ```json
 {
   "scope_id": "10.0.1.0",
@@ -77,11 +101,16 @@ Or trigger a **Sync Now** from the plugin's Server detail page inside NetBox.
   "subnet_mask": "255.255.255.0",
   "description": "",
   "state": "Active",
-  "lease_duration_seconds": 86400
+  "lease_duration_seconds": 86400,
+  "router": "10.0.1.1",
+  "failover_name": "FAILOVER-BUILDING-A"
 }
 ```
 
+`router` is read from DHCP Option 3 on the scope and is `null` if not set. `failover_name` is `null` if the scope is not part of a failover relationship.
+
 ### Lease
+
 ```json
 {
   "ip_address": "10.0.1.50",
@@ -93,7 +122,10 @@ Or trigger a **Sync Now** from the plugin's Server detail page inside NetBox.
 }
 ```
 
+Only leases with `address_state` of `Active` or `ActiveReservation` are returned.
+
 ### Reservation
+
 ```json
 {
   "ip_address": "10.0.1.100",
@@ -106,10 +138,12 @@ Or trigger a **Sync Now** from the plugin's Server detail page inside NetBox.
 ```
 
 ### Failover
+
 ```json
 {
   "name": "FAILOVER-BUILDING-A",
-  "partner_server": "dhcp02.example.com",
+  "primary_server": "dhcp01.example.com",
+  "secondary_server": "dhcp02.example.com",
   "mode": "LoadBalance",
   "scope_ids": ["10.0.1.0", "10.0.2.0"],
   "max_client_lead_time": 3600,
@@ -119,10 +153,13 @@ Or trigger a **Sync Now** from the plugin's Server detail page inside NetBox.
 }
 ```
 
+`primary_server` is resolved from the local machine's FQDN. `state_switchover_interval` is `null` when automatic state switchover is disabled.
+
 ### Option Value
+
 ```json
 {
-  "option_id": 6,
+  "code": 6,
   "name": "DNS Servers",
   "value": ["8.8.8.8", "8.8.4.4"],
   "type": "IPv4Address",
@@ -130,9 +167,12 @@ Or trigger a **Sync Now** from the plugin's Server detail page inside NetBox.
 }
 ```
 
+`value` is always an array. Multi-value options (e.g. DNS server lists) contain multiple entries.
+
 ## Notes
 
-- **`scope_id`** is always the network address of the scope (e.g. `10.0.1.0`), matching Windows DHCP's own convention.
-- **`client_id`** uses Windows DHCP format: `00-11-22-33-44-55` (hyphen-separated hex octets). The POST /reservations endpoint normalises any MAC format to this convention automatically.
-- **Failover creation** (`POST /api/dhcp/failover`) must run on the **primary** server. PSU on the primary server contacts the secondary server directly via the `Add-DhcpServerv4Failover` cmdlet.
-- The DELETE reservation endpoint returns **HTTP 204** (no body) on success, which the NetBox plugin's `PSUClient` handles correctly.
+- **`scope_id`** is always the network address of the scope (e.g. `10.0.1.0`), matching the Windows DHCP Server convention.
+- **`client_id`** uses Windows DHCP hyphen-separated hex format: `00-11-22-33-44-55`. The `POST /reservations` endpoint normalises any MAC format to this convention automatically.
+- **Failover creation** (`POST /api/dhcp/failover`) must be run against the **primary** server. The `Add-DhcpServerv4Failover` cmdlet contacts the secondary server directly from the primary.
+- **Option 3 (Router)** is not returned in scope-level option value responses — it is included directly in the scope object as `router`. The NetBox plugin stores it on the Scope's `router` field and skips it during option value import.
+- **Option 51 (Lease Time)** is also skipped during import — it is stored on the Scope's `lease_lifetime` field.
