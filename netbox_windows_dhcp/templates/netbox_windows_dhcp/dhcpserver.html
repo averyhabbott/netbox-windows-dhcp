@@ -72,6 +72,7 @@
         {% include 'inc/table.html' with table=failover_table %}
       </div>
     </div>
+    {% include 'inc/paginator.html' with paginator=failover_table.paginator page=failover_table.page %}
   </div>
 </div>
 {% endif %}
@@ -85,6 +86,7 @@
         {% include 'inc/table.html' with table=scope_table %}
       </div>
     </div>
+    {% include 'inc/paginator.html' with paginator=scope_table.paginator page=scope_table.page %}
   </div>
 </div>
 {% endif %}

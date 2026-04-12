@@ -37,7 +37,7 @@ def _ensure_custom_fields(sender, **kwargs):
         if created:
             logger.info('Registered custom field dhcp_client_id on IPAddress')
     except Exception as exc:
-        logger.warning('Could not register dhcp_client_id custom field: %s', exc)
+        logger.warning(f'Could not register dhcp_client_id custom field: {exc}')
 
 
 class NetBoxWindowsDHCPConfig(PluginConfig):

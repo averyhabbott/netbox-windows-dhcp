@@ -49,6 +49,7 @@
         {% include 'inc/table.html' with table=value_table %}
       </div>
     </div>
+    {% include 'inc/paginator.html' with paginator=value_table.paginator page=value_table.page %}
   </div>
 </div>
 {% endif %}

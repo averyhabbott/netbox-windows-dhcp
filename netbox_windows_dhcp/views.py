@@ -97,54 +97,38 @@ class DHCPServerBulkDeleteView(generic.BulkDeleteView):
 
 
 class DHCPServerSyncView(LoginRequiredMixin, View):
-    """Runs an immediate synchronous sync for a single DHCP server."""
+    """Enqueues a background sync job for a single DHCP server."""
 
     def post(self, request, pk):
         server = get_object_or_404(DHCPServer, pk=pk)
-        from .background_tasks import _load_settings, _sync_server
-        cfg = _load_settings()
-        try:
-            _sync_server(
-                logger,
-                server,
-                cfg.scope_sync_mode,
-                cfg.push_reservations,
-                cfg.push_scope_info,
-            )
-            messages.success(request, f'Sync completed for {server.name}.')
-        except Exception as exc:
-            logger.exception('Sync failed for server %s', server)
-            messages.error(request, f'Sync failed for {server.name}: {exc}')
-        return redirect(server.get_absolute_url())
+        from .background_tasks import DHCPServerSyncJob
+        job = DHCPServerSyncJob.enqueue(
+            name=f'Sync {server.name}',
+            user=request.user,
+            server_pk=server.pk,
+        )
+        messages.success(request, f'Sync job queued for {server.name}.')
+        return redirect(job.get_absolute_url())
 
     def get(self, request, pk):
         return self.post(request, pk)
 
 
 class DHCPGlobalSyncView(LoginRequiredMixin, View):
-    """Runs a synchronous sync for all configured DHCP servers."""
+    """Enqueues a background sync job for every configured DHCP server."""
 
     def post(self, request):
-        from .background_tasks import _load_settings, _sync_server
+        from .background_tasks import DHCPServerSyncJob
         servers = DHCPServer.objects.all()
-        cfg = _load_settings()
-        errors = []
+        count = 0
         for server in servers:
-            try:
-                _sync_server(
-                    logger,
-                    server,
-                    cfg.scope_sync_mode,
-                    cfg.push_reservations,
-                    cfg.push_scope_info,
-                )
-            except Exception as exc:
-                logger.exception('Sync failed for server %s', server)
-                errors.append(f'{server.name}: {exc}')
-        if errors:
-            messages.error(request, 'Sync errors: ' + '; '.join(errors))
-        else:
-            messages.success(request, f'Sync completed for {servers.count()} server(s).')
+            DHCPServerSyncJob.enqueue(
+                name=f'Sync {server.name}',
+                user=request.user,
+                server_pk=server.pk,
+            )
+            count += 1
+        messages.success(request, f'Queued sync job for {count} server(s). Check System → Jobs for progress.')
         return redirect('plugins:netbox_windows_dhcp:dhcpserver_list')
 
     def get(self, request):
@@ -152,24 +136,24 @@ class DHCPGlobalSyncView(LoginRequiredMixin, View):
 
 
 class DHCPServerImportView(LoginRequiredMixin, View):
-    """One-time import of failovers, scopes, and option values from a DHCP server."""
+    """Enqueues a background import job for a DHCP server."""
 
     template_name = 'netbox_windows_dhcp/dhcpserver_import.html'
 
     def get(self, request, pk):
         server = get_object_or_404(DHCPServer, pk=pk)
-        return render(request, self.template_name, {'object': server, 'results': None})
+        return render(request, self.template_name, {'object': server})
 
     def post(self, request, pk):
         server = get_object_or_404(DHCPServer, pk=pk)
-        from .import_logic import run_import
-        try:
-            results = run_import(server)
-        except Exception as exc:
-            logger.exception('Import failed for server %s', server)
-            messages.error(request, f'Import failed: {exc}')
-            return render(request, self.template_name, {'object': server, 'results': None})
-        return render(request, self.template_name, {'object': server, 'results': results})
+        from .background_tasks import DHCPImportJob
+        job = DHCPImportJob.enqueue(
+            name=f'Import from {server.name}',
+            user=request.user,
+            server_pk=server.pk,
+        )
+        messages.success(request, f'Import job queued for {server.name}.')
+        return redirect(job.get_absolute_url())
 
 
 # ---------------------------------------------------------------------------

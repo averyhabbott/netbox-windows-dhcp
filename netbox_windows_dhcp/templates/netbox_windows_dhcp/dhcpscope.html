@@ -53,6 +53,9 @@
         {% endif %}
       </div>
     </div>
+    {% if option_table.rows %}
+      {% include 'inc/paginator.html' with paginator=option_table.paginator page=option_table.page %}
+    {% endif %}
   </div>
 </div>
 

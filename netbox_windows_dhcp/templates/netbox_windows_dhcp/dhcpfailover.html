@@ -57,6 +57,7 @@
         {% include 'inc/table.html' with table=scope_table %}
       </div>
     </div>
+    {% include 'inc/paginator.html' with paginator=scope_table.paginator page=scope_table.page %}
   </div>
 </div>
 {% endif %}

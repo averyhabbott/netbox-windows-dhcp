@@ -73,6 +73,7 @@ class DHCPOptionValueTable(NetBoxTable):
     friendly_name = tables.Column(
         linkify=lambda record: record.get_absolute_url(),
         verbose_name='Friendly Name',
+        empty_values=(),
     )
     option_definition = tables.Column(
         linkify=True,
@@ -84,6 +85,9 @@ class DHCPOptionValueTable(NetBoxTable):
         model = DHCPOptionValue
         fields = ('pk', 'friendly_name', 'option_definition', 'value', 'actions')
         default_columns = ('friendly_name', 'option_definition', 'value', 'actions')
+
+    def render_friendly_name(self, value, record):
+        return value or str(record)
 
 
 class DHCPScopeTable(NetBoxTable):

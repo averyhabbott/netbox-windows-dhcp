@@ -27,4 +27,4 @@ def dhcpscope_post_save(sender, instance, created, **kwargs):
         for server in servers:
             DHCPServerSyncJob.enqueue(server)
     except Exception as exc:
-        logger.warning('Failed to enqueue scope push after save of %s: %s', instance, exc)
+        logger.warning(f'Failed to enqueue scope push after save of {instance}: {exc}')

@@ -1,6 +1,7 @@
 from rest_framework import serializers
 
 from netbox.api.serializers import NetBoxModelSerializer
+from ipam.api.serializers import PrefixSerializer
 from ipam.models import Prefix
 
 from ..models import (
@@ -10,16 +11,6 @@ from ..models import (
     DHCPScope,
     DHCPServer,
 )
-
-
-class BriefPrefixSerializer(serializers.ModelSerializer):
-    """Minimal read-only Prefix representation for nested use in DHCPScopeSerializer."""
-    url = serializers.HyperlinkedIdentityField(view_name='ipam-api:prefix-detail')
-    display = serializers.CharField(read_only=True)
-
-    class Meta:
-        model = Prefix
-        fields = ('id', 'url', 'display', 'prefix')
 
 
 class DHCPServerSerializer(NetBoxModelSerializer):
@@ -113,7 +104,7 @@ class DHCPScopeSerializer(NetBoxModelSerializer):
     url = serializers.HyperlinkedIdentityField(
         view_name='plugins-api:netbox_windows_dhcp-api:dhcpscope-detail'
     )
-    prefix = BriefPrefixSerializer(read_only=True)
+    prefix = PrefixSerializer(nested=True, read_only=True)
     prefix_id = serializers.PrimaryKeyRelatedField(
         queryset=Prefix.objects.all(),
         source='prefix',
