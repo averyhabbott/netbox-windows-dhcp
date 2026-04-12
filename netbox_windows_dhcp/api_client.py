@@ -40,7 +40,7 @@ class PSUClient:
         self.server = server
         self.base_url = server.base_url
         self.session = requests.Session()
-        self.session.verify = True  # SSL verification; set to False for self-signed certs
+        self.session.verify = server.verify_ssl
         if server.api_key:
             # PSU v5 uses JWT App Tokens passed as Bearer tokens
             self.session.headers['Authorization'] = f'Bearer {server.api_key}'
@@ -78,6 +78,15 @@ class PSUClient:
     def _get(self, path: str, params: Optional[Dict] = None) -> Any:
         return self._request('GET', path, params=params)
 
+    def _get_list(self, path: str, params: Optional[Dict] = None) -> List[Dict]:
+        """Like _get but always returns a list, guarding against single-object JSON responses."""
+        result = self._request('GET', path, params=params)
+        if result is None:
+            return []
+        if isinstance(result, dict):
+            return [result]
+        return result
+
     def _post(self, path: str, data: Dict) -> Any:
         return self._request('POST', path, json=data)
 
@@ -93,7 +102,7 @@ class PSUClient:
 
     def list_scopes(self) -> List[Dict]:
         """Return all DHCP scopes on this server."""
-        return self._get('scopes') or []
+        return self._get_list('scopes')
 
     def get_scope(self, scope_id: str) -> Dict:
         return self._get(f'scopes/{scope_id}')
@@ -136,7 +145,7 @@ class PSUClient:
             }
         """
         params = {'scope_id': scope_id} if scope_id else {}
-        return self._get('leases', params=params) or []
+        return self._get_list('leases', params=params)
 
     # ------------------------------------------------------------------
     # Reservations
@@ -156,7 +165,7 @@ class PSUClient:
             }
         """
         params = {'scope_id': scope_id} if scope_id else {}
-        return self._get('reservations', params=params) or []
+        return self._get_list('reservations', params=params)
 
     def create_reservation(self, payload: Dict) -> Dict:
         """
@@ -183,7 +192,7 @@ class PSUClient:
     # ------------------------------------------------------------------
 
     def list_failover(self) -> List[Dict]:
-        return self._get('failover') or []
+        return self._get_list('failover')
 
     def create_failover(self, payload: Dict) -> Dict:
         """
@@ -209,8 +218,8 @@ class PSUClient:
 
     def list_server_options(self) -> List[Dict]:
         """Return server-level DHCP option values."""
-        return self._get('options/server') or []
+        return self._get_list('options/server')
 
     def list_scope_options(self, scope_id: str) -> List[Dict]:
         """Return scope-level DHCP option values for a given scope."""
-        return self._get(f'options/scope/{scope_id}') or []
+        return self._get_list(f'options/scope/{scope_id}')

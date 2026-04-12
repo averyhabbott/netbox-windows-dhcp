@@ -24,7 +24,7 @@ def run_import(server) -> Dict:
     results = {
         'failovers': {'created': [], 'skipped': [], 'errors': []},
         'scopes':    {'created': [], 'skipped': [], 'errors': []},
-        'option_values': {'created': 0, 'skipped': 0, 'errors': []},
+        'option_values': {'created': [], 'skipped': [], 'errors': []},
     }
 
     client = PSUClient(server)
@@ -216,6 +216,12 @@ def _import_option_value(scope, ro: Dict, results: Dict):
 
     code = int(code_raw)
 
+    # Option 3 (Router) is stored on the scope's router field.
+    # Option 51 (Lease Time) is stored on the scope's lease_lifetime field.
+    # Skip both here to avoid duplicate data.
+    if code in (3, 51):
+        return
+
     # PSU returns value as a JSON array (multi-value options like DNS servers);
     # join to a comma-separated string for storage.
     if isinstance(value_raw, list):
@@ -244,7 +250,8 @@ def _import_option_value(scope, ro: Dict, results: Dict):
 
     scope.option_values.add(opt_val)
 
+    label = f'Option {code} ({opt_def.name}): {value} — scope: {scope.name}'
     if created:
-        results['option_values']['created'] += 1
+        results['option_values']['created'].append(label)
     else:
-        results['option_values']['skipped'] += 1
+        results['option_values']['skipped'].append(label)

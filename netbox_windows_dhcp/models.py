@@ -77,6 +77,11 @@ class DHCPServer(NetBoxModel):
         verbose_name='App Token',
         help_text='PSU v5 App Token (Security → App Tokens in the PSU admin console). Sent as Authorization: Bearer. Leave blank if auth is not required.',
     )
+    verify_ssl = models.BooleanField(
+        default=True,
+        verbose_name='Verify SSL Certificate',
+        help_text='Uncheck to disable TLS certificate verification (for self-signed certs in test environments).',
+    )
 
     class Meta:
         ordering = ['name']

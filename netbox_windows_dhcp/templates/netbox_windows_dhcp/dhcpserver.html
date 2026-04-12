@@ -29,6 +29,10 @@
             <td>{% if object.api_key %}<span class="text-muted">(configured)</span>{% else %}<span class="text-muted">None</span>{% endif %}</td>
           </tr>
           <tr>
+            <th scope="row">Verify SSL</th>
+            <td>{% if object.verify_ssl %}<span class="badge bg-success">Yes</span>{% else %}<span class="badge bg-warning text-dark">No</span>{% endif %}</td>
+          </tr>
+          <tr>
             <th scope="row">Base URL</th>
             <td><code>{{ object.base_url }}</code></td>
           </tr>

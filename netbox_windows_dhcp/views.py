@@ -20,6 +20,7 @@ from .forms import (
     DHCPOptionCodeDefinitionForm,
     DHCPOptionValueFilterForm,
     DHCPOptionValueForm,
+    DHCPScopeBulkEditForm,
     DHCPScopeFilterForm,
     DHCPScopeForm,
     DHCPServerFilterForm,
@@ -96,16 +97,24 @@ class DHCPServerBulkDeleteView(generic.BulkDeleteView):
 
 
 class DHCPServerSyncView(LoginRequiredMixin, View):
-    """Enqueues an immediate sync job for a single DHCP server."""
+    """Runs an immediate synchronous sync for a single DHCP server."""
 
     def post(self, request, pk):
         server = get_object_or_404(DHCPServer, pk=pk)
-        from .background_tasks import DHCPServerSyncJob
-        job = DHCPServerSyncJob.enqueue(server, request=request)
-        messages.success(
-            request,
-            f'Sync job queued for {server.name} (Job #{job.pk}).',
-        )
+        from .background_tasks import _load_settings, _sync_server
+        cfg = _load_settings()
+        try:
+            _sync_server(
+                logger,
+                server,
+                cfg.scope_sync_mode,
+                cfg.push_reservations,
+                cfg.push_scope_info,
+            )
+            messages.success(request, f'Sync completed for {server.name}.')
+        except Exception as exc:
+            logger.exception('Sync failed for server %s', server)
+            messages.error(request, f'Sync failed for {server.name}: {exc}')
         return redirect(server.get_absolute_url())
 
     def get(self, request, pk):
@@ -113,16 +122,29 @@ class DHCPServerSyncView(LoginRequiredMixin, View):
 
 
 class DHCPGlobalSyncView(LoginRequiredMixin, View):
-    """Enqueues sync jobs for all configured DHCP servers."""
+    """Runs a synchronous sync for all configured DHCP servers."""
 
     def post(self, request):
-        from .background_tasks import DHCPServerSyncJob
+        from .background_tasks import _load_settings, _sync_server
         servers = DHCPServer.objects.all()
-        count = 0
+        cfg = _load_settings()
+        errors = []
         for server in servers:
-            DHCPServerSyncJob.enqueue(server, request=request)
-            count += 1
-        messages.success(request, f'Sync jobs queued for {count} server(s).')
+            try:
+                _sync_server(
+                    logger,
+                    server,
+                    cfg.scope_sync_mode,
+                    cfg.push_reservations,
+                    cfg.push_scope_info,
+                )
+            except Exception as exc:
+                logger.exception('Sync failed for server %s', server)
+                errors.append(f'{server.name}: {exc}')
+        if errors:
+            messages.error(request, 'Sync errors: ' + '; '.join(errors))
+        else:
+            messages.success(request, f'Sync completed for {servers.count()} server(s).')
         return redirect('plugins:netbox_windows_dhcp:dhcpserver_list')
 
     def get(self, request):
@@ -301,6 +323,35 @@ class DHCPScopeEditView(generic.ObjectEditView):
 
 class DHCPScopeDeleteView(generic.ObjectDeleteView):
     queryset = DHCPScope.objects.all()
+
+
+class DHCPScopeBulkEditView(generic.BulkEditView):
+    queryset = DHCPScope.objects.select_related('prefix', 'failover')
+    filterset = DHCPScopeFilterSet
+    table = DHCPScopeTable
+    form = DHCPScopeBulkEditForm
+
+    def post(self, request, *args, **kwargs):
+        response = super().post(request, *args, **kwargs)
+
+        # After the parent saves scalar fields and tags, apply M2M option_values.
+        # Only do this when the form was submitted (_apply) and the parent succeeded (redirect).
+        if '_apply' in request.POST:
+            from django.http import HttpResponseRedirect
+            if isinstance(response, HttpResponseRedirect):
+                pk_list = [int(pk) for pk in request.POST.getlist('pk') if str(pk).isdigit()]
+                form = self.form(data=request.POST, initial={'pk': pk_list})
+                if form.is_valid():
+                    add_opts = form.cleaned_data.get('add_option_values') or []
+                    remove_opts = form.cleaned_data.get('remove_option_values') or []
+                    if add_opts or remove_opts:
+                        for obj in DHCPScope.objects.filter(pk__in=pk_list):
+                            if add_opts:
+                                obj.option_values.add(*add_opts)
+                            if remove_opts:
+                                obj.option_values.remove(*remove_opts)
+
+        return response
 
 
 class DHCPScopeBulkDeleteView(generic.BulkDeleteView):

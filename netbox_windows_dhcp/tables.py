@@ -1,5 +1,5 @@
 import django_tables2 as tables
-from netbox.tables import NetBoxTable, BooleanColumn, ActionsColumn
+from netbox.tables import NetBoxTable, BooleanColumn, ActionsColumn, TagColumn
 
 from .models import (
     DHCPFailover,
@@ -70,19 +70,20 @@ class DHCPOptionCodeDefinitionTable(NetBoxTable):
 
 
 class DHCPOptionValueTable(NetBoxTable):
-    display_name = tables.Column(
-        accessor='__str__',
-        verbose_name='Name',
+    friendly_name = tables.Column(
         linkify=lambda record: record.get_absolute_url(),
-        orderable=False,
+        verbose_name='Friendly Name',
     )
-    option_definition = tables.Column(linkify=True)
+    option_definition = tables.Column(
+        linkify=True,
+        verbose_name='Option Code',
+    )
     value = tables.Column()
 
     class Meta(NetBoxTable.Meta):
         model = DHCPOptionValue
-        fields = ('pk', 'display_name', 'option_definition', 'value', 'friendly_name', 'actions')
-        default_columns = ('display_name', 'option_definition', 'value', 'actions')
+        fields = ('pk', 'friendly_name', 'option_definition', 'value', 'actions')
+        default_columns = ('friendly_name', 'option_definition', 'value', 'actions')
 
 
 class DHCPScopeTable(NetBoxTable):
@@ -92,14 +93,15 @@ class DHCPScopeTable(NetBoxTable):
     end_ip = tables.Column(verbose_name='End IP')
     router = tables.Column(verbose_name='Router')
     failover = tables.Column(linkify=True)
-    lease_lifetime = tables.Column(verbose_name='Lease (s)')
+    lease_lifetime = tables.Column(verbose_name='Lease Life (s)')
+    tags = TagColumn(url_name='plugins:netbox_windows_dhcp:dhcpscope_list')
 
     class Meta(NetBoxTable.Meta):
         model = DHCPScope
         fields = (
             'pk', 'name', 'prefix', 'start_ip', 'end_ip',
-            'router', 'failover', 'lease_lifetime', 'actions',
+            'router', 'failover', 'lease_lifetime', 'tags', 'actions',
         )
         default_columns = (
-            'name', 'prefix', 'start_ip', 'end_ip', 'failover', 'actions',
+            'name', 'prefix', 'start_ip', 'end_ip', 'failover', 'tags', 'actions',
         )

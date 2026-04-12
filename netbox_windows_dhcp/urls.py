@@ -69,6 +69,7 @@ urlpatterns = [
     # -----------------------------------------------------------------------
     path('scopes/', views.DHCPScopeListView.as_view(), name='dhcpscope_list'),
     path('scopes/add/', views.DHCPScopeCreateView.as_view(), name='dhcpscope_add'),
+    path('scopes/edit/', views.DHCPScopeBulkEditView.as_view(), name='dhcpscope_bulk_edit'),
     path('scopes/delete/', views.DHCPScopeBulkDeleteView.as_view(), name='dhcpscope_bulk_delete'),
     path('scopes/<int:pk>/', views.DHCPScopeView.as_view(), name='dhcpscope'),
     path('scopes/<int:pk>/edit/', views.DHCPScopeEditView.as_view(), name='dhcpscope_edit'),

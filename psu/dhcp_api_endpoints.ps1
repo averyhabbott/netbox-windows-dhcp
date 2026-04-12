@@ -22,114 +22,116 @@
          New-PSUEndpoint call below.
 
     All endpoints are rooted at /api/dhcp/ to match the PSUClient base URL.
+
+    PSU v5 runs each endpoint in an isolated runspace.  Shared helper functions
+    are stored in the $H string and prepended to every endpoint's scriptblock via
+    [scriptblock]::Create() so that each runspace is fully self-contained.
+    URL path parameters (:param) and the $Body variable are injected automatically
+    by PSU — no param() declaration is required inside endpoint scriptblocks.
 #>
 
 
 # ===========================================================================
-# SHARED HELPERS  (dot-sourced into each endpoint via -ScriptBlock approach)
-# These are defined as strings and invoked with [scriptblock]::Create() so
-# that they work correctly inside PSU runspaces without a separate module.
+# SHARED HELPERS — embedded into every endpoint via [scriptblock]::Create()
 # ===========================================================================
 
-$HelperFunctions = {
-
-    function ConvertTo-ScopeObject {
-        param([Microsoft.Management.Infrastructure.CimInstance]$Scope)
-        [ordered]@{
-            scope_id               = $Scope.ScopeId.ToString()
-            name                   = [string]$Scope.Name
-            start_ip               = $Scope.StartRange.ToString()
-            end_ip                 = $Scope.EndRange.ToString()
-            subnet_mask            = $Scope.SubnetMask.ToString()
-            description            = [string]$Scope.Description
-            state                  = $Scope.State.ToString()
-            lease_duration_seconds = [int]$Scope.LeaseDuration.TotalSeconds
-        }
+$H = @'
+function ConvertTo-ScopeObject {
+    param([Microsoft.Management.Infrastructure.CimInstance]$Scope)
+    [ordered]@{
+        scope_id               = $Scope.ScopeId.ToString()
+        name                   = [string]$Scope.Name
+        start_ip               = $Scope.StartRange.ToString()
+        end_ip                 = $Scope.EndRange.ToString()
+        subnet_mask            = $Scope.SubnetMask.ToString()
+        description            = [string]$Scope.Description
+        state                  = $Scope.State.ToString()
+        lease_duration_seconds = [int]$Scope.LeaseDuration.TotalSeconds
     }
-
-    function ConvertTo-LeaseObject {
-        param([Microsoft.Management.Infrastructure.CimInstance]$Lease)
-        $expiry = $null
-        if ($Lease.LeaseExpiryTime) {
-            $expiry = $Lease.LeaseExpiryTime.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-        }
-        [ordered]@{
-            ip_address    = $Lease.IPAddress.ToString()
-            client_id     = [string]$Lease.ClientId
-            hostname      = [string]$Lease.HostName
-            scope_id      = $Lease.ScopeId.ToString()
-            lease_expiry  = $expiry
-            address_state = $Lease.AddressState.ToString()
-        }
-    }
-
-    function ConvertTo-ReservationObject {
-        param([Microsoft.Management.Infrastructure.CimInstance]$Reservation)
-        [ordered]@{
-            ip_address  = $Reservation.IPAddress.ToString()
-            client_id   = [string]$Reservation.ClientId
-            name        = [string]$Reservation.Name
-            description = [string]$Reservation.Description
-            type        = $Reservation.Type.ToString()
-            scope_id    = $Reservation.ScopeId.ToString()
-        }
-    }
-
-    function ConvertTo-FailoverObject {
-        param([Microsoft.Management.Infrastructure.CimInstance]$Failover)
-        $switchInterval = $null
-        if ($Failover.StateSwitchInterval -and $Failover.StateSwitchInterval.TotalSeconds -gt 0) {
-            $switchInterval = [int]$Failover.StateSwitchInterval.TotalSeconds
-        }
-        # Resolve the local server's FQDN so NetBox can match it to a DHCPServer object
-        $localFqdn = try {
-            [System.Net.Dns]::GetHostEntry([System.Net.Dns]::GetHostName()).HostName
-        } catch {
-            $env:COMPUTERNAME
-        }
-        [ordered]@{
-            name                      = [string]$Failover.Name
-            primary_server            = $localFqdn
-            secondary_server          = [string]$Failover.PartnerServer
-            mode                      = $Failover.Mode.ToString()
-            scope_ids                 = @($Failover.ScopeId | ForEach-Object { $_.ToString() })
-            max_client_lead_time      = [int]$Failover.MaxClientLeadTime.TotalSeconds
-            max_response_delay        = [int]$Failover.MaxResponseDelay.TotalSeconds
-            state_switchover_interval = $switchInterval
-            enable_auth               = [bool]$Failover.EnableAuth
-        }
-    }
-
-    function ConvertTo-OptionValueObject {
-        param([Microsoft.Management.Infrastructure.CimInstance]$Option)
-        [ordered]@{
-            code         = [int]$Option.OptionId
-            name         = [string]$Option.Name
-            value        = @($Option.Value | ForEach-Object { $_.ToString() })
-            type         = $Option.Type.ToString()
-            vendor_class = [string]$Option.VendorClass
-        }
-    }
-
-    function Find-ReservationByClientId {
-        param([string]$ClientId)
-        foreach ($scope in (Get-DhcpServerv4Scope -ErrorAction SilentlyContinue)) {
-            $match = Get-DhcpServerv4Reservation -ScopeId $scope.ScopeId -ErrorAction SilentlyContinue |
-                     Where-Object { $_.ClientId -eq $ClientId } |
-                     Select-Object -First 1
-            if ($match) { return $match }
-        }
-        return $null
-    }
-
-    function Write-ApiError {
-        param([string]$Message, [int]$StatusCode = 500)
-        New-PSUApiResponse -StatusCode $StatusCode `
-            -Body (@{ error = $Message } | ConvertTo-Json -Compress) `
-            -ContentType 'application/json'
-    }
-
 }
+
+function ConvertTo-LeaseObject {
+    param([Microsoft.Management.Infrastructure.CimInstance]$Lease)
+    $expiry = $null
+    if ($Lease.LeaseExpiryTime) {
+        $expiry = $Lease.LeaseExpiryTime.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    }
+    [ordered]@{
+        ip_address    = $Lease.IPAddress.ToString()
+        client_id     = [string]$Lease.ClientId
+        hostname      = [string]$Lease.HostName
+        scope_id      = $Lease.ScopeId.ToString()
+        lease_expiry  = $expiry
+        address_state = $Lease.AddressState.ToString()
+    }
+}
+
+function ConvertTo-ReservationObject {
+    param([Microsoft.Management.Infrastructure.CimInstance]$Reservation)
+    [ordered]@{
+        ip_address  = $Reservation.IPAddress.ToString()
+        client_id   = [string]$Reservation.ClientId
+        name        = [string]$Reservation.Name
+        description = [string]$Reservation.Description
+        type        = $Reservation.Type.ToString()
+        scope_id    = $Reservation.ScopeId.ToString()
+    }
+}
+
+function ConvertTo-FailoverObject {
+    param([Microsoft.Management.Infrastructure.CimInstance]$Failover)
+    $switchInterval = $null
+    if ($Failover.StateSwitchInterval -and $Failover.StateSwitchInterval.TotalSeconds -gt 0) {
+        $switchInterval = [int]$Failover.StateSwitchInterval.TotalSeconds
+    }
+    $localFqdn = try {
+        [System.Net.Dns]::GetHostEntry([System.Net.Dns]::GetHostName()).HostName
+    } catch {
+        $env:COMPUTERNAME
+    }
+    [ordered]@{
+        name                      = [string]$Failover.Name
+        primary_server            = $localFqdn
+        secondary_server          = [string]$Failover.PartnerServer
+        mode                      = $Failover.Mode.ToString()
+        scope_ids                 = @($Failover.ScopeId | ForEach-Object { $_.ToString() })
+        max_client_lead_time      = [int]$Failover.MaxClientLeadTime.TotalSeconds
+        max_response_delay        = [int]$Failover.MaxResponseDelay.TotalSeconds
+        state_switchover_interval = $switchInterval
+        enable_auth               = [bool]$Failover.EnableAuth
+    }
+}
+
+function ConvertTo-OptionValueObject {
+    param([Microsoft.Management.Infrastructure.CimInstance]$Option)
+    [ordered]@{
+        code         = [int]$Option.OptionId
+        name         = [string]$Option.Name
+        value        = @($Option.Value | ForEach-Object { $_.ToString() })
+        type         = $Option.Type.ToString()
+        vendor_class = [string]$Option.VendorClass
+    }
+}
+
+function Find-ReservationByClientId {
+    param([string]$ClientId)
+    foreach ($scope in (Get-DhcpServerv4Scope -ErrorAction SilentlyContinue)) {
+        $match = Get-DhcpServerv4Reservation -ScopeId $scope.ScopeId -ErrorAction SilentlyContinue |
+                 Where-Object { $_.ClientId -eq $ClientId } |
+                 Select-Object -First 1
+        if ($match) { return $match }
+    }
+    return $null
+}
+
+function Write-ApiError {
+    param([string]$Message, [int]$StatusCode = 500)
+    New-PSUApiResponse -StatusCode $StatusCode `
+        -Body (@{ error = $Message } | ConvertTo-Json -Compress) `
+        -ContentType 'application/json'
+}
+
+'@
 
 
 # ===========================================================================
@@ -141,9 +143,7 @@ $HelperFunctions = {
 # Returns all DHCP scopes on this server, including router (Option 3) and
 # the name of any associated failover relationship.
 # ---------------------------------------------------------------------------
-New-PSUEndpoint -Url '/api/dhcp/scopes' -Method GET -Endpoint {
-    . ([scriptblock]::Create($using:HelperFunctions))
-
+New-PSUEndpoint -Url '/api/dhcp/scopes' -Method GET -Endpoint ([scriptblock]::Create($H + {
     try {
         $scopes = Get-DhcpServerv4Scope -ErrorAction Stop
 
@@ -157,7 +157,9 @@ New-PSUEndpoint -Url '/api/dhcp/scopes' -Method GET -Endpoint {
                     $scopeFailoverMap[$sid.ToString()] = $fo.Name
                 }
             }
-        } catch { }
+        } catch {
+            Write-Verbose "Could not enumerate failover relationships: $_"
+        }
 
         $result = @(
             $scopes | ForEach-Object {
@@ -176,22 +178,19 @@ New-PSUEndpoint -Url '/api/dhcp/scopes' -Method GET -Endpoint {
                 $obj
             }
         )
-        $result | ConvertTo-Json -Depth 4 -Compress
+        ConvertTo-Json -InputObject $result -Depth 4 -Compress
     }
     catch {
         Write-ApiError -Message $_.Exception.Message -StatusCode 500
     }
-}
+}.ToString()))
 
 
 # ---------------------------------------------------------------------------
 # GET /api/dhcp/scopes/:scope_id
 # Returns a single scope by its network address (e.g. "10.0.1.0").
 # ---------------------------------------------------------------------------
-New-PSUEndpoint -Url '/api/dhcp/scopes/:scope_id' -Method GET -Endpoint {
-    param($scope_id)
-    . ([scriptblock]::Create($using:HelperFunctions))
-
+New-PSUEndpoint -Url '/api/dhcp/scopes/:scope_id' -Method GET -Endpoint ([scriptblock]::Create($H + {
     try {
         $scope = Get-DhcpServerv4Scope -ScopeId $scope_id -ErrorAction Stop
         ConvertTo-ScopeObject $scope | ConvertTo-Json -Depth 4 -Compress
@@ -199,7 +198,7 @@ New-PSUEndpoint -Url '/api/dhcp/scopes/:scope_id' -Method GET -Endpoint {
     catch {
         Write-ApiError -Message "Scope '$scope_id' not found." -StatusCode 404
     }
-}
+}.ToString()))
 
 
 # ---------------------------------------------------------------------------
@@ -218,9 +217,7 @@ New-PSUEndpoint -Url '/api/dhcp/scopes/:scope_id' -Method GET -Endpoint {
 #     "description": ""
 #   }
 # ---------------------------------------------------------------------------
-New-PSUEndpoint -Url '/api/dhcp/scopes' -Method POST -Endpoint {
-    . ([scriptblock]::Create($using:HelperFunctions))
-
+New-PSUEndpoint -Url '/api/dhcp/scopes' -Method POST -Endpoint ([scriptblock]::Create($H + {
     try {
         $body = $Body | ConvertFrom-Json
 
@@ -265,7 +262,7 @@ New-PSUEndpoint -Url '/api/dhcp/scopes' -Method POST -Endpoint {
     catch {
         Write-ApiError -Message $_.Exception.Message -StatusCode 500
     }
-}
+}.ToString()))
 
 
 # ---------------------------------------------------------------------------
@@ -274,10 +271,7 @@ New-PSUEndpoint -Url '/api/dhcp/scopes' -Method POST -Endpoint {
 #
 # Accepts the same body shape as POST.  Only provided fields are updated.
 # ---------------------------------------------------------------------------
-New-PSUEndpoint -Url '/api/dhcp/scopes/:scope_id' -Method PUT -Endpoint {
-    param($scope_id)
-    . ([scriptblock]::Create($using:HelperFunctions))
-
+New-PSUEndpoint -Url '/api/dhcp/scopes/:scope_id' -Method PUT -Endpoint ([scriptblock]::Create($H + {
     try {
         # Verify scope exists first
         $null = Get-DhcpServerv4Scope -ScopeId $scope_id -ErrorAction Stop
@@ -320,7 +314,7 @@ New-PSUEndpoint -Url '/api/dhcp/scopes/:scope_id' -Method PUT -Endpoint {
     catch {
         Write-ApiError -Message $_.Exception.Message -StatusCode 500
     }
-}
+}.ToString()))
 
 
 # ===========================================================================
@@ -332,11 +326,9 @@ New-PSUEndpoint -Url '/api/dhcp/scopes/:scope_id' -Method PUT -Endpoint {
 # Returns active DHCP leases.  scope_id query parameter is optional.
 # Filters to Active and ActiveReservation address states only.
 # ---------------------------------------------------------------------------
-New-PSUEndpoint -Url '/api/dhcp/leases' -Method GET -Endpoint {
-    . ([scriptblock]::Create($using:HelperFunctions))
-
+New-PSUEndpoint -Url '/api/dhcp/leases' -Method GET -Endpoint ([scriptblock]::Create($H + {
     try {
-        # $scope_id comes from query string automatically in PSU
+        # $scope_id comes from the query string automatically in PSU
         $targetScopes = if ($scope_id) {
             Get-DhcpServerv4Scope -ScopeId $scope_id -ErrorAction Stop
         }
@@ -352,12 +344,12 @@ New-PSUEndpoint -Url '/api/dhcp/leases' -Method GET -Endpoint {
                 $result += ConvertTo-LeaseObject $lease
             }
         }
-        $result | ConvertTo-Json -Depth 4 -Compress
+        ConvertTo-Json -InputObject $result -Depth 4 -Compress
     }
     catch {
         Write-ApiError -Message $_.Exception.Message -StatusCode 500
     }
-}
+}.ToString()))
 
 
 # ===========================================================================
@@ -368,9 +360,7 @@ New-PSUEndpoint -Url '/api/dhcp/leases' -Method GET -Endpoint {
 # GET /api/dhcp/reservations?scope_id=10.0.1.0
 # Returns DHCP reservations.  scope_id query parameter is optional.
 # ---------------------------------------------------------------------------
-New-PSUEndpoint -Url '/api/dhcp/reservations' -Method GET -Endpoint {
-    . ([scriptblock]::Create($using:HelperFunctions))
-
+New-PSUEndpoint -Url '/api/dhcp/reservations' -Method GET -Endpoint ([scriptblock]::Create($H + {
     try {
         $targetScopes = if ($scope_id) {
             Get-DhcpServerv4Scope -ScopeId $scope_id -ErrorAction Stop
@@ -386,12 +376,12 @@ New-PSUEndpoint -Url '/api/dhcp/reservations' -Method GET -Endpoint {
                 $result += ConvertTo-ReservationObject $res
             }
         }
-        $result | ConvertTo-Json -Depth 4 -Compress
+        ConvertTo-Json -InputObject $result -Depth 4 -Compress
     }
     catch {
         Write-ApiError -Message $_.Exception.Message -StatusCode 500
     }
-}
+}.ToString()))
 
 
 # ---------------------------------------------------------------------------
@@ -408,9 +398,7 @@ New-PSUEndpoint -Url '/api/dhcp/reservations' -Method GET -Endpoint {
 #     "type":       "Dhcp"          <- "Dhcp", "Bootp", or "Both"
 #   }
 # ---------------------------------------------------------------------------
-New-PSUEndpoint -Url '/api/dhcp/reservations' -Method POST -Endpoint {
-    . ([scriptblock]::Create($using:HelperFunctions))
-
+New-PSUEndpoint -Url '/api/dhcp/reservations' -Method POST -Endpoint ([scriptblock]::Create($H + {
     try {
         $body = $Body | ConvertFrom-Json
 
@@ -447,7 +435,7 @@ New-PSUEndpoint -Url '/api/dhcp/reservations' -Method POST -Endpoint {
     catch {
         Write-ApiError -Message $_.Exception.Message -StatusCode 500
     }
-}
+}.ToString()))
 
 
 # ---------------------------------------------------------------------------
@@ -461,10 +449,7 @@ New-PSUEndpoint -Url '/api/dhcp/reservations' -Method POST -Endpoint {
 #     "type":        "Dhcp"
 #   }
 # ---------------------------------------------------------------------------
-New-PSUEndpoint -Url '/api/dhcp/reservations/:client_id' -Method PUT -Endpoint {
-    param($client_id)
-    . ([scriptblock]::Create($using:HelperFunctions))
-
+New-PSUEndpoint -Url '/api/dhcp/reservations/:client_id' -Method PUT -Endpoint ([scriptblock]::Create($H + {
     try {
         $reservation = Find-ReservationByClientId -ClientId $client_id
         if (-not $reservation) {
@@ -493,17 +478,14 @@ New-PSUEndpoint -Url '/api/dhcp/reservations/:client_id' -Method PUT -Endpoint {
     catch {
         Write-ApiError -Message $_.Exception.Message -StatusCode 500
     }
-}
+}.ToString()))
 
 
 # ---------------------------------------------------------------------------
 # DELETE /api/dhcp/reservations/:client_id
 # Removes a reservation by client MAC address.  Returns 204 No Content.
 # ---------------------------------------------------------------------------
-New-PSUEndpoint -Url '/api/dhcp/reservations/:client_id' -Method DELETE -Endpoint {
-    param($client_id)
-    . ([scriptblock]::Create($using:HelperFunctions))
-
+New-PSUEndpoint -Url '/api/dhcp/reservations/:client_id' -Method DELETE -Endpoint ([scriptblock]::Create($H + {
     try {
         $reservation = Find-ReservationByClientId -ClientId $client_id
         if (-not $reservation) {
@@ -522,7 +504,7 @@ New-PSUEndpoint -Url '/api/dhcp/reservations/:client_id' -Method DELETE -Endpoin
     catch {
         Write-ApiError -Message $_.Exception.Message -StatusCode 500
     }
-}
+}.ToString()))
 
 
 # ===========================================================================
@@ -533,15 +515,13 @@ New-PSUEndpoint -Url '/api/dhcp/reservations/:client_id' -Method DELETE -Endpoin
 # GET /api/dhcp/failover
 # Returns all DHCP failover relationships configured on this server.
 # ---------------------------------------------------------------------------
-New-PSUEndpoint -Url '/api/dhcp/failover' -Method GET -Endpoint {
-    . ([scriptblock]::Create($using:HelperFunctions))
-
+New-PSUEndpoint -Url '/api/dhcp/failover' -Method GET -Endpoint ([scriptblock]::Create($H + {
     try {
         $failovers = Get-DhcpServerv4Failover -ErrorAction Stop
         $result = @(
             $failovers | ForEach-Object { ConvertTo-FailoverObject $_ }
         )
-        $result | ConvertTo-Json -Depth 5 -Compress
+        ConvertTo-Json -InputObject $result -Depth 5 -Compress
     }
     catch {
         # No failover relationships exist — return empty array
@@ -552,7 +532,7 @@ New-PSUEndpoint -Url '/api/dhcp/failover' -Method GET -Endpoint {
             Write-ApiError -Message $_.Exception.Message -StatusCode 500
         }
     }
-}
+}.ToString()))
 
 
 # ---------------------------------------------------------------------------
@@ -575,9 +555,7 @@ New-PSUEndpoint -Url '/api/dhcp/failover' -Method GET -Endpoint {
 # Note: PSU must be running on the PRIMARY server.  The secondary_server value
 #       must be reachable by name/IP from this host.
 # ---------------------------------------------------------------------------
-New-PSUEndpoint -Url '/api/dhcp/failover' -Method POST -Endpoint {
-    . ([scriptblock]::Create($using:HelperFunctions))
-
+New-PSUEndpoint -Url '/api/dhcp/failover' -Method POST -Endpoint ([scriptblock]::Create($H + {
     try {
         $body = $Body | ConvertFrom-Json
 
@@ -626,7 +604,7 @@ New-PSUEndpoint -Url '/api/dhcp/failover' -Method POST -Endpoint {
     catch {
         Write-ApiError -Message $_.Exception.Message -StatusCode 500
     }
-}
+}.ToString()))
 
 
 # ===========================================================================
@@ -638,30 +616,25 @@ New-PSUEndpoint -Url '/api/dhcp/failover' -Method POST -Endpoint {
 # Returns all option values set at the server level.
 # Each item: { code, name, value (array), type, vendor_class }
 # ---------------------------------------------------------------------------
-New-PSUEndpoint -Url '/api/dhcp/options/server' -Method GET -Endpoint {
-    . ([scriptblock]::Create($using:HelperFunctions))
-
+New-PSUEndpoint -Url '/api/dhcp/options/server' -Method GET -Endpoint ([scriptblock]::Create($H + {
     try {
         $options = Get-DhcpServerv4OptionValue -All -ErrorAction Stop
         $result = @(
             $options | ForEach-Object { ConvertTo-OptionValueObject $_ }
         )
-        $result | ConvertTo-Json -Depth 4 -Compress
+        ConvertTo-Json -InputObject $result -Depth 4 -Compress
     }
     catch {
         Write-ApiError -Message $_.Exception.Message -StatusCode 500
     }
-}
+}.ToString()))
 
 
 # ---------------------------------------------------------------------------
 # GET /api/dhcp/options/scope/:scope_id
 # Returns all option values set on a specific scope.
 # ---------------------------------------------------------------------------
-New-PSUEndpoint -Url '/api/dhcp/options/scope/:scope_id' -Method GET -Endpoint {
-    param($scope_id)
-    . ([scriptblock]::Create($using:HelperFunctions))
-
+New-PSUEndpoint -Url '/api/dhcp/options/scope/:scope_id' -Method GET -Endpoint ([scriptblock]::Create($H + {
     try {
         # Verify scope exists
         $null = Get-DhcpServerv4Scope -ScopeId $scope_id -ErrorAction Stop
@@ -670,7 +643,7 @@ New-PSUEndpoint -Url '/api/dhcp/options/scope/:scope_id' -Method GET -Endpoint {
         $result = @(
             $options | ForEach-Object { ConvertTo-OptionValueObject $_ }
         )
-        $result | ConvertTo-Json -Depth 4 -Compress
+        ConvertTo-Json -InputObject $result -Depth 4 -Compress
     }
     catch [Microsoft.Management.Infrastructure.CimException] {
         Write-ApiError -Message "Scope '$scope_id' not found." -StatusCode 404
@@ -678,4 +651,4 @@ New-PSUEndpoint -Url '/api/dhcp/options/scope/:scope_id' -Method GET -Endpoint {
     catch {
         Write-ApiError -Message $_.Exception.Message -StatusCode 500
     }
-}
+}.ToString()))

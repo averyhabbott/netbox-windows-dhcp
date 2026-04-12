@@ -1,7 +1,7 @@
 from django import forms
 
 from ipam.models import Prefix
-from netbox.forms import NetBoxModelForm, NetBoxModelFilterSetForm
+from netbox.forms import NetBoxModelBulkEditForm, NetBoxModelForm, NetBoxModelFilterSetForm
 from utilities.forms.fields import (
     DynamicModelChoiceField,
     DynamicModelMultipleChoiceField,
@@ -25,13 +25,13 @@ from .models import (
 
 class DHCPServerForm(NetBoxModelForm):
     fieldsets = (
-        FieldSet('name', 'hostname', 'port', 'use_https', 'api_key', name='Server'),
+        FieldSet('name', 'hostname', 'port', 'use_https', 'api_key', 'verify_ssl', name='Server'),
         FieldSet('tags', name='Tags'),
     )
 
     class Meta:
         model = DHCPServer
-        fields = ('name', 'hostname', 'port', 'use_https', 'api_key', 'tags')
+        fields = ('name', 'hostname', 'port', 'use_https', 'api_key', 'verify_ssl', 'tags')
         labels = {
             'api_key': 'App Token',
         }
@@ -209,6 +209,42 @@ class DHCPScopeFilterForm(NetBoxModelFilterSetForm):
         required=False,
     )
     tag = TagFilterField(model)
+
+
+class DHCPScopeBulkEditForm(NetBoxModelBulkEditForm):
+    model = DHCPScope
+
+    fieldsets = (
+        FieldSet('router', 'lease_lifetime', 'failover', name='Scope'),
+        FieldSet('add_option_values', 'remove_option_values', name='Option Values'),
+    )
+
+    router = forms.GenericIPAddressField(
+        required=False,
+        label='Router (Option 3)',
+    )
+    lease_lifetime = forms.IntegerField(
+        required=False,
+        min_value=1,
+        label='Lease Lifetime (s)',
+    )
+    failover = DynamicModelChoiceField(
+        queryset=DHCPFailover.objects.all(),
+        required=False,
+        label='Failover Relationship',
+    )
+    add_option_values = DynamicModelMultipleChoiceField(
+        queryset=DHCPOptionValue.objects.all(),
+        required=False,
+        label='Add Option Values',
+    )
+    remove_option_values = DynamicModelMultipleChoiceField(
+        queryset=DHCPOptionValue.objects.all(),
+        required=False,
+        label='Remove Option Values',
+    )
+
+    nullable_fields = ('router', 'failover')
 
 
 # ---------------------------------------------------------------------------

@@ -15,6 +15,7 @@ from ..models import (
 class BriefPrefixSerializer(serializers.ModelSerializer):
     """Minimal read-only Prefix representation for nested use in DHCPScopeSerializer."""
     url = serializers.HyperlinkedIdentityField(view_name='ipam-api:prefix-detail')
+    display = serializers.CharField(read_only=True)
 
     class Meta:
         model = Prefix

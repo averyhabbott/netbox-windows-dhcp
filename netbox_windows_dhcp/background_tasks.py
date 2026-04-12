@@ -35,30 +35,36 @@ def _load_settings():
 # Module-level sync functions — shared by DHCPSyncJob and DHCPServerSyncJob
 # ---------------------------------------------------------------------------
 
-def _upsert_ip_address(job_logger, ip_str: str, status: str, dns_name: str, description: str):
+def _upsert_ip_address(job_logger, ip_str: str, prefix_len: int, status: str, dns_name: str, client_id: str):
     from ipam.models import IPAddress
     try:
-        obj, created = IPAddress.objects.get_or_create(
-            address=f'{ip_str}/32',
-            defaults={
-                'status': status,
-                'dns_name': dns_name[:255] if dns_name else '',
-                'description': description[:200] if description else '',
-            },
-        )
-        if not created:
-            changed = False
-            if obj.status != status:
-                obj.status = status
-                changed = True
-            if dns_name and obj.dns_name != dns_name[:255]:
-                obj.dns_name = dns_name[:255]
-                changed = True
-            if description and obj.description != description[:200]:
-                obj.description = description[:200]
-                changed = True
-            if changed:
-                obj.save()
+        # Match on host address regardless of prefix length (/24, /32, etc.)
+        qs = IPAddress.objects.filter(address__net_host=ip_str)
+        if qs.exists():
+            obj = qs.first()
+            created = False
+        else:
+            obj = IPAddress(address=f'{ip_str}/{prefix_len}')
+            created = True
+
+        changed = created
+
+        if obj.status != status:
+            obj.status = status
+            changed = True
+
+        new_dns = dns_name[:255] if dns_name else ''
+        if new_dns and obj.dns_name != new_dns:
+            obj.dns_name = new_dns
+            changed = True
+
+        if client_id and obj.custom_field_data.get('dhcp_client_id') != client_id:
+            obj.custom_field_data['dhcp_client_id'] = client_id
+            changed = True
+
+        if changed:
+            obj.save()
+
         action = 'Created' if created else 'Updated'
         job_logger.debug('%s IP Address %s → status=%s', action, ip_str, status)
     except Exception as exc:
@@ -66,6 +72,7 @@ def _upsert_ip_address(job_logger, ip_str: str, status: str, dns_name: str, desc
 
 
 def _update_ip_addresses_from_reservations(job_logger, scope, reservations: list):
+    prefix_len = scope.prefix.prefix.prefixlen
     for res in reservations:
         ip_str = res.get('ip_address') or res.get('IPAddress')
         client_id = res.get('client_id') or res.get('ClientId') or ''
@@ -75,14 +82,16 @@ def _update_ip_addresses_from_reservations(job_logger, scope, reservations: list
         _upsert_ip_address(
             job_logger,
             ip_str=ip_str,
+            prefix_len=prefix_len,
             status='dhcp-reserved',
             dns_name=name,
-            description=f'DHCP Reservation | Client ID: {client_id}' if client_id else 'DHCP Reservation',
+            client_id=client_id,
         )
 
 
 def _update_ip_addresses_from_leases(job_logger, scope, leases: list):
     from ipam.models import IPAddress
+    prefix_len = scope.prefix.prefix.prefixlen
     for lease in leases:
         ip_str = lease.get('ip_address') or lease.get('IPAddress')
         client_id = lease.get('client_id') or lease.get('ClientId') or ''
@@ -104,9 +113,10 @@ def _update_ip_addresses_from_leases(job_logger, scope, leases: list):
         _upsert_ip_address(
             job_logger,
             ip_str=ip_str,
+            prefix_len=prefix_len,
             status='dhcp-lease',
             dns_name=hostname,
-            description=f'DHCP Lease | Client ID: {client_id}' if client_id else 'DHCP Lease',
+            client_id=client_id,
         )
 
 
@@ -271,9 +281,16 @@ class DHCPServerSyncJob(JobRunner):
         description = 'On-demand sync for a single Windows DHCP server.'
 
     def run(self, *args, **kwargs):
-        server = self.job.object
-        if not server:
-            self.logger.error('No server attached to job.')
+        server_pk = kwargs.get('server_pk')
+        if not server_pk:
+            self.logger.error('No server_pk provided to job.')
+            return
+
+        from .models import DHCPServer
+        try:
+            server = DHCPServer.objects.get(pk=server_pk)
+        except DHCPServer.DoesNotExist:
+            self.logger.error('DHCPServer pk=%s not found.', server_pk)
             return
 
         cfg = _load_settings()
