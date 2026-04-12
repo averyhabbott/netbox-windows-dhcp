@@ -28,9 +28,9 @@ PSU v5 uses JWT App Tokens for authentication.
 1. In the PSU admin console, go to **Security → App Tokens** and generate a new token
 2. Copy the token value
 3. In NetBox, edit the **DHCP Server** object and paste the token into the **App Token** field
-4. Add `-Authentication` to each `New-PSUEndpoint` call in the script to enforce the token
+4. At the top of `dhcp_api_endpoints.ps1`, set `$RequireAuthentication = $true`
 
-Without `-Authentication`, the endpoints are unauthenticated and accessible to anyone who can reach the PSU server.
+Without authentication enabled, the endpoints are accessible to anyone who can reach the PSU server.
 
 The plugin sends the token as:
 

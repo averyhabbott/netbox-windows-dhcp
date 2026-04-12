@@ -72,7 +72,7 @@ class DHCPServer(NetBoxModel):
     port = models.PositiveIntegerField(default=443)
     use_https = models.BooleanField(default=True, verbose_name='Use HTTPS')
     api_key = models.CharField(
-        max_length=500,
+        max_length=2000,
         blank=True,
         verbose_name='App Token',
         help_text='PSU v5 App Token (Security → App Tokens in the PSU admin console). Sent as Authorization: Bearer. Leave blank if auth is not required.',

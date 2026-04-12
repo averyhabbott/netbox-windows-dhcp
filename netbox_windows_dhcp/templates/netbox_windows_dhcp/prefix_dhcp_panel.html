@@ -17,7 +17,7 @@
           <th>Range</th>
           <th>Router</th>
           <th>Failover</th>
-          <th>Lease (s)</th>
+          <th>Lease</th>
           <th></th>
         </tr>
       </thead>
@@ -28,7 +28,7 @@
           <td><code>{{ scope.start_ip }} – {{ scope.end_ip }}</code></td>
           <td>{% if scope.router %}<code>{{ scope.router }}</code>{% else %}<span class="text-muted">—</span>{% endif %}</td>
           <td>{% if scope.failover %}<a href="{{ scope.failover.get_absolute_url }}">{{ scope.failover }}</a>{% else %}<span class="text-muted">—</span>{% endif %}</td>
-          <td>{{ scope.lease_lifetime }}</td>
+          <td>{{ scope.lease_lifetime_display }}</td>
           <td class="text-end">
             <a href="{{ scope.get_absolute_url }}" class="btn btn-sm btn-outline-secondary" title="View">
               <i class="mdi mdi-eye"></i>

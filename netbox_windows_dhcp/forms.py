@@ -39,6 +39,10 @@ class DHCPServerForm(NetBoxModelForm):
             'api_key': forms.PasswordInput(render_value=True),
         }
 
+    def clean_api_key(self):
+        """Strip whitespace that may have been introduced by copy-pasting the token."""
+        return self.cleaned_data.get('api_key', '').strip()
+
 
 class DHCPServerFilterForm(NetBoxModelFilterSetForm):
     model = DHCPServer

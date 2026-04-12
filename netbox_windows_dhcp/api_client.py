@@ -42,8 +42,9 @@ class PSUClient:
         self.session = requests.Session()
         self.session.verify = server.verify_ssl
         if server.api_key:
-            # PSU v5 uses JWT App Tokens passed as Bearer tokens
-            self.session.headers['Authorization'] = f'Bearer {server.api_key}'
+            # PSU v5 uses JWT App Tokens passed as Bearer tokens.
+            # Strip whitespace in case the token was copy-pasted with trailing newlines/spaces.
+            self.session.headers['Authorization'] = f'Bearer {server.api_key.strip()}'
         self.session.headers['Accept'] = 'application/json'
         self.session.headers['Content-Type'] = 'application/json'
 

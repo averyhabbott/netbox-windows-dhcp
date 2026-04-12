@@ -32,6 +32,20 @@
 
 
 # ===========================================================================
+# CONFIGURATION
+# ===========================================================================
+
+# Set to $true to require a PSU App Token on all endpoints.
+# Generate a token in the PSU admin console under Security > App Tokens,
+# then paste it into the App Token field on the DHCP Server object in NetBox.
+$RequireAuthentication = $false
+
+# Internal — builds the -Authentication splat used on every New-PSUEndpoint call.
+# Do not edit this line.
+$_epAuth = if ($RequireAuthentication) { @{ Authentication = $true } } else { @{} }
+
+
+# ===========================================================================
 # SHARED HELPERS — embedded into every endpoint via [scriptblock]::Create()
 # ===========================================================================
 
@@ -143,7 +157,7 @@ function Write-ApiError {
 # Returns all DHCP scopes on this server, including router (Option 3) and
 # the name of any associated failover relationship.
 # ---------------------------------------------------------------------------
-New-PSUEndpoint -Url '/api/dhcp/scopes' -Method GET -Endpoint ([scriptblock]::Create($H + {
+New-PSUEndpoint -Url '/api/dhcp/scopes' -Method GET @_epAuth -Endpoint ([scriptblock]::Create($H + {
     try {
         $scopes = Get-DhcpServerv4Scope -ErrorAction Stop
 
@@ -190,7 +204,7 @@ New-PSUEndpoint -Url '/api/dhcp/scopes' -Method GET -Endpoint ([scriptblock]::Cr
 # GET /api/dhcp/scopes/:scope_id
 # Returns a single scope by its network address (e.g. "10.0.1.0").
 # ---------------------------------------------------------------------------
-New-PSUEndpoint -Url '/api/dhcp/scopes/:scope_id' -Method GET -Endpoint ([scriptblock]::Create($H + {
+New-PSUEndpoint -Url '/api/dhcp/scopes/:scope_id' -Method GET @_epAuth -Endpoint ([scriptblock]::Create($H + {
     try {
         $scope = Get-DhcpServerv4Scope -ScopeId $scope_id -ErrorAction Stop
         ConvertTo-ScopeObject $scope | ConvertTo-Json -Depth 4 -Compress
@@ -217,7 +231,7 @@ New-PSUEndpoint -Url '/api/dhcp/scopes/:scope_id' -Method GET -Endpoint ([script
 #     "description": ""
 #   }
 # ---------------------------------------------------------------------------
-New-PSUEndpoint -Url '/api/dhcp/scopes' -Method POST -Endpoint ([scriptblock]::Create($H + {
+New-PSUEndpoint -Url '/api/dhcp/scopes' -Method POST @_epAuth -Endpoint ([scriptblock]::Create($H + {
     try {
         $body = $Body | ConvertFrom-Json
 
@@ -271,7 +285,7 @@ New-PSUEndpoint -Url '/api/dhcp/scopes' -Method POST -Endpoint ([scriptblock]::C
 #
 # Accepts the same body shape as POST.  Only provided fields are updated.
 # ---------------------------------------------------------------------------
-New-PSUEndpoint -Url '/api/dhcp/scopes/:scope_id' -Method PUT -Endpoint ([scriptblock]::Create($H + {
+New-PSUEndpoint -Url '/api/dhcp/scopes/:scope_id' -Method PUT @_epAuth -Endpoint ([scriptblock]::Create($H + {
     try {
         # Verify scope exists first
         $null = Get-DhcpServerv4Scope -ScopeId $scope_id -ErrorAction Stop
@@ -326,7 +340,7 @@ New-PSUEndpoint -Url '/api/dhcp/scopes/:scope_id' -Method PUT -Endpoint ([script
 # Returns active DHCP leases.  scope_id query parameter is optional.
 # Filters to Active and ActiveReservation address states only.
 # ---------------------------------------------------------------------------
-New-PSUEndpoint -Url '/api/dhcp/leases' -Method GET -Endpoint ([scriptblock]::Create($H + {
+New-PSUEndpoint -Url '/api/dhcp/leases' -Method GET @_epAuth -Endpoint ([scriptblock]::Create($H + {
     try {
         # $scope_id comes from the query string automatically in PSU
         $targetScopes = if ($scope_id) {
@@ -360,7 +374,7 @@ New-PSUEndpoint -Url '/api/dhcp/leases' -Method GET -Endpoint ([scriptblock]::Cr
 # GET /api/dhcp/reservations?scope_id=10.0.1.0
 # Returns DHCP reservations.  scope_id query parameter is optional.
 # ---------------------------------------------------------------------------
-New-PSUEndpoint -Url '/api/dhcp/reservations' -Method GET -Endpoint ([scriptblock]::Create($H + {
+New-PSUEndpoint -Url '/api/dhcp/reservations' -Method GET @_epAuth -Endpoint ([scriptblock]::Create($H + {
     try {
         $targetScopes = if ($scope_id) {
             Get-DhcpServerv4Scope -ScopeId $scope_id -ErrorAction Stop
@@ -398,7 +412,7 @@ New-PSUEndpoint -Url '/api/dhcp/reservations' -Method GET -Endpoint ([scriptbloc
 #     "type":       "Dhcp"          <- "Dhcp", "Bootp", or "Both"
 #   }
 # ---------------------------------------------------------------------------
-New-PSUEndpoint -Url '/api/dhcp/reservations' -Method POST -Endpoint ([scriptblock]::Create($H + {
+New-PSUEndpoint -Url '/api/dhcp/reservations' -Method POST @_epAuth -Endpoint ([scriptblock]::Create($H + {
     try {
         $body = $Body | ConvertFrom-Json
 
@@ -449,7 +463,7 @@ New-PSUEndpoint -Url '/api/dhcp/reservations' -Method POST -Endpoint ([scriptblo
 #     "type":        "Dhcp"
 #   }
 # ---------------------------------------------------------------------------
-New-PSUEndpoint -Url '/api/dhcp/reservations/:client_id' -Method PUT -Endpoint ([scriptblock]::Create($H + {
+New-PSUEndpoint -Url '/api/dhcp/reservations/:client_id' -Method PUT @_epAuth -Endpoint ([scriptblock]::Create($H + {
     try {
         $reservation = Find-ReservationByClientId -ClientId $client_id
         if (-not $reservation) {
@@ -485,7 +499,7 @@ New-PSUEndpoint -Url '/api/dhcp/reservations/:client_id' -Method PUT -Endpoint (
 # DELETE /api/dhcp/reservations/:client_id
 # Removes a reservation by client MAC address.  Returns 204 No Content.
 # ---------------------------------------------------------------------------
-New-PSUEndpoint -Url '/api/dhcp/reservations/:client_id' -Method DELETE -Endpoint ([scriptblock]::Create($H + {
+New-PSUEndpoint -Url '/api/dhcp/reservations/:client_id' -Method DELETE @_epAuth -Endpoint ([scriptblock]::Create($H + {
     try {
         $reservation = Find-ReservationByClientId -ClientId $client_id
         if (-not $reservation) {
@@ -515,7 +529,7 @@ New-PSUEndpoint -Url '/api/dhcp/reservations/:client_id' -Method DELETE -Endpoin
 # GET /api/dhcp/failover
 # Returns all DHCP failover relationships configured on this server.
 # ---------------------------------------------------------------------------
-New-PSUEndpoint -Url '/api/dhcp/failover' -Method GET -Endpoint ([scriptblock]::Create($H + {
+New-PSUEndpoint -Url '/api/dhcp/failover' -Method GET @_epAuth -Endpoint ([scriptblock]::Create($H + {
     try {
         $failovers = Get-DhcpServerv4Failover -ErrorAction Stop
         $result = @(
@@ -555,7 +569,7 @@ New-PSUEndpoint -Url '/api/dhcp/failover' -Method GET -Endpoint ([scriptblock]::
 # Note: PSU must be running on the PRIMARY server.  The secondary_server value
 #       must be reachable by name/IP from this host.
 # ---------------------------------------------------------------------------
-New-PSUEndpoint -Url '/api/dhcp/failover' -Method POST -Endpoint ([scriptblock]::Create($H + {
+New-PSUEndpoint -Url '/api/dhcp/failover' -Method POST @_epAuth -Endpoint ([scriptblock]::Create($H + {
     try {
         $body = $Body | ConvertFrom-Json
 
@@ -616,7 +630,7 @@ New-PSUEndpoint -Url '/api/dhcp/failover' -Method POST -Endpoint ([scriptblock]:
 # Returns all option values set at the server level.
 # Each item: { code, name, value (array), type, vendor_class }
 # ---------------------------------------------------------------------------
-New-PSUEndpoint -Url '/api/dhcp/options/server' -Method GET -Endpoint ([scriptblock]::Create($H + {
+New-PSUEndpoint -Url '/api/dhcp/options/server' -Method GET @_epAuth -Endpoint ([scriptblock]::Create($H + {
     try {
         $options = Get-DhcpServerv4OptionValue -All -ErrorAction Stop
         $result = @(
@@ -634,7 +648,7 @@ New-PSUEndpoint -Url '/api/dhcp/options/server' -Method GET -Endpoint ([scriptbl
 # GET /api/dhcp/options/scope/:scope_id
 # Returns all option values set on a specific scope.
 # ---------------------------------------------------------------------------
-New-PSUEndpoint -Url '/api/dhcp/options/scope/:scope_id' -Method GET -Endpoint ([scriptblock]::Create($H + {
+New-PSUEndpoint -Url '/api/dhcp/options/scope/:scope_id' -Method GET @_epAuth -Endpoint ([scriptblock]::Create($H + {
     try {
         # Verify scope exists
         $null = Get-DhcpServerv4Scope -ScopeId $scope_id -ErrorAction Stop
