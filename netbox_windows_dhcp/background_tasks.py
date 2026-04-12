@@ -17,12 +17,37 @@ Sync logic:
 """
 
 import logging
+import uuid
+from contextlib import contextmanager
 from typing import Optional
 
 from core.choices import JobIntervalChoices
 from netbox.jobs import JobRunner, system_job
 
 logger = logging.getLogger('netbox_windows_dhcp')
+
+
+@contextmanager
+def _change_logging(user):
+    """
+    Set current_request so that NetBox's post_save signal handler creates ObjectChange records.
+
+    NetBox's handle_changed_object (core/signals.py) returns immediately if current_request
+    is None, which is always the case in background jobs because JobRunner.handle() never
+    sets up the request context that middleware would normally provide.
+    """
+    from netbox.context import current_request
+
+    class _FakeRequest:
+        def __init__(self, user):
+            self.user = user
+            self.id = uuid.uuid4()
+
+    token = current_request.set(_FakeRequest(user))
+    try:
+        yield
+    finally:
+        current_request.reset(token)
 
 
 def _load_settings():
@@ -42,6 +67,7 @@ def _upsert_ip_address(job_logger, ip_str: str, prefix_len: int, status: str, dn
         qs = IPAddress.objects.filter(address__net_host=ip_str)
         if qs.exists():
             obj = qs.first()
+            obj.snapshot()  # Capture pre-change state for changelog before any modifications
             created = False
         else:
             obj = IPAddress(address=f'{ip_str}/{prefix_len}')
@@ -71,8 +97,6 @@ def _upsert_ip_address(job_logger, ip_str: str, prefix_len: int, status: str, dn
             changed = True
 
         if changed:
-            if not created:
-                obj.snapshot()
             obj.save()
             action = 'Created' if created else 'Updated'
             reason_str = f' [{", ".join(change_reasons)}]' if change_reasons else ''
@@ -130,6 +154,50 @@ def _update_ip_addresses_from_leases(job_logger, scope, leases: list):
             dns_name=hostname,
             client_id=client_id,
         )
+
+
+def _cleanup_stale_ips(job_logger, scope, lease_ips: set, reservation_ips: set, push_reservations: bool):
+    """
+    Remove or downgrade IPs within a scope that no longer exist on the DHCP server.
+
+    - dhcp-reserved with no matching reservation (only when push_reservations is False):
+        if a lease exists → downgrade to dhcp-lease
+        else → delete
+    - dhcp-lease with no matching lease → delete
+
+    When push_reservations is True, NetBox is the source of truth for reservations,
+    so dhcp-reserved IPs are never deleted or downgraded based on server state.
+    """
+    from ipam.models import IPAddress
+
+    prefix_cidr = str(scope.prefix.prefix)
+    managed = IPAddress.objects.filter(
+        address__net_contained_or_equal=prefix_cidr,
+        status__in=('dhcp-lease', 'dhcp-reserved'),
+    )
+
+    for ip_obj in managed:
+        ip_str = str(ip_obj.address.ip)
+
+        if ip_obj.status == 'dhcp-reserved':
+            if push_reservations:
+                # NetBox is the source of truth; don't remove reservations based on server state
+                continue
+            if ip_str not in reservation_ips:
+                if ip_str in lease_ips:
+                    ip_obj.snapshot()
+                    ip_obj.status = 'dhcp-lease'
+                    ip_obj.save()
+                    job_logger.info(
+                        f'Downgraded IP {ip_str} dhcp-reserved→dhcp-lease (reservation removed, lease still active)'
+                    )
+                else:
+                    job_logger.info(f'Deleting IP {ip_str} — reservation and lease no longer exist on server')
+                    ip_obj.delete()
+
+        elif ip_obj.status == 'dhcp-lease' and ip_str not in lease_ips:
+            job_logger.info(f'Deleting IP {ip_str} — lease expired or no longer exists on server')
+            ip_obj.delete()
 
 
 def _push_reservations(job_logger, client, scope, scope_id: str):
@@ -235,12 +303,27 @@ def _sync_server(job_logger, server, sync_mode: str, push_reservations: bool, pu
                 leases = client.list_leases(scope_id=scope_id)
                 reservations = client.list_reservations(scope_id=scope_id)
             except PSUClientError as exc:
-                job_logger.error(f'Failed to fetch leases/reservations for scope {scope_id}: {exc}')
-                leases, reservations = [], []
+                job_logger.error(
+                    f'Failed to fetch leases/reservations for scope {scope_id}: {exc} — skipping cleanup'
+                )
+                leases, reservations = None, None
 
-            job_logger.info(f'Scope {scope_id}: {len(leases)} lease(s), {len(reservations)} reservation(s)')
-            _update_ip_addresses_from_reservations(job_logger, scope, reservations)
-            _update_ip_addresses_from_leases(job_logger, scope, leases)
+            if leases is not None:
+                job_logger.info(f'Scope {scope_id}: {len(leases)} lease(s), {len(reservations)} reservation(s)')
+                _update_ip_addresses_from_reservations(job_logger, scope, reservations)
+                _update_ip_addresses_from_leases(job_logger, scope, leases)
+
+                lease_ips = {
+                    r.get('ip_address') or r.get('IPAddress')
+                    for r in leases
+                    if r.get('ip_address') or r.get('IPAddress')
+                }
+                reservation_ips = {
+                    r.get('ip_address') or r.get('IPAddress')
+                    for r in reservations
+                    if r.get('ip_address') or r.get('IPAddress')
+                }
+                _cleanup_stale_ips(job_logger, scope, lease_ips, reservation_ips, push_reservations)
         else:
             job_logger.info(f'Scope {scope_id}: skipping IP updates (sync_mode={sync_mode})')
 
@@ -253,18 +336,32 @@ def _sync_server(job_logger, server, sync_mode: str, push_reservations: bool, pu
         if push_scope_info:
             _push_scope(job_logger, client, scope, scope_id)
 
-    # For push_scope_info: push any local scopes associated with this server that
-    # don't exist remotely yet (i.e. need to be created on the DHCP server).
-    if push_scope_info:
-        for network, scope in local_scope_map.items():
-            if network in remote_scope_map:
-                continue  # already handled above
-            # Only push if this scope is linked to this server via its failover relationship
-            if scope.failover and (
-                scope.failover.primary_server_id == server.pk
-                or scope.failover.secondary_server_id == server.pk
-            ):
-                _push_scope(job_logger, client, scope)
+    # Handle local scopes that have no matching remote scope on this server.
+    # Only consider scopes linked to this server via their failover relationship.
+    for network, scope in local_scope_map.items():
+        if network in remote_scope_map:
+            continue  # already handled in the loop above
+
+        is_this_server = scope.failover and (
+            scope.failover.primary_server_id == server.pk
+            or scope.failover.secondary_server_id == server.pk
+        )
+        if not is_this_server:
+            continue
+
+        if push_scope_info:
+            # Push scope info is on — create the missing scope on the server.
+            _push_scope(job_logger, client, scope)
+        else:
+            # Server is reachable and doesn't know this scope — remove it from NetBox.
+            job_logger.info(
+                f'Deleting scope "{scope.name}" ({network}) — '
+                f'no longer exists on {server.name} and push_scope_info is disabled'
+            )
+            try:
+                scope.delete()
+            except Exception as exc:
+                job_logger.warning(f'Failed to delete scope "{scope.name}" ({network}): {exc}')
 
 
 # ---------------------------------------------------------------------------
@@ -299,11 +396,12 @@ class DHCPSyncJob(JobRunner):
             f'push_reservations={push_reservations} push_scope_info={push_scope_info}'
         )
 
-        for server in servers:
-            try:
-                _sync_server(self.logger, server, sync_mode, push_reservations, push_scope_info)
-            except Exception as exc:
-                self.logger.error(f'Error syncing server {server.name}: {exc}')
+        with _change_logging(self.job.user):
+            for server in servers:
+                try:
+                    _sync_server(self.logger, server, sync_mode, push_reservations, push_scope_info)
+                except Exception as exc:
+                    self.logger.error(f'Error syncing server {server.name}: {exc}')
 
 
 class DHCPServerSyncJob(JobRunner):
@@ -327,7 +425,8 @@ class DHCPServerSyncJob(JobRunner):
             return
 
         cfg = _load_settings()
-        _sync_server(self.logger, server, cfg.scope_sync_mode, cfg.push_reservations, cfg.push_scope_info)
+        with _change_logging(self.job.user):
+            _sync_server(self.logger, server, cfg.scope_sync_mode, cfg.push_reservations, cfg.push_scope_info)
 
 
 class DHCPImportJob(JobRunner):
@@ -352,7 +451,8 @@ class DHCPImportJob(JobRunner):
 
         from .import_logic import run_import
         self.logger.info(f'Starting import from {server.name} ({server.hostname})')
-        results = run_import(server)
+        with _change_logging(self.job.user):
+            results = run_import(server)
 
         for category, data in results.items():
             created = data.get('created', [])
