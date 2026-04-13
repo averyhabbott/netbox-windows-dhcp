@@ -22,9 +22,10 @@ def run_import(server) -> Dict:
     from .api_client import PSUClient, PSUClientError
 
     results = {
-        'failovers': {'created': [], 'skipped': [], 'errors': []},
-        'scopes':    {'created': [], 'skipped': [], 'errors': []},
-        'option_values': {'created': [], 'skipped': [], 'errors': []},
+        'failovers':        {'created': [], 'skipped': [], 'errors': []},
+        'scopes':           {'created': [], 'skipped': [], 'errors': []},
+        'option_values':    {'created': [], 'skipped': [], 'errors': []},
+        'exclusion_ranges': {'created': [], 'skipped': [], 'errors': []},
     }
 
     client = PSUClient(server)
@@ -164,9 +165,20 @@ def _import_scope(client, rs: Dict, results: Dict):
         defaults={'status': 'active'},
     )
 
-    # Skip if a scope with this name + prefix already exists
-    if DHCPScope.objects.filter(prefix=prefix_obj, name=name).exists():
+    # Skip if a scope with this name + prefix already exists, but still import
+    # exclusion ranges in case they were added after the scope was first imported.
+    existing = DHCPScope.objects.filter(prefix=prefix_obj, name=name).first()
+    if existing:
         results['scopes']['skipped'].append(f'{name} ({cidr})')
+        from .api_client import PSUClientError
+        try:
+            remote_exclusions = client.list_exclusions(scope_id)
+            for re in remote_exclusions:
+                _import_exclusion_range(existing, re, results)
+        except PSUClientError as exc:
+            results['exclusion_ranges']['errors'].append(
+                f'Scope {name}: could not fetch exclusion ranges: {exc}'
+            )
         return
 
     # Optionally link a failover if the API tells us the failover name
@@ -195,6 +207,16 @@ def _import_scope(client, rs: Dict, results: Dict):
     except PSUClientError as exc:
         results['option_values']['errors'].append(
             f'Scope {name}: could not fetch options: {exc}'
+        )
+
+    # Import exclusion ranges
+    try:
+        remote_exclusions = client.list_exclusions(scope_id)
+        for re in remote_exclusions:
+            _import_exclusion_range(scope, re, results)
+    except PSUClientError as exc:
+        results['exclusion_ranges']['errors'].append(
+            f'Scope {name}: could not fetch exclusion ranges: {exc}'
         )
 
 
@@ -255,3 +277,32 @@ def _import_option_value(scope, ro: Dict, results: Dict):
         results['option_values']['created'].append(label)
     else:
         results['option_values']['skipped'].append(label)
+
+
+# ---------------------------------------------------------------------- #
+# Exclusion range helper
+# ---------------------------------------------------------------------- #
+
+def _import_exclusion_range(scope, re: Dict, results: Dict):
+    from .models import DHCPExclusionRange
+
+    start_ip = re.get('start_ip') or re.get('StartRange') or ''
+    end_ip   = re.get('end_ip')   or re.get('EndRange')   or ''
+
+    if not start_ip or not end_ip:
+        results['exclusion_ranges']['errors'].append(
+            f'Scope {scope.name}: exclusion range missing start_ip or end_ip — skipped.'
+        )
+        return
+
+    _, created = DHCPExclusionRange.objects.get_or_create(
+        scope=scope,
+        start_ip=start_ip,
+        end_ip=end_ip,
+    )
+
+    label = f'{start_ip} – {end_ip} (scope: {scope.name})'
+    if created:
+        results['exclusion_ranges']['created'].append(label)
+    else:
+        results['exclusion_ranges']['skipped'].append(label)

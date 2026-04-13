@@ -4,6 +4,7 @@ from netbox.views.generic import ObjectChangeLogView
 
 from . import views
 from .models import (
+    DHCPExclusionRange,
     DHCPFailover,
     DHCPOptionCodeDefinition,
     DHCPOptionValue,
@@ -75,6 +76,15 @@ urlpatterns = [
     path('scopes/<int:pk>/edit/', views.DHCPScopeEditView.as_view(), name='dhcpscope_edit'),
     path('scopes/<int:pk>/delete/', views.DHCPScopeDeleteView.as_view(), name='dhcpscope_delete'),
     path('scopes/<int:pk>/changelog/', ObjectChangeLogView.as_view(), {'model': DHCPScope}, name='dhcpscope_changelog'),
+
+    # -----------------------------------------------------------------------
+    # DHCPExclusionRange
+    # -----------------------------------------------------------------------
+    path('exclusion-ranges/add/', views.DHCPExclusionRangeCreateView.as_view(), name='dhcpexclusionrange_add'),
+    path('exclusion-ranges/<int:pk>/', views.DHCPExclusionRangeView.as_view(), name='dhcpexclusionrange'),
+    path('exclusion-ranges/<int:pk>/edit/', views.DHCPExclusionRangeEditView.as_view(), name='dhcpexclusionrange_edit'),
+    path('exclusion-ranges/<int:pk>/delete/', views.DHCPExclusionRangeDeleteView.as_view(), name='dhcpexclusionrange_delete'),
+    path('exclusion-ranges/<int:pk>/changelog/', ObjectChangeLogView.as_view(), {'model': DHCPExclusionRange}, name='dhcpexclusionrange_changelog'),
 
     # -----------------------------------------------------------------------
     # Settings

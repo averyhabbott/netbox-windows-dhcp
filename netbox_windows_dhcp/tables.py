@@ -2,6 +2,7 @@ import django_tables2 as tables
 from netbox.tables import NetBoxTable, BooleanColumn, ActionsColumn, TagColumn
 
 from .models import (
+    DHCPExclusionRange,
     DHCPFailover,
     DHCPOptionCodeDefinition,
     DHCPOptionValue,
@@ -88,6 +89,17 @@ class DHCPOptionValueTable(NetBoxTable):
 
     def render_friendly_name(self, value, record):
         return value or str(record)
+
+
+class DHCPExclusionRangeTable(NetBoxTable):
+    start_ip = tables.Column(verbose_name='Start IP')
+    end_ip = tables.Column(verbose_name='End IP')
+    scope = tables.Column(linkify=True, verbose_name='Scope')
+
+    class Meta(NetBoxTable.Meta):
+        model = DHCPExclusionRange
+        fields = ('pk', 'start_ip', 'end_ip', 'scope', 'actions')
+        default_columns = ('start_ip', 'end_ip', 'actions')
 
 
 class DHCPScopeTable(NetBoxTable):

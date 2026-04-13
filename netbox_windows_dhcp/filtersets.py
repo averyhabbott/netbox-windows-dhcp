@@ -4,6 +4,7 @@ from netbox.filtersets import NetBoxModelFilterSet
 from utilities.filtersets import register_filterset
 
 from .models import (
+    DHCPExclusionRange,
     DHCPFailover,
     DHCPOptionCodeDefinition,
     DHCPOptionValue,
@@ -106,6 +107,28 @@ class DHCPOptionValueFilterSet(NetBoxModelFilterSet):
             Q(friendly_name__icontains=value) |
             Q(value__icontains=value) |
             Q(option_definition__name__icontains=value)
+        )
+
+
+@register_filterset
+class DHCPExclusionRangeFilterSet(NetBoxModelFilterSet):
+    scope_id = django_filters.ModelMultipleChoiceFilter(
+        queryset=DHCPScope.objects.all(),
+        field_name='scope',
+        label='Scope',
+    )
+
+    class Meta:
+        model = DHCPExclusionRange
+        fields = ('scope', 'start_ip', 'end_ip')
+
+    def search(self, queryset, name, value):
+        if not value.strip():
+            return queryset
+        return queryset.filter(
+            Q(start_ip__icontains=value) |
+            Q(end_ip__icontains=value) |
+            Q(scope__name__icontains=value)
         )
 
 

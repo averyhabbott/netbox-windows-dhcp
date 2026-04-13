@@ -261,6 +261,62 @@ class DHCPOptionValue(NetBoxModel):
         return reverse('plugins:netbox_windows_dhcp:dhcpoptionvalue', args=[self.pk])
 
 
+class DHCPExclusionRange(NetBoxModel):
+    """
+    An IP address range excluded from dynamic allocation within a DHCP scope.
+    Windows DHCP exclusion ranges are identified by scope + start_ip + end_ip;
+    there is no server-side ID. Multiple exclusion ranges are allowed per scope.
+    """
+
+    scope = models.ForeignKey(
+        'DHCPScope',
+        on_delete=models.CASCADE,
+        related_name='exclusion_ranges',
+        verbose_name='Scope',
+    )
+    start_ip = models.GenericIPAddressField(verbose_name='Start IP')
+    end_ip = models.GenericIPAddressField(verbose_name='End IP')
+
+    class Meta:
+        ordering = ['scope', 'start_ip']
+        unique_together = [('scope', 'start_ip', 'end_ip')]
+        verbose_name = 'DHCP Exclusion Range'
+        verbose_name_plural = 'DHCP Exclusion Ranges'
+
+    def __str__(self):
+        return f'{self.start_ip} – {self.end_ip}'
+
+    def get_absolute_url(self):
+        return reverse('plugins:netbox_windows_dhcp:dhcpexclusionrange', args=[self.pk])
+
+    def clean(self):
+        super().clean()
+        if not self.start_ip or not self.end_ip:
+            return
+        try:
+            start = NetAddrIP(self.start_ip)
+            end = NetAddrIP(self.end_ip)
+        except Exception:
+            return
+        if start > end:
+            raise ValidationError(
+                {'end_ip': 'End IP must be greater than or equal to the Start IP.'}
+            )
+        if self.scope_id:
+            try:
+                prefix_network = IPNetwork(str(self.scope.prefix.prefix))
+            except Exception:
+                return
+            if start not in prefix_network:
+                raise ValidationError(
+                    {'start_ip': f'Start IP must be within the scope prefix {self.scope.prefix.prefix}.'}
+                )
+            if end not in prefix_network:
+                raise ValidationError(
+                    {'end_ip': f'End IP must be within the scope prefix {self.scope.prefix.prefix}.'}
+                )
+
+
 class DHCPScope(NetBoxModel):
     """
     A DHCP scope associated with a NetBox Prefix.

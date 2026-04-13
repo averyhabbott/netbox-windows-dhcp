@@ -9,5 +9,6 @@ router.register('failover', views.DHCPFailoverViewSet)
 router.register('option-codes', views.DHCPOptionCodeDefinitionViewSet)
 router.register('option-values', views.DHCPOptionValueViewSet)
 router.register('scopes', views.DHCPScopeViewSet)
+router.register('exclusion-ranges', views.DHCPExclusionRangeViewSet)
 
 urlpatterns = router.urls

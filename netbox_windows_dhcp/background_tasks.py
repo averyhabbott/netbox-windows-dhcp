@@ -231,7 +231,126 @@ def _push_reservations(job_logger, client, scope, scope_id: str):
             job_logger.warning(f'Failed to push reservation {ip_obj}: {exc}')
 
 
-def _push_scope(job_logger, client, scope, scope_id: Optional[str] = None):
+def _pull_exclusions(job_logger, client, scope, scope_id: str):
+    """
+    Reconcile NetBox exclusion ranges to match the live DHCP server (server is authoritative).
+    Called when push_scope_info=False.
+    - Server exclusions missing from NetBox are created.
+    - NetBox exclusions no longer on the server are deleted.
+    """
+    from .api_client import PSUClientError
+    from .models import DHCPExclusionRange
+
+    try:
+        remote_raw = client.list_exclusions(scope_id)
+    except PSUClientError as exc:
+        job_logger.warning(f'Scope {scope_id}: could not fetch exclusion ranges — skipping reconciliation: {exc}')
+        return
+
+    remote = {
+        (r.get('start_ip') or r.get('StartRange'), r.get('end_ip') or r.get('EndRange'))
+        for r in remote_raw
+        if (r.get('start_ip') or r.get('StartRange')) and (r.get('end_ip') or r.get('EndRange'))
+    }
+    local_qs = scope.exclusion_ranges.all()
+    local = {(ex.start_ip, ex.end_ip): ex for ex in local_qs}
+
+    for start, end in remote - set(local.keys()):
+        DHCPExclusionRange.objects.create(scope=scope, start_ip=start, end_ip=end)
+        job_logger.info(f'Scope {scope_id}: added exclusion {start}–{end} from server')
+
+    for (start, end), ex in local.items():
+        if (start, end) not in remote:
+            job_logger.info(f'Scope {scope_id}: removed exclusion {start}–{end} — no longer on server')
+            ex.delete()
+
+
+def _sync_exclusions(job_logger, client, scope, scope_id: str):
+    """
+    Reconcile exclusion ranges between NetBox and the DHCP server.
+
+    Called only when push_scope_info=True (NetBox is source of truth).
+    - Exclusions in NetBox but missing from server → created on server.
+    - Exclusions on server but absent from NetBox → removed from server.
+    """
+    from .api_client import PSUClientError
+
+    try:
+        remote_raw = client.list_exclusions(scope_id)
+    except PSUClientError as exc:
+        job_logger.warning(f'Scope {scope_id}: could not fetch remote exclusions — skipping reconciliation: {exc}')
+        return
+
+    remote = {
+        (r.get('start_ip') or r.get('StartRange'), r.get('end_ip') or r.get('EndRange'))
+        for r in remote_raw
+        if (r.get('start_ip') or r.get('StartRange')) and (r.get('end_ip') or r.get('EndRange'))
+    }
+    local = {
+        (ex.start_ip, ex.end_ip)
+        for ex in scope.exclusion_ranges.all()
+    }
+
+    for start, end in local - remote:
+        try:
+            client.create_exclusion({'scope_id': scope_id, 'start_ip': start, 'end_ip': end})
+            job_logger.info(f'Scope {scope_id}: pushed exclusion {start}–{end} to server')
+        except PSUClientError as exc:
+            job_logger.warning(f'Scope {scope_id}: failed to push exclusion {start}–{end}: {exc}')
+
+    for start, end in remote - local:
+        try:
+            client.delete_exclusion({'scope_id': scope_id, 'start_ip': start, 'end_ip': end})
+            job_logger.info(f'Scope {scope_id}: removed exclusion {start}–{end} from server (not in NetBox)')
+        except PSUClientError as exc:
+            job_logger.warning(f'Scope {scope_id}: failed to remove exclusion {start}–{end}: {exc}')
+
+
+def _pull_scope_attributes(job_logger, scope, remote):
+    """
+    Update NetBox scope fields to match the live DHCP server (server is authoritative).
+    Called on every sync when push_scope_info=False.
+    Logs and saves only fields that actually differ.
+    """
+    scope_label = scope.name  # capture before any name change
+
+    remote_name   = remote.get('name')     or remote.get('Name')       or ''
+    remote_start  = remote.get('start_ip') or remote.get('StartRange') or ''
+    remote_end    = remote.get('end_ip')   or remote.get('EndRange')   or ''
+    router_raw    = remote.get('router')   or remote.get('Router')     or ''
+    remote_router = router_raw if router_raw not in ('', '0.0.0.0') else None
+    remote_lease  = int(remote.get('lease_duration_seconds') or remote.get('LeaseDuration') or 86400)
+
+    # Collect (field_name, old_value, new_value) tuples for fields that need updating.
+    changes = []
+    if remote_name and scope.name != remote_name:
+        changes.append(('name', scope.name, remote_name))
+    if remote_start and scope.start_ip != remote_start:
+        changes.append(('start_ip', scope.start_ip, remote_start))
+    if remote_end and scope.end_ip != remote_end:
+        changes.append(('end_ip', scope.end_ip, remote_end))
+    if scope.router != remote_router:
+        changes.append(('router', scope.router, remote_router))
+    if scope.lease_lifetime != remote_lease:
+        changes.append(('lease_lifetime', scope.lease_lifetime, remote_lease))
+
+    if not changes:
+        job_logger.debug(f'Scope "{scope_label}": all attributes match server')
+        return
+
+    scope.snapshot()
+    for field, old_val, new_val in changes:
+        setattr(scope, field, new_val)
+        job_logger.info(f'Scope "{scope_label}": {field} updated {old_val!r} → {new_val!r} from server')
+    scope.save(update_fields=[f for f, _, _ in changes])
+
+
+def _push_scope(job_logger, client, scope, remote=None, scope_id: Optional[str] = None):
+    """
+    Push NetBox scope attributes to the DHCP server (NetBox is authoritative).
+    When `remote` is provided, skips the push if all fields already match.
+    When `scope_id` is None, creates the scope on the server instead of updating.
+    """
     from netaddr import IPNetwork
     try:
         prefix_net = IPNetwork(str(scope.prefix.prefix))
@@ -245,12 +364,35 @@ def _push_scope(job_logger, client, scope, scope_id: Optional[str] = None):
             'lease_duration_seconds': scope.lease_lifetime,
             'description': '',
         }
-        if scope_id:
-            client.update_scope(scope_id, payload)
-            job_logger.info(f'Updated scope {scope_id} on server')
-        else:
+
+        if not scope_id:
             client.create_scope(payload)
             job_logger.info(f'Created scope {payload["scope_id"]} on server')
+            return
+
+        # Compare with remote to avoid pushing when nothing has changed.
+        if remote is not None:
+            router_raw = remote.get('router') or remote.get('Router') or ''
+            remote_router = router_raw if router_raw not in ('', '0.0.0.0') else None
+            remote_lease = int(remote.get('lease_duration_seconds') or remote.get('LeaseDuration') or 86400)
+            diffs = []
+            if (remote.get('name') or remote.get('Name') or '') != scope.name:
+                diffs.append('name')
+            if (remote.get('start_ip') or remote.get('StartRange') or '') != scope.start_ip:
+                diffs.append('start_ip')
+            if (remote.get('end_ip') or remote.get('EndRange') or '') != scope.end_ip:
+                diffs.append('end_ip')
+            if remote_router != scope.router:
+                diffs.append('router')
+            if remote_lease != scope.lease_lifetime:
+                diffs.append('lease_lifetime')
+            if not diffs:
+                job_logger.debug(f'Scope {scope_id}: already matches NetBox — no push needed')
+                return
+            job_logger.info(f'Scope {scope_id}: pushing changes to server — field(s) differ: {", ".join(diffs)}')
+
+        client.update_scope(scope_id, payload)
+        job_logger.info(f'Updated scope {scope_id} on server')
     except Exception as exc:
         job_logger.warning(f'Failed to push scope {scope}: {exc}')
 
@@ -340,7 +482,11 @@ def _sync_server(job_logger, server, sync_ip_addresses: bool, push_reservations:
                 job_logger.error(f'Failed to push reservations for scope {scope_id}: {exc}')
 
         if push_scope_info:
-            _push_scope(job_logger, client, scope, scope_id)
+            _push_scope(job_logger, client, scope, remote=remote, scope_id=scope_id)
+            _sync_exclusions(job_logger, client, scope, scope_id)
+        else:
+            _pull_scope_attributes(job_logger, scope, remote)
+            _pull_exclusions(job_logger, client, scope, scope_id)
 
     # Handle local scopes that have no matching remote scope on this server.
     # Only consider scopes linked to this server via their failover relationship.
@@ -483,12 +629,19 @@ class DHCPImportJob(JobRunner):
         with _change_logging(self.job.user):
             results = run_import(server)
 
+        category_labels = {
+            'failovers':        'Failovers',
+            'scopes':           'Scopes',
+            'option_values':    'Option Values',
+            'exclusion_ranges': 'Exclusion Ranges',
+        }
         for category, data in results.items():
             created = data.get('created', [])
             skipped = data.get('skipped', [])
             errors = data.get('errors', [])
+            label = category_labels.get(category, category)
             self.logger.info(
-                f'{category}: {len(created)} created, {len(skipped)} skipped, {len(errors)} error(s)'
+                f'{label}: {len(created)} created, {len(skipped)} skipped, {len(errors)} error(s)'
             )
             for item in created:
                 self.logger.info(f'  Created: {item}')

@@ -1,6 +1,7 @@
 from netbox.api.viewsets import NetBoxModelViewSet
 
 from ..filtersets import (
+    DHCPExclusionRangeFilterSet,
     DHCPFailoverFilterSet,
     DHCPOptionCodeDefinitionFilterSet,
     DHCPOptionValueFilterSet,
@@ -8,6 +9,7 @@ from ..filtersets import (
     DHCPServerFilterSet,
 )
 from ..models import (
+    DHCPExclusionRange,
     DHCPFailover,
     DHCPOptionCodeDefinition,
     DHCPOptionValue,
@@ -15,6 +17,7 @@ from ..models import (
     DHCPServer,
 )
 from .serializers import (
+    DHCPExclusionRangeSerializer,
     DHCPFailoverSerializer,
     DHCPOptionCodeDefinitionSerializer,
     DHCPOptionValueSerializer,
@@ -49,7 +52,14 @@ class DHCPOptionValueViewSet(NetBoxModelViewSet):
 
 class DHCPScopeViewSet(NetBoxModelViewSet):
     queryset = DHCPScope.objects.select_related('prefix', 'failover').prefetch_related(
-        'option_values__option_definition'
+        'option_values__option_definition',
+        'exclusion_ranges',
     )
     serializer_class = DHCPScopeSerializer
     filterset_class = DHCPScopeFilterSet
+
+
+class DHCPExclusionRangeViewSet(NetBoxModelViewSet):
+    queryset = DHCPExclusionRange.objects.select_related('scope__prefix')
+    serializer_class = DHCPExclusionRangeSerializer
+    filterset_class = DHCPExclusionRangeFilterSet

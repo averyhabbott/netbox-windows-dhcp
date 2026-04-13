@@ -7,6 +7,7 @@ from django.views import View
 from netbox.views import generic
 
 from .filtersets import (
+    DHCPExclusionRangeFilterSet,
     DHCPFailoverFilterSet,
     DHCPOptionCodeDefinitionFilterSet,
     DHCPOptionValueFilterSet,
@@ -14,6 +15,7 @@ from .filtersets import (
     DHCPServerFilterSet,
 )
 from .forms import (
+    DHCPExclusionRangeForm,
     DHCPFailoverFilterForm,
     DHCPFailoverForm,
     DHCPOptionCodeDefinitionFilterForm,
@@ -28,6 +30,7 @@ from .forms import (
     PluginSettingsForm,
 )
 from .models import (
+    DHCPExclusionRange,
     DHCPFailover,
     DHCPOptionCodeDefinition,
     DHCPOptionValue,
@@ -35,6 +38,7 @@ from .models import (
     DHCPServer,
 )
 from .tables import (
+    DHCPExclusionRangeTable,
     DHCPFailoverTable,
     DHCPOptionCodeDefinitionTable,
     DHCPOptionValueTable,
@@ -286,13 +290,44 @@ class DHCPScopeListView(generic.ObjectListView):
 
 class DHCPScopeView(generic.ObjectView):
     queryset = DHCPScope.objects.select_related('prefix', 'failover').prefetch_related(
-        'option_values__option_definition'
+        'option_values__option_definition',
+        'exclusion_ranges',
     )
 
     def get_extra_context(self, request, instance):
+        from django.db.models import BooleanField, Q
+        from django.db.models.expressions import RawSQL
+        from ipam.models import IPAddress
+        from ipam.tables import IPAddressTable
+
         option_table = DHCPOptionValueTable(instance.option_values.all())
         option_table.configure(request)
-        return {'option_table': option_table}
+
+        exclusion_table = DHCPExclusionRangeTable(instance.exclusion_ranges.all())
+        exclusion_table.configure(request)
+
+        # IPs in the dynamic range (start_ip–end_ip) OR within the prefix with dhcp-* status.
+        # The range condition uses a RawSQL annotation because Django has no built-in inet
+        # range lookup; host(address)::inet strips the prefix length for a pure IP comparison.
+        prefix_cidr = str(instance.prefix.prefix)
+        ip_qs = IPAddress.objects.annotate(
+            _in_dynamic_range=RawSQL(
+                "host(address)::inet >= %s::inet AND host(address)::inet <= %s::inet",
+                (instance.start_ip, instance.end_ip),
+                output_field=BooleanField(),
+            )
+        ).filter(
+            Q(_in_dynamic_range=True)
+            | Q(address__net_contained_or_equal=prefix_cidr, status__startswith='dhcp-')
+        ).order_by('address')
+        ip_table = IPAddressTable(ip_qs)
+        ip_table.configure(request)
+
+        return {
+            'option_table': option_table,
+            'exclusion_table': exclusion_table,
+            'ip_table': ip_table,
+        }
 
 
 class DHCPScopeCreateView(generic.ObjectEditView):
@@ -341,6 +376,32 @@ class DHCPScopeBulkEditView(generic.BulkEditView):
 class DHCPScopeBulkDeleteView(generic.BulkDeleteView):
     queryset = DHCPScope.objects.all()
     table = DHCPScopeTable
+
+
+# ---------------------------------------------------------------------------
+# DHCPExclusionRange views
+# ---------------------------------------------------------------------------
+
+class DHCPExclusionRangeView(generic.ObjectView):
+    queryset = DHCPExclusionRange.objects.select_related('scope__prefix')
+
+
+class DHCPExclusionRangeCreateView(generic.ObjectEditView):
+    queryset = DHCPExclusionRange.objects.all()
+    form = DHCPExclusionRangeForm
+
+    def get_extra_addanother_params(self, request):
+        # Preserve scope_id on "add another" so the scope stays pre-filled
+        return {'scope': request.GET.get('scope', '')}
+
+
+class DHCPExclusionRangeEditView(generic.ObjectEditView):
+    queryset = DHCPExclusionRange.objects.all()
+    form = DHCPExclusionRangeForm
+
+
+class DHCPExclusionRangeDeleteView(generic.ObjectDeleteView):
+    queryset = DHCPExclusionRange.objects.all()
 
 
 # ---------------------------------------------------------------------------

@@ -127,6 +127,15 @@ function ConvertTo-OptionValueObject {
     }
 }
 
+function ConvertTo-ExclusionRangeObject {
+    param([Microsoft.Management.Infrastructure.CimInstance]$Exclusion)
+    [ordered]@{
+        scope_id = $Exclusion.ScopeId.ToString()
+        start_ip = $Exclusion.StartRange.ToString()
+        end_ip   = $Exclusion.EndRange.ToString()
+    }
+}
+
 function Find-ReservationByClientId {
     param([string]$ClientId)
     foreach ($scope in (Get-DhcpServerv4Scope -ErrorAction SilentlyContinue)) {
@@ -661,6 +670,122 @@ New-PSUEndpoint -Url '/api/dhcp/options/scope/:scope_id' -Method GET @_epAuth -E
     }
     catch [Microsoft.Management.Infrastructure.CimException] {
         Write-ApiError -Message "Scope '$scope_id' not found." -StatusCode 404
+    }
+    catch {
+        Write-ApiError -Message $_.Exception.Message -StatusCode 500
+    }
+}.ToString()))
+
+
+# ===========================================================================
+# SECTION 6 — EXCLUSION RANGES
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# GET /api/dhcp/exclusions?scope_id=10.0.1.0
+# Returns exclusion ranges for the given scope.
+# scope_id query parameter is required.
+# ---------------------------------------------------------------------------
+New-PSUEndpoint -Url '/api/dhcp/exclusions' -Method GET @_epAuth -Endpoint ([scriptblock]::Create($H + {
+    try {
+        if (-not $scope_id) {
+            New-PSUApiResponse -StatusCode 400 `
+                -Body (@{ error = 'scope_id query parameter is required.' } | ConvertTo-Json -Compress) `
+                -ContentType 'application/json'
+            return
+        }
+
+        # Verify scope exists
+        $null = Get-DhcpServerv4Scope -ScopeId $scope_id -ErrorAction Stop
+
+        $exclusions = Get-DhcpServerv4ExclusionRange -ScopeId $scope_id -ErrorAction SilentlyContinue
+        $result = @(
+            $exclusions | ForEach-Object { ConvertTo-ExclusionRangeObject $_ }
+        )
+        ConvertTo-Json -InputObject $result -Depth 4 -Compress
+    }
+    catch [Microsoft.Management.Infrastructure.CimException] {
+        Write-ApiError -Message "Scope '$scope_id' not found." -StatusCode 404
+    }
+    catch {
+        Write-ApiError -Message $_.Exception.Message -StatusCode 500
+    }
+}.ToString()))
+
+
+# ---------------------------------------------------------------------------
+# POST /api/dhcp/exclusions
+# Creates a new exclusion range on a scope.
+#
+# Expected body:
+#   {
+#     "scope_id":  "10.0.1.0",
+#     "start_ip":  "10.0.1.50",
+#     "end_ip":    "10.0.1.59"
+#   }
+# ---------------------------------------------------------------------------
+New-PSUEndpoint -Url '/api/dhcp/exclusions' -Method POST @_epAuth -Endpoint ([scriptblock]::Create($H + {
+    try {
+        $body = $Body | ConvertFrom-Json
+
+        if (-not $body.scope_id -or -not $body.start_ip -or -not $body.end_ip) {
+            New-PSUApiResponse -StatusCode 400 `
+                -Body (@{ error = 'scope_id, start_ip, and end_ip are required.' } | ConvertTo-Json -Compress) `
+                -ContentType 'application/json'
+            return
+        }
+
+        Add-DhcpServerv4ExclusionRange `
+            -ScopeId    $body.scope_id `
+            -StartRange $body.start_ip `
+            -EndRange   $body.end_ip `
+            -ErrorAction Stop
+
+        $exclusions = Get-DhcpServerv4ExclusionRange -ScopeId $body.scope_id -ErrorAction SilentlyContinue |
+                      Where-Object { $_.StartRange -eq $body.start_ip -and $_.EndRange -eq $body.end_ip } |
+                      Select-Object -First 1
+
+        New-PSUApiResponse -StatusCode 201 `
+            -Body (ConvertTo-ExclusionRangeObject $exclusions | ConvertTo-Json -Depth 4 -Compress) `
+            -ContentType 'application/json'
+    }
+    catch {
+        Write-ApiError -Message $_.Exception.Message -StatusCode 500
+    }
+}.ToString()))
+
+
+# ---------------------------------------------------------------------------
+# DELETE /api/dhcp/exclusions
+# Removes an exclusion range identified by scope_id + start_ip + end_ip.
+# Windows DHCP has no per-exclusion ID; the tuple uniquely identifies it.
+#
+# Expected body:
+#   {
+#     "scope_id":  "10.0.1.0",
+#     "start_ip":  "10.0.1.50",
+#     "end_ip":    "10.0.1.59"
+#   }
+# ---------------------------------------------------------------------------
+New-PSUEndpoint -Url '/api/dhcp/exclusions' -Method DELETE @_epAuth -Endpoint ([scriptblock]::Create($H + {
+    try {
+        $body = $Body | ConvertFrom-Json
+
+        if (-not $body.scope_id -or -not $body.start_ip -or -not $body.end_ip) {
+            New-PSUApiResponse -StatusCode 400 `
+                -Body (@{ error = 'scope_id, start_ip, and end_ip are required.' } | ConvertTo-Json -Compress) `
+                -ContentType 'application/json'
+            return
+        }
+
+        Remove-DhcpServerv4ExclusionRange `
+            -ScopeId    $body.scope_id `
+            -StartRange $body.start_ip `
+            -EndRange   $body.end_ip `
+            -Force `
+            -ErrorAction Stop
+
+        New-PSUApiResponse -StatusCode 204
     }
     catch {
         Write-ApiError -Message $_.Exception.Message -StatusCode 500

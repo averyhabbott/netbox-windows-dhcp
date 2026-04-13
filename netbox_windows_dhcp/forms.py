@@ -10,6 +10,7 @@ from utilities.forms.fields import (
 from utilities.forms.rendering import FieldSet, InlineFields
 
 from .models import (
+    DHCPExclusionRange,
     DHCPFailover,
     DHCPOptionCodeDefinition,
     DHCPOptionValue,
@@ -17,6 +18,40 @@ from .models import (
     DHCPScope,
     DHCPServer,
 )
+
+
+# ---------------------------------------------------------------------------
+# DHCPExclusionRange
+# ---------------------------------------------------------------------------
+
+class DHCPExclusionRangeForm(NetBoxModelForm):
+    fieldsets = (
+        FieldSet('scope', 'start_ip', 'end_ip', name='Exclusion Range'),
+        FieldSet('tags', name='Tags'),
+    )
+
+    scope = DynamicModelChoiceField(
+        queryset=DHCPScope.objects.all(),
+        label='Scope',
+    )
+
+    class Meta:
+        model = DHCPExclusionRange
+        fields = ('scope', 'start_ip', 'end_ip', 'tags')
+        labels = {
+            'start_ip': 'Start IP',
+            'end_ip': 'End IP',
+        }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Pre-populate scope from query param when arriving from the scope detail page
+        scope_id = self.initial.get('scope') or self.data.get('scope')
+        if scope_id and not self.instance.pk:
+            try:
+                self.initial['scope'] = int(scope_id)
+            except (TypeError, ValueError):
+                pass
 
 
 # ---------------------------------------------------------------------------

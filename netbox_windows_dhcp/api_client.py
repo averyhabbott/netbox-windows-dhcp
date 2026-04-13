@@ -224,3 +224,47 @@ class PSUClient:
     def list_scope_options(self, scope_id: str) -> List[Dict]:
         """Return scope-level DHCP option values for a given scope."""
         return self._get_list(f'options/scope/{scope_id}')
+
+    # ------------------------------------------------------------------
+    # Exclusion Ranges
+    # ------------------------------------------------------------------
+
+    def list_exclusions(self, scope_id: str) -> List[Dict]:
+        """
+        Return exclusion ranges for the given scope.
+
+        Each exclusion dict:
+            {
+              "scope_id": "10.0.1.0",
+              "start_ip": "10.0.1.50",
+              "end_ip":   "10.0.1.59"
+            }
+        """
+        return self._get_list('exclusions', params={'scope_id': scope_id})
+
+    def create_exclusion(self, payload: Dict) -> Dict:
+        """
+        Create an exclusion range on a DHCP scope.
+
+        Expected payload:
+            {
+              "scope_id":  "10.0.1.0",
+              "start_ip":  "10.0.1.50",
+              "end_ip":    "10.0.1.59"
+            }
+        """
+        return self._post('exclusions', payload)
+
+    def delete_exclusion(self, payload: Dict) -> None:
+        """
+        Delete an exclusion range identified by scope_id + start_ip + end_ip.
+
+        Windows DHCP has no per-exclusion ID; the 3-tuple uniquely identifies it.
+        Expected payload:
+            {
+              "scope_id":  "10.0.1.0",
+              "start_ip":  "10.0.1.50",
+              "end_ip":    "10.0.1.59"
+            }
+        """
+        self._request('DELETE', 'exclusions', json=payload)

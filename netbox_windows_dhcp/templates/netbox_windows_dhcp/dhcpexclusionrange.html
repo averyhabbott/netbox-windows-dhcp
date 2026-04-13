@@ -1,0 +1,30 @@
+{% extends 'generic/object.html' %}
+{% load helpers %}
+
+{% block content %}
+<div class="row mb-3">
+  <div class="col col-md-6">
+    <div class="card">
+      <h5 class="card-header">DHCP Exclusion Range</h5>
+      <div class="card-body">
+        <table class="table table-hover attr-table">
+          <tr>
+            <th scope="row">Scope</th>
+            <td><a href="{{ object.scope.get_absolute_url }}">{{ object.scope }}</a></td>
+          </tr>
+          <tr>
+            <th scope="row">Start IP</th>
+            <td><code>{{ object.start_ip }}</code></td>
+          </tr>
+          <tr>
+            <th scope="row">End IP</th>
+            <td><code>{{ object.end_ip }}</code></td>
+          </tr>
+        </table>
+      </div>
+    </div>
+    {% include 'inc/panels/tags.html' %}
+    {% include 'inc/panels/custom_fields.html' %}
+  </div>
+</div>
+{% endblock %}

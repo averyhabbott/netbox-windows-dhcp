@@ -9,10 +9,10 @@ A NetBox v4.5.0+ plugin for full integration with Windows DHCP Server via [Power
 - Correlate DHCP Scopes with NetBox Prefixes (many scopes → one prefix)
 - Lease lifetime stored in seconds, displayed in the most readable unit (e.g. `3 Days`, `73 Hours`, `30 Minutes`)
 - Global library of reusable DHCP Option Values with Option Code Definitions (pre-populated with all standard Windows DHCP built-in codes)
-- One-time **Import from Server** — pulls failovers, scopes, and scope-level option values from a live DHCP server into NetBox
+- One-time **Import from Server** — pulls failovers, scopes, scope-level option values, and exclusion ranges from a live DHCP server into NetBox
 - Active sync mode: pull leases and reservations → create/update NetBox IP Addresses with status, DNS name, and client MAC
 - Stale record cleanup: expired leases and removed reservations are deleted or downgraded automatically
-- Push reservations and scope config from NetBox → DHCP server (optional, settings-controlled)
+- Push reservations, scope config, and exclusion ranges from NetBox → DHCP server (optional, settings-controlled)
 - **DHCP Scopes** panel injected into the NetBox Prefix detail view
 - All sync and import operations run as background jobs — no HTTP timeouts on large servers
 - All background job changes appear in the NetBox changelog (attributed to the user who queued the job)
@@ -225,6 +225,9 @@ The plugin expects PowerShell Universal **v5.x** on each DHCP server, exposing e
 | POST | `/api/dhcp/failover` | Create a failover relationship |
 | GET | `/api/dhcp/options/server` | Server-level option values |
 | GET | `/api/dhcp/options/scope/:scope_id` | Scope-level option values |
+| GET | `/api/dhcp/exclusions?scope_id=` | List exclusion ranges for a scope |
+| POST | `/api/dhcp/exclusions` | Create an exclusion range |
+| DELETE | `/api/dhcp/exclusions` | Delete an exclusion range (body: scope_id, start_ip, end_ip) |
 
 Authentication: PSU v5 App Tokens are sent as `Authorization: Bearer <token>`. Generate a token in the PSU admin console under **Security → App Tokens** and paste it into the **App Token** field on the DHCP Server object in NetBox.
 
@@ -238,4 +241,5 @@ The plugin exposes a REST API under `/api/plugins/netbox-windows-dhcp/`:
 | `/failover/` | Failover relationships |
 | `/option-codes/` | Option Code Definitions |
 | `/option-values/` | Option Values |
-| `/scopes/` | DHCP Scopes |
+| `/scopes/` | DHCP Scopes (includes nested `exclusion_ranges`) |
+| `/exclusion-ranges/` | DHCP Exclusion Ranges |

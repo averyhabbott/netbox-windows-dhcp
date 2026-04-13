@@ -5,6 +5,7 @@ from ipam.api.serializers import PrefixSerializer
 from ipam.models import Prefix
 
 from ..models import (
+    DHCPExclusionRange,
     DHCPFailover,
     DHCPOptionCodeDefinition,
     DHCPOptionValue,
@@ -100,6 +101,31 @@ class DHCPOptionValueSerializer(NetBoxModelSerializer):
         brief_fields = ('id', 'url', 'display', 'friendly_name', 'value')
 
 
+class DHCPExclusionRangeSerializer(NetBoxModelSerializer):
+    url = serializers.HyperlinkedIdentityField(
+        view_name='plugins-api:netbox_windows_dhcp-api:dhcpexclusionrange-detail'
+    )
+    scope = serializers.SerializerMethodField()
+    scope_id = serializers.PrimaryKeyRelatedField(
+        queryset=DHCPScope.objects.all(),
+        source='scope',
+        write_only=True,
+    )
+
+    class Meta:
+        model = DHCPExclusionRange
+        fields = (
+            'id', 'url', 'display',
+            'scope', 'scope_id',
+            'start_ip', 'end_ip',
+            'tags', 'custom_fields', 'created', 'last_updated',
+        )
+        brief_fields = ('id', 'url', 'display', 'start_ip', 'end_ip')
+
+    def get_scope(self, obj):
+        return {'id': obj.scope_id, 'name': str(obj.scope), 'url': obj.scope.get_absolute_url()}
+
+
 class DHCPScopeSerializer(NetBoxModelSerializer):
     url = serializers.HyperlinkedIdentityField(
         view_name='plugins-api:netbox_windows_dhcp-api:dhcpscope-detail'
@@ -126,6 +152,7 @@ class DHCPScopeSerializer(NetBoxModelSerializer):
         write_only=True,
         required=False,
     )
+    exclusion_ranges = DHCPExclusionRangeSerializer(many=True, read_only=True)
 
     class Meta:
         model = DHCPScope
@@ -135,6 +162,7 @@ class DHCPScopeSerializer(NetBoxModelSerializer):
             'start_ip', 'end_ip', 'router', 'lease_lifetime',
             'failover', 'failover_id',
             'option_values', 'option_value_ids',
+            'exclusion_ranges',
             'tags', 'custom_fields', 'created', 'last_updated',
         )
         brief_fields = ('id', 'url', 'display', 'name', 'start_ip', 'end_ip')
