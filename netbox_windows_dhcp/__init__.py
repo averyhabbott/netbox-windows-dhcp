@@ -58,6 +58,7 @@ class NetBoxWindowsDHCPConfig(PluginConfig):
         from django.db.models.signals import post_migrate
         post_migrate.connect(_ensure_custom_fields, sender=self)
         from . import signals  # noqa: F401
+        from . import background_tasks  # noqa: F401 — registers DHCPSyncJob with system_job scheduler
 
     def _check_custom_statuses(self):
         """Warn if the required custom IP Address statuses are not configured."""

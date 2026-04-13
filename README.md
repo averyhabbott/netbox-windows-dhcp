@@ -60,11 +60,14 @@ FIELD_CHOICES = {
     'ipam.IPAddress.status+': [
         ('dhcp-lease',    'DHCP-Lease',    'blue'),
         ('dhcp-reserved', 'DHCP-Reserved', 'cyan'),
+        ('dhcp-staged',   'DHCP-Staged',   'green'),  # optional — see Pre-Staging IPs below
     ]
 }
 ```
 
-If these are missing, the plugin displays a warning on the Settings page and logs a warning at startup.
+`dhcp-lease` and `dhcp-reserved` are required when **Sync IP Addresses from Leases & Reservations** is enabled. If these are missing, the plugin displays a warning on the Settings page and logs a warning at startup.
+
+`dhcp-staged` is optional and only needed if you use the pre-staging workflow described below.
 
 ### 4. Run migrations
 
@@ -104,21 +107,20 @@ Go to **Windows DHCP → Admin → Settings** to configure:
 
 | Setting | Description |
 | --- | --- |
-| Scope Data Sync Mode | `passive` (default) — scope info only; `active` — update IP Addresses |
+| Sync IP Addresses from Leases & Reservations | When checked, pull leases and reservations and create/update/delete NetBox IP Address records. When unchecked, sync scope config only. |
 | Push Reservations to DHCP Server | Push NetBox `reserved`/`dhcp-reserved` IPs to the DHCP server as reservations |
 | Push Scope Info to DHCP Server | Push scope config changes from NetBox to the DHCP server |
 | Sync Interval (minutes) | How often the background sync runs (5–1440) |
 
 ## Sync Behavior
 
-### Sync modes
+### IP Address sync
 
-| Mode | Behavior |
-| --- | --- |
-| `passive` (default) | Pull and display scope info; do **not** update IP Address objects |
-| `active` | Pull leases and reservations; create/update/delete NetBox IP Address records |
+When **Sync IP Addresses from Leases & Reservations** is unchecked (default), the sync pulls and stores scope config only — no IP Address objects are created or modified.
 
-### IP Address lifecycle (active mode)
+When checked, the sync pulls leases and reservations from each DHCP server and creates/updates/deletes NetBox IP Address records.
+
+### IP Address lifecycle (active sync)
 
 **Creating and updating:**
 
@@ -156,6 +158,23 @@ When a scope exists in NetBox but is no longer reported by the DHCP server, and 
 > When **Push Scope Info to DHCP Server** is enabled, a scope missing from the server will instead be created on the server.
 
 **Safety:** If the API call to fetch leases/reservations fails for a scope, cleanup is skipped for that scope. If `list_scopes()` fails entirely, the server is unreachable and no cleanup runs at all.
+
+### Pre-Staging IPs (`dhcp-staged`)
+
+Sometimes a device needs to be registered in NetBox weeks before it is provisioned — before a lease has been issued and before the client MAC is known (making a DHCP reservation impossible).
+
+Set the IP Address status to `DHCP-Staged` (requires the optional `dhcp-staged` entry in `FIELD_CHOICES`) and set `dns_name` to the planned canonical hostname. The sync will never overwrite or delete a `dhcp-staged` IP:
+
+- If a lease or reservation appears for the same address, the sync logs a skip message and leaves the IP untouched.
+- Cleanup never removes `dhcp-staged` IPs regardless of server state.
+
+**Typical lifecycle:**
+
+1. Create the IP in NetBox with status `DHCP-Staged` and the planned `dns_name`.
+2. Device is provisioned; it receives a DHCP lease. The sync skips the address and logs `"IP x.x.x.x is dhcp-staged — skipping"`.
+3. Once the client MAC is known, edit the IP: set status to `DHCP-Reserved`, fill in `dhcp_client_id`, and optionally push the reservation to the DHCP server.
+
+The planned `dns_name` is preserved throughout this process — it will not be overwritten with the DHCP-assigned hostname.
 
 ### Sync Now
 

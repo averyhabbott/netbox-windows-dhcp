@@ -80,4 +80,5 @@ urlpatterns = [
     # Settings
     # -----------------------------------------------------------------------
     path('settings/', views.SettingsView.as_view(), name='settings'),
+    path('settings/sync/', views.ScheduleSyncView.as_view(), name='schedule_sync'),
 ]

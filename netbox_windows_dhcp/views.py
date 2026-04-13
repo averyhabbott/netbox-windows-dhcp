@@ -344,6 +344,50 @@ class DHCPScopeBulkDeleteView(generic.BulkDeleteView):
 
 
 # ---------------------------------------------------------------------------
+# Settings view helpers
+# ---------------------------------------------------------------------------
+
+SYNC_JOB_NAME = 'Windows DHCP Sync'
+
+
+def _get_next_sync_job():
+    """Return the next scheduled or pending DHCPSyncJob Job row, or None."""
+    from core.models import Job
+    from django.db.models import F
+    return (
+        Job.objects.filter(name=SYNC_JOB_NAME, status__in=['scheduled', 'pending'])
+        .order_by(F('scheduled').asc(nulls_last=True))
+        .first()
+    )
+
+
+def _apply_interval_to_job(new_interval):
+    """
+    Update the interval (and reschedule datetime) on any existing scheduled/pending
+    DHCPSyncJob. Does nothing if no job exists.
+    """
+    from core.models import Job
+    from django.utils import timezone
+    from datetime import timedelta
+    from django.db.models import F
+
+    job = (
+        Job.objects.filter(name=SYNC_JOB_NAME, status__in=['scheduled', 'pending'])
+        .order_by(F('scheduled').asc(nulls_last=True))
+        .first()
+    )
+    if not job:
+        return
+
+    job.interval = new_interval
+    update_fields = ['interval']
+    if job.status == 'scheduled':
+        job.scheduled = timezone.now() + timedelta(minutes=new_interval)
+        update_fields.append('scheduled')
+    job.save(update_fields=update_fields)
+
+
+# ---------------------------------------------------------------------------
 # Settings view
 # ---------------------------------------------------------------------------
 
@@ -371,6 +415,7 @@ class SettingsView(LoginRequiredMixin, View):
         return render(request, self.template_name, {
             'form': form,
             'missing_statuses': self._check_custom_statuses(),
+            'next_sync_job': _get_next_sync_job(),
         })
 
     def post(self, request):
@@ -382,10 +427,82 @@ class SettingsView(LoginRequiredMixin, View):
         form = PluginSettingsForm(request.POST, instance=DHCPPluginSettings.load())
         if form.is_valid():
             form.save()
+            _apply_interval_to_job(form.cleaned_data['sync_interval'])
             messages.success(request, 'Settings saved.')
             return redirect('plugins:netbox_windows_dhcp:settings')
 
         return render(request, self.template_name, {
             'form': form,
             'missing_statuses': self._check_custom_statuses(),
+            'next_sync_job': _get_next_sync_job(),
         })
+
+
+class ScheduleSyncView(LoginRequiredMixin, View):
+    """
+    Handle 'Run Now' and 'Schedule' actions for the recurring DHCPSyncJob.
+
+    POST action=run_now  — cancel any existing scheduled job, enqueue immediately
+                           (job auto-reschedules after it completes).
+    POST action=schedule — cancel any existing scheduled job, create a new one
+                           scheduled at the user-supplied start_at datetime.
+    """
+
+    def post(self, request):
+        if not request.user.is_superuser:
+            messages.error(request, 'Superuser access required.')
+            return redirect('plugins:netbox_windows_dhcp:settings')
+
+        from core.models import Job
+        from django.utils import timezone
+
+        from .background_tasks import DHCPSyncJob
+        from .models import DHCPPluginSettings
+
+        cfg = DHCPPluginSettings.load()
+        action = request.POST.get('action', 'schedule')
+
+        # Cancel any existing scheduled job (safe to delete — it hasn't entered the
+        # RQ queue yet; pending jobs are already queued so we leave those alone).
+        Job.objects.filter(name=SYNC_JOB_NAME, status='scheduled').delete()
+
+        if action == 'run_now':
+            job = DHCPSyncJob.enqueue(
+                user=request.user,
+                interval=cfg.sync_interval,
+            )
+            messages.success(
+                request,
+                f'Sync enqueued — it will run shortly and reschedule every '
+                f'{cfg.sync_interval} minute(s) after completion.',
+            )
+            return redirect(job.get_absolute_url())
+
+        else:  # schedule
+            from django.utils.dateparse import parse_datetime
+
+            raw = request.POST.get('start_at', '').strip()
+            scheduled_at = parse_datetime(raw)
+            if not scheduled_at:
+                messages.error(request, 'Please enter a valid start date/time.')
+                return redirect('plugins:netbox_windows_dhcp:settings')
+
+            # datetime-local inputs are naive (no tz); treat as server local time
+            if timezone.is_naive(scheduled_at):
+                scheduled_at = timezone.make_aware(scheduled_at)
+
+            if scheduled_at <= timezone.now():
+                messages.error(request, 'Start time must be in the future.')
+                return redirect('plugins:netbox_windows_dhcp:settings')
+
+            DHCPSyncJob.enqueue(
+                user=request.user,
+                schedule_at=scheduled_at,
+                interval=cfg.sync_interval,
+            )
+            messages.success(
+                request,
+                f'Sync scheduled to start at {scheduled_at.strftime("%b %-d, %Y %-I:%M %p")}, '
+                f'then every {cfg.sync_interval} minute(s) thereafter.',
+            )
+            return redirect('plugins:netbox_windows_dhcp:settings')

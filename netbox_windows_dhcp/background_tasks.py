@@ -5,7 +5,7 @@ Sync logic:
   For each DHCPServer:
     1. Fetch /scopes from PSU.
     2. Match returned scopes against DHCPScope objects (by network address).
-    3. If scope_sync_mode == 'active':
+    3. If sync_ip_addresses == True:
          - Fetch leases + reservations.
          - Update/create NetBox IPAddress objects with status dhcp-lease or dhcp-reserved.
          - Set dns_name from DHCP hostname.
@@ -67,6 +67,12 @@ def _upsert_ip_address(job_logger, ip_str: str, prefix_len: int, status: str, dn
         qs = IPAddress.objects.filter(address__net_host=ip_str)
         if qs.exists():
             obj = qs.first()
+            if obj.status == 'dhcp-staged':
+                job_logger.info(
+                    f'IP {ip_str} is dhcp-staged — skipping ({status} seen on server); '
+                    f'update status manually when ready'
+                )
+                return
             obj.snapshot()  # Capture pre-change state for changelog before any modifications
             created = False
         else:
@@ -249,13 +255,13 @@ def _push_scope(job_logger, client, scope, scope_id: Optional[str] = None):
         job_logger.warning(f'Failed to push scope {scope}: {exc}')
 
 
-def _sync_server(job_logger, server, sync_mode: str, push_reservations: bool, push_scope_info: bool):
+def _sync_server(job_logger, server, sync_ip_addresses: bool, push_reservations: bool, push_scope_info: bool):
     from .api_client import PSUClient, PSUClientError
     from .models import DHCPScope
 
     job_logger.info(
         f'Syncing server: {server.name} ({server.hostname}) — '
-        f'mode={sync_mode} push_reservations={push_reservations} push_scope_info={push_scope_info}'
+        f'sync_ip_addresses={sync_ip_addresses} push_reservations={push_reservations} push_scope_info={push_scope_info}'
     )
     client = PSUClient(server)
 
@@ -298,7 +304,7 @@ def _sync_server(job_logger, server, sync_mode: str, push_reservations: bool, pu
 
         job_logger.info(f'Scope "{scope.name}" matched remote scope_id={scope_id} on {server.name}')
 
-        if sync_mode == 'active':
+        if sync_ip_addresses:
             try:
                 leases = client.list_leases(scope_id=scope_id)
                 reservations = client.list_reservations(scope_id=scope_id)
@@ -325,7 +331,7 @@ def _sync_server(job_logger, server, sync_mode: str, push_reservations: bool, pu
                 }
                 _cleanup_stale_ips(job_logger, scope, lease_ips, reservation_ips, push_reservations)
         else:
-            job_logger.info(f'Scope {scope_id}: skipping IP updates (sync_mode={sync_mode})')
+            job_logger.info(f'Scope {scope_id}: skipping IP updates (sync_ip_addresses=False)')
 
         if push_reservations:
             try:
@@ -380,28 +386,51 @@ class DHCPSyncJob(JobRunner):
         )
 
     def run(self, *args, **kwargs):
-        from .models import DHCPServer
-        servers = DHCPServer.objects.all()
-        if not servers.exists():
-            self.logger.info('No DHCP servers configured — nothing to sync.')
-            return
+        from datetime import timedelta
 
-        cfg = _load_settings()
-        sync_mode = cfg.scope_sync_mode
-        push_reservations = cfg.push_reservations
-        push_scope_info = cfg.push_scope_info
+        from django.utils import timezone
 
-        self.logger.info(
-            f'Starting DHCP sync: mode={sync_mode} '
-            f'push_reservations={push_reservations} push_scope_info={push_scope_info}'
-        )
+        start_time = timezone.now()
 
-        with _change_logging(self.job.user):
-            for server in servers:
-                try:
-                    _sync_server(self.logger, server, sync_mode, push_reservations, push_scope_info)
-                except Exception as exc:
-                    self.logger.error(f'Error syncing server {server.name}: {exc}')
+        try:
+            from .models import DHCPServer
+            servers = DHCPServer.objects.all()
+            if not servers.exists():
+                self.logger.info('No DHCP servers configured — nothing to sync.')
+                return
+
+            cfg = _load_settings()
+            sync_ip_addresses = cfg.sync_ip_addresses
+            push_reservations = cfg.push_reservations
+            push_scope_info = cfg.push_scope_info
+
+            self.logger.info(
+                f'Starting DHCP sync: sync_ip_addresses={sync_ip_addresses} '
+                f'push_reservations={push_reservations} push_scope_info={push_scope_info}'
+            )
+
+            with _change_logging(self.job.user):
+                for server in servers:
+                    try:
+                        _sync_server(self.logger, server, sync_ip_addresses, push_reservations, push_scope_info)
+                    except Exception as exc:
+                        self.logger.error(f'Error syncing server {server.name}: {exc}')
+
+        finally:
+            # Re-read settings so the interval reflects any changes made since this run started.
+            cfg = _load_settings()
+            interval = cfg.sync_interval
+
+            # Suppress NetBox's default auto-reschedule (which anchors to completion time).
+            # We manually enqueue the next run anchored to start_time to prevent drift.
+            self.job.interval = None
+            self.job.save(update_fields=['interval'])
+
+            DHCPSyncJob.enqueue(
+                user=self.job.user,
+                schedule_at=start_time + timedelta(minutes=interval),
+                interval=interval,
+            )
 
 
 class DHCPServerSyncJob(JobRunner):
@@ -426,7 +455,7 @@ class DHCPServerSyncJob(JobRunner):
 
         cfg = _load_settings()
         with _change_logging(self.job.user):
-            _sync_server(self.logger, server, cfg.scope_sync_mode, cfg.push_reservations, cfg.push_scope_info)
+            _sync_server(self.logger, server, cfg.sync_ip_addresses, cfg.push_reservations, cfg.push_scope_info)
 
 
 class DHCPImportJob(JobRunner):

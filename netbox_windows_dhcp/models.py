@@ -12,21 +12,13 @@ class DHCPPluginSettings(models.Model):
     Always accessed via DHCPPluginSettings.load() — never instantiated directly.
     """
 
-    SYNC_MODE_PASSIVE = 'passive'
-    SYNC_MODE_ACTIVE = 'active'
-    SYNC_MODE_CHOICES = [
-        (SYNC_MODE_PASSIVE, 'Passive — sync scope info, do not update IP Addresses'),
-        (SYNC_MODE_ACTIVE, 'Active — update NetBox IP Addresses with lease/reservation data'),
-    ]
-
-    scope_sync_mode = models.CharField(
-        max_length=10,
-        choices=SYNC_MODE_CHOICES,
-        default=SYNC_MODE_PASSIVE,
-        verbose_name='Scope Data Sync Mode',
+    sync_ip_addresses = models.BooleanField(
+        default=False,
+        verbose_name='Sync IP Addresses from Leases & Reservations',
         help_text=(
-            'Active: pull leases/reservations from DHCP servers and update '
-            'NetBox IP Address status. Passive: sync scope config only.'
+            'When enabled, pull leases and reservations from DHCP servers and '
+            'create/update/delete NetBox IP Address records with status, DNS name, '
+            'and client MAC.'
         ),
     )
     push_reservations = models.BooleanField(

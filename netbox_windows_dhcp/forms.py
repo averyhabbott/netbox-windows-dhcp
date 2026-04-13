@@ -244,7 +244,26 @@ class DHCPScopeForm(NetBoxModelForm):
             self.initial.setdefault('lease_lifetime_unit', 'days')
 
     def clean(self):
-        cleaned = super().clean()
+        cleaned = super().clean() or self.cleaned_data
+
+        # Validate that no two selected option values share the same option code.
+        option_values = cleaned.get('option_values')
+        if option_values:
+            seen_codes = {}
+            duplicates = []
+            for ov in option_values:
+                code = ov.option_definition.code
+                if code in seen_codes:
+                    duplicates.append(code)
+                else:
+                    seen_codes[code] = ov
+            if duplicates:
+                codes_str = ', '.join(str(c) for c in sorted(set(duplicates)))
+                raise forms.ValidationError(
+                    f'A scope cannot have more than one value for the same option code. '
+                    f'Duplicate code(s): {codes_str}.'
+                )
+
         value = cleaned.get('lease_lifetime_value')
         unit = cleaned.get('lease_lifetime_unit', 'seconds')
         if value is not None:
@@ -296,7 +315,7 @@ class DHCPScopeBulkEditForm(NetBoxModelBulkEditForm):
     )
 
     def clean(self):
-        cleaned = super().clean()
+        cleaned = super().clean() or self.cleaned_data
         value = cleaned.get('lease_lifetime_value')
         unit = cleaned.get('lease_lifetime_unit')
         if value and unit:
@@ -339,4 +358,4 @@ class PluginSettingsForm(forms.ModelForm):
 
     class Meta:
         model = DHCPPluginSettings
-        fields = ('scope_sync_mode', 'push_reservations', 'push_scope_info', 'sync_interval')
+        fields = ('sync_ip_addresses', 'push_reservations', 'push_scope_info', 'sync_interval')

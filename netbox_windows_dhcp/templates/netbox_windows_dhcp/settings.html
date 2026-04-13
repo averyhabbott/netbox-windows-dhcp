@@ -42,18 +42,92 @@
     </div>
 
     <div class="card mt-3">
-      <h5 class="card-header">Sync Actions</h5>
+      <h5 class="card-header">Scheduled Sync</h5>
       <div class="card-body">
-        <form method="post" action="{% url 'plugins:netbox_windows_dhcp:global_sync' %}">
-          {% csrf_token %}
-          <button type="submit" class="btn btn-warning">
-            <i class="mdi mdi-sync-circle"></i> Sync All Servers Now
-          </button>
-          <span class="text-muted ms-2">Enqueues a sync job for every configured DHCP server.</span>
-        </form>
+
+        <table class="table table-borderless mb-3">
+          <tr>
+            <th style="width:160px">Next run at</th>
+            <td>
+              {% if next_sync_job %}
+                {% if next_sync_job.status == 'scheduled' and next_sync_job.scheduled %}
+                  {{ next_sync_job.scheduled|date:"N j, Y, g:i a" }}
+                  <span class="text-muted ms-1">({{ next_sync_job.scheduled|timeuntil }} from now)</span>
+                {% elif next_sync_job.status == 'pending' %}
+                  <span class="badge bg-warning text-dark">Queued — running shortly</span>
+                {% else %}
+                  <span class="text-muted">N/A</span>
+                {% endif %}
+              {% else %}
+                <span class="text-muted">N/A — no sync scheduled</span>
+              {% endif %}
+            </td>
+          </tr>
+          {% if next_sync_job and next_sync_job.interval %}
+          <tr>
+            <th>Repeats every</th>
+            <td>{{ next_sync_job.interval }} minute{{ next_sync_job.interval|pluralize }}</td>
+          </tr>
+          {% endif %}
+        </table>
+
+        <div class="d-flex flex-wrap gap-2 align-items-end">
+
+          <form method="post" action="{% url 'plugins:netbox_windows_dhcp:schedule_sync' %}">
+            {% csrf_token %}
+            <input type="hidden" name="action" value="run_now">
+            <button type="submit" class="btn btn-warning">
+              <i class="mdi mdi-play-circle-outline"></i> Run Now
+            </button>
+          </form>
+
+          {% if not next_sync_job or next_sync_job.status != 'pending' %}
+          <form id="schedule-form" method="post" action="{% url 'plugins:netbox_windows_dhcp:schedule_sync' %}" class="d-flex align-items-end gap-2">
+            {% csrf_token %}
+            <input type="hidden" name="action" value="schedule">
+            {# start_at_hidden is filled with the UTC ISO string by the script below before submit #}
+            <input type="hidden" name="start_at" id="start_at_hidden">
+            <div>
+              <label for="start_at_local" class="form-label mb-1 small text-muted">Start at (your local time)</label>
+              <input type="datetime-local" id="start_at_local" class="form-control form-control-sm" required
+                     style="width:220px">
+            </div>
+            <button type="submit" class="btn btn-outline-secondary">
+              <i class="mdi mdi-clock-outline"></i> Schedule
+            </button>
+          </form>
+          {% endif %}
+
+        </div>
+
+        <span class="text-muted d-block mt-2 small">
+          <i class="mdi mdi-information-outline"></i>
+          <strong>Run Now</strong> enqueues an immediate sync that then repeats on the configured interval.
+          <strong>Schedule</strong> runs the first sync at the chosen date/time, then repeats on the interval.
+          Saving a new interval above reschedules any existing job.
+        </span>
+
       </div>
     </div>
 
   </div>
 </div>
+{% endblock %}
+
+{% block javascript %}
+{{ block.super }}
+<script>
+(function () {
+  var form = document.getElementById('schedule-form');
+  if (!form) return;
+  form.addEventListener('submit', function (e) {
+    var localInput = document.getElementById('start_at_local');
+    var hiddenInput = document.getElementById('start_at_hidden');
+    if (!localInput.value) return;
+    // new Date() treats a datetime-local string (no tz suffix) as browser local time.
+    // toISOString() converts that to UTC so the server gets an unambiguous timestamp.
+    hiddenInput.value = new Date(localInput.value).toISOString();
+  });
+})();
+</script>
 {% endblock %}
