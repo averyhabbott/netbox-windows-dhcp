@@ -23,7 +23,8 @@ class DHCPServerSerializer(NetBoxModelSerializer):
         model = DHCPServer
         fields = (
             'id', 'url', 'display', 'name', 'hostname', 'port', 'use_https',
-            'api_key', 'tags', 'custom_fields', 'created', 'last_updated',
+            'api_key', 'verify_ssl', 'sync_standalone_scopes',
+            'tags', 'custom_fields', 'created', 'last_updated',
         )
         brief_fields = ('id', 'url', 'display', 'name', 'hostname')
         extra_kwargs = {
@@ -55,7 +56,7 @@ class DHCPFailoverSerializer(NetBoxModelSerializer):
             'primary_server', 'primary_server_id',
             'secondary_server', 'secondary_server_id',
             'mode', 'max_client_lead_time', 'max_response_delay',
-            'state_switchover_interval', 'enable_auth', 'shared_secret',
+            'state_switchover_interval', 'sync_enabled', 'enable_auth', 'shared_secret',
             'tags', 'custom_fields', 'created', 'last_updated',
         )
         brief_fields = ('id', 'url', 'display', 'name', 'mode')
@@ -136,6 +137,14 @@ class DHCPScopeSerializer(NetBoxModelSerializer):
         source='prefix',
         write_only=True,
     )
+    server = DHCPServerSerializer(nested=True, read_only=True)
+    server_id = serializers.PrimaryKeyRelatedField(
+        queryset=DHCPServer.objects.all(),
+        source='server',
+        write_only=True,
+        required=False,
+        allow_null=True,
+    )
     failover = DHCPFailoverSerializer(nested=True, read_only=True)
     failover_id = serializers.PrimaryKeyRelatedField(
         queryset=DHCPFailover.objects.all(),
@@ -160,9 +169,24 @@ class DHCPScopeSerializer(NetBoxModelSerializer):
             'id', 'url', 'display', 'name',
             'prefix', 'prefix_id',
             'start_ip', 'end_ip', 'router', 'lease_lifetime',
+            'server', 'server_id',
             'failover', 'failover_id',
             'option_values', 'option_value_ids',
             'exclusion_ranges',
             'tags', 'custom_fields', 'created', 'last_updated',
         )
         brief_fields = ('id', 'url', 'display', 'name', 'start_ip', 'end_ip')
+
+    def validate(self, data):
+        data = super().validate(data)
+        has_server = bool(data.get('server'))
+        has_failover = bool(data.get('failover'))
+        if has_server and has_failover:
+            raise serializers.ValidationError(
+                'Set either server_id or failover_id, not both.'
+            )
+        if not has_server and not has_failover:
+            raise serializers.ValidationError(
+                'Either server_id or failover_id must be set.'
+            )
+        return data

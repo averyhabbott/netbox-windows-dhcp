@@ -4,6 +4,7 @@ from django.contrib import messages
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.shortcuts import get_object_or_404, redirect, render
 from django.views import View
+from netbox.object_actions import BulkDelete, BulkExport, CloneObject, DeleteObject
 from netbox.views import generic
 
 from .filtersets import (
@@ -49,6 +50,12 @@ from .tables import (
 logger = logging.getLogger('netbox_windows_dhcp')
 
 
+def _setting(name: str):
+    """Return the named DHCPPluginSettings boolean, cached per call."""
+    from .models import DHCPPluginSettings
+    return getattr(DHCPPluginSettings.load(), name)
+
+
 # ---------------------------------------------------------------------------
 # DHCPServer views
 # ---------------------------------------------------------------------------
@@ -71,7 +78,10 @@ class DHCPServerView(generic.ObjectView):
         failover_table = FT(related_failovers)
         failover_table.configure(request)
 
-        related_scopes = DHCPScope.objects.filter(failover__in=related_failovers)
+        from django.db.models import Q
+        related_scopes = DHCPScope.objects.filter(
+            Q(server=instance) | Q(failover__in=related_failovers)
+        )
         scope_table = DHCPScopeTable(related_scopes)
         scope_table.configure(request)
 
@@ -169,10 +179,14 @@ class DHCPFailoverListView(generic.ObjectListView):
     table = DHCPFailoverTable
     filterset = DHCPFailoverFilterSet
     filterset_form = DHCPFailoverFilterForm
+    template_name = 'netbox_windows_dhcp/dhcpfailover_list.html'
+    # No add or bulk_edit — failovers are import-only; sync is toggled via dedicated action
+    actions = (BulkExport, BulkDelete)
 
 
 class DHCPFailoverView(generic.ObjectView):
     queryset = DHCPFailover.objects.select_related('primary_server', 'secondary_server')
+    actions = (DeleteObject,)
 
     def get_extra_context(self, request, instance):
         scope_table = DHCPScopeTable(instance.scopes.all())
@@ -183,6 +197,13 @@ class DHCPFailoverView(generic.ObjectView):
 class DHCPFailoverCreateView(generic.ObjectEditView):
     queryset = DHCPFailover.objects.all()
     form = DHCPFailoverForm
+
+    def dispatch(self, request, *args, **kwargs):
+        messages.error(
+            request,
+            'Failover relationships are read-only. Import them from a DHCP server to create them.',
+        )
+        return redirect('plugins:netbox_windows_dhcp:dhcpfailover_list')
 
 
 class DHCPFailoverEditView(generic.ObjectEditView):
@@ -197,6 +218,36 @@ class DHCPFailoverDeleteView(generic.ObjectDeleteView):
 class DHCPFailoverBulkDeleteView(generic.BulkDeleteView):
     queryset = DHCPFailover.objects.all()
     table = DHCPFailoverTable
+
+
+class DHCPFailoverToggleSyncView(LoginRequiredMixin, View):
+    """Toggle sync_enabled on a single failover relationship."""
+
+    def post(self, request, pk):
+        failover = get_object_or_404(DHCPFailover, pk=pk)
+        failover.sync_enabled = not failover.sync_enabled
+        failover.save(update_fields=['sync_enabled'])
+        state = 'enabled' if failover.sync_enabled else 'disabled'
+        messages.success(request, f'Sync {state} for failover "{failover}".')
+        return redirect(request.META.get('HTTP_REFERER', 'plugins:netbox_windows_dhcp:dhcpfailover_list'))
+
+
+class DHCPFailoverBulkToggleSyncView(LoginRequiredMixin, View):
+    """Toggle sync_enabled on all selected failover relationships."""
+
+    def post(self, request):
+        pk_list = [int(pk) for pk in request.POST.getlist('pk') if str(pk).isdigit()]
+        if not pk_list:
+            messages.warning(request, 'No failover relationships selected.')
+            return redirect('plugins:netbox_windows_dhcp:dhcpfailover_list')
+
+        failovers = DHCPFailover.objects.filter(pk__in=pk_list)
+        for failover in failovers:
+            failover.sync_enabled = not failover.sync_enabled
+            failover.save(update_fields=['sync_enabled'])
+
+        messages.success(request, f'Toggled sync for {failovers.count()} failover relationship(s).')
+        return redirect(request.POST.get('return_url', 'plugins:netbox_windows_dhcp:dhcpfailover_list'))
 
 
 # ---------------------------------------------------------------------------
@@ -282,14 +333,17 @@ class DHCPOptionValueBulkDeleteView(generic.BulkDeleteView):
 # ---------------------------------------------------------------------------
 
 class DHCPScopeListView(generic.ObjectListView):
-    queryset = DHCPScope.objects.select_related('prefix', 'failover')
+    queryset = DHCPScope.objects.select_related('prefix', 'server', 'failover')
     table = DHCPScopeTable
     filterset = DHCPScopeFilterSet
     filterset_form = DHCPScopeFilterForm
 
+    def get_extra_context(self, request):
+        return {'push_scope_info': _setting('push_scope_info')}
+
 
 class DHCPScopeView(generic.ObjectView):
-    queryset = DHCPScope.objects.select_related('prefix', 'failover').prefetch_related(
+    queryset = DHCPScope.objects.select_related('prefix', 'server', 'failover').prefetch_related(
         'option_values__option_definition',
         'exclusion_ranges',
     )
@@ -327,21 +381,46 @@ class DHCPScopeView(generic.ObjectView):
             'option_table': option_table,
             'exclusion_table': exclusion_table,
             'ip_table': ip_table,
+            'push_scope_info': _setting('push_scope_info'),
         }
+
+
+_SCOPE_READONLY_MSG = (
+    'DHCP Scopes are read-only when "Push Scope Info" is disabled. '
+    'Enable it in plugin settings to manage scopes from NetBox.'
+)
 
 
 class DHCPScopeCreateView(generic.ObjectEditView):
     queryset = DHCPScope.objects.all()
     form = DHCPScopeForm
 
+    def dispatch(self, request, *args, **kwargs):
+        if not _setting('push_scope_info'):
+            messages.error(request, _SCOPE_READONLY_MSG)
+            return redirect('plugins:netbox_windows_dhcp:dhcpscope_list')
+        return super().dispatch(request, *args, **kwargs)
+
 
 class DHCPScopeEditView(generic.ObjectEditView):
     queryset = DHCPScope.objects.all()
     form = DHCPScopeForm
 
+    def dispatch(self, request, *args, **kwargs):
+        if not _setting('push_scope_info'):
+            messages.error(request, _SCOPE_READONLY_MSG)
+            return redirect('plugins:netbox_windows_dhcp:dhcpscope_list')
+        return super().dispatch(request, *args, **kwargs)
+
 
 class DHCPScopeDeleteView(generic.ObjectDeleteView):
     queryset = DHCPScope.objects.all()
+
+    def dispatch(self, request, *args, **kwargs):
+        if not _setting('push_scope_info'):
+            messages.error(request, _SCOPE_READONLY_MSG)
+            return redirect('plugins:netbox_windows_dhcp:dhcpscope_list')
+        return super().dispatch(request, *args, **kwargs)
 
 
 class DHCPScopeBulkEditView(generic.BulkEditView):
@@ -349,6 +428,12 @@ class DHCPScopeBulkEditView(generic.BulkEditView):
     filterset = DHCPScopeFilterSet
     table = DHCPScopeTable
     form = DHCPScopeBulkEditForm
+
+    def dispatch(self, request, *args, **kwargs):
+        if not _setting('push_scope_info'):
+            messages.error(request, _SCOPE_READONLY_MSG)
+            return redirect('plugins:netbox_windows_dhcp:dhcpscope_list')
+        return super().dispatch(request, *args, **kwargs)
 
     def post(self, request, *args, **kwargs):
         response = super().post(request, *args, **kwargs)
@@ -376,6 +461,12 @@ class DHCPScopeBulkEditView(generic.BulkEditView):
 class DHCPScopeBulkDeleteView(generic.BulkDeleteView):
     queryset = DHCPScope.objects.all()
     table = DHCPScopeTable
+
+    def dispatch(self, request, *args, **kwargs):
+        if not _setting('push_scope_info'):
+            messages.error(request, _SCOPE_READONLY_MSG)
+            return redirect('plugins:netbox_windows_dhcp:dhcpscope_list')
+        return super().dispatch(request, *args, **kwargs)
 
 
 # ---------------------------------------------------------------------------

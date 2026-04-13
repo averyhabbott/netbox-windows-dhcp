@@ -136,6 +136,11 @@ class DHCPExclusionRangeFilterSet(NetBoxModelFilterSet):
 class DHCPScopeFilterSet(NetBoxModelFilterSet):
     name = django_filters.CharFilter(lookup_expr='icontains')
     prefix_id = django_filters.NumberFilter(field_name='prefix')
+    server_id = django_filters.ModelMultipleChoiceFilter(
+        queryset=DHCPServer.objects.all(),
+        field_name='server',
+        label='Server',
+    )
     failover_id = django_filters.ModelMultipleChoiceFilter(
         queryset=DHCPFailover.objects.all(),
         field_name='failover',
@@ -144,7 +149,7 @@ class DHCPScopeFilterSet(NetBoxModelFilterSet):
 
     class Meta:
         model = DHCPScope
-        fields = ('name', 'prefix', 'failover', 'router')
+        fields = ('name', 'prefix', 'server', 'failover', 'router')
 
     def search(self, queryset, name, value):
         if not value.strip():

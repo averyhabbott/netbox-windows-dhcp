@@ -112,7 +112,73 @@ Go to **Windows DHCP → Admin → Settings** to configure:
 | Push Scope Info to DHCP Server | Push scope config changes from NetBox to the DHCP server |
 | Sync Interval (minutes) | How often the background sync runs (5–1440) |
 
+## Editing Rules
+
+Not all objects in the plugin support full CRUD. The table below summarises what operations are allowed and under what conditions.
+
+### Failover Relationships
+
+| Operation | Allowed |
+| --- | --- |
+| View | ✅ Always |
+| Delete | ✅ Always |
+| Create | ❌ Never — import from the DHCP server |
+| Edit | ✅ Via direct URL only (not exposed in the UI) |
+
+Failover relationships are created automatically during an **Import from Server** run. The **Add** button and **Edit** button are intentionally hidden from the list and detail views — relationships should be managed on the DHCP server and imported into NetBox. The **Sync Enabled** toggle on the list view is the primary way to manage a failover relationship after import.
+
+### DHCP Scopes
+
+| Operation | Push Scope Info **off** | Push Scope Info **on** |
+| --- | --- | --- |
+| View | ✅ | ✅ |
+| Create | ❌ | ✅ |
+| Edit | ❌ | ✅ |
+| Delete | ❌ | ✅ |
+
+When **Push Scope Info to DHCP Server** is disabled, the DHCP server is the source of truth for scope configuration. Scopes reach NetBox via **Import from Server** and are kept up to date by periodic sync. Direct edits are blocked to prevent NetBox from drifting out of sync with the server.
+
+When **Push Scope Info to DHCP Server** is enabled, NetBox becomes the source of truth. Scope changes saved in NetBox are pushed to the DHCP server on the next sync. Full CRUD is permitted.
+
+> **Note:** Exclusion Ranges follow scope info — create, edit, and delete are permitted whenever **Push Scope Info** is enabled, and blocked when it is disabled.
+
+### IP Address Status Validation
+
+Any IP Address with a status that begins with `dhcp-` (e.g. `dhcp-lease`, `dhcp-reserved`, `dhcp-staged`) must satisfy both of the following conditions when saved through the UI or REST API:
+
+1. The IP address must fall within the prefix of at least one configured DHCP Scope.
+2. The IP address must **not** fall within any exclusion range of that scope.
+
+This validation runs during form submission and API writes. It does **not** run during background sync — the sync sets statuses based on authoritative data from the DHCP server and bypasses this check by design.
+
+There are no UI-level restrictions on editing IP addresses with `dhcp-lease` or `dhcp-reserved` status beyond the above. Changes made manually will be overwritten on the next sync if **Sync IP Addresses from Leases & Reservations** is enabled.
+
+## Scope Source
+
+Every DHCP Scope must be associated with exactly one of:
+
+- **Server** — for standalone scopes that are not part of a failover relationship. Set automatically during **Import from Server** when the scope has no failover name.
+- **Failover Relationship** — for scopes managed under a Windows DHCP failover pair.
+
+This association determines which server is responsible for syncing the scope. Standalone scopes are only synced against their assigned server; failover scopes are synced via the primary server of their failover relationship.
+
 ## Sync Behavior
+
+### Scope eligibility
+
+Not every scope is synced on every server. Before processing a scope, the sync checks eligibility:
+
+| Scope type | Synced when |
+| --- | --- |
+| Standalone (has Server) | Server's **Sync Standalone Scopes** is enabled, and the scope's assigned server matches the server being synced |
+| Failover-linked | The failover relationship's **Sync Enabled** is on, and the server being synced is the **primary** of that failover |
+| Neither assigned | Never synced |
+
+**Server pre-flight:** If a server has **Sync Standalone Scopes** disabled and is not the primary server for any active failover relationship, the sync skips it entirely — no network connection is made.
+
+### Per-failover sync control
+
+Each failover relationship has a **Sync Enabled** toggle (visible on the failover list and toggleable per-row). When disabled, all scopes using that failover are excluded from sync. This allows pausing sync for a specific failover pair without affecting others.
 
 ### IP Address sync
 
@@ -153,7 +219,7 @@ After syncing leases and reservations for a scope, the plugin removes records th
 
 **Scope cleanup:**
 
-When a scope exists in NetBox but is no longer reported by the DHCP server, and the server was successfully reached, and **Push Scope Info to DHCP Server** is disabled, the scope is deleted from NetBox. Only scopes linked to the server via a failover relationship are considered.
+When a scope exists in NetBox but is no longer reported by the DHCP server, and the server was successfully reached, and **Push Scope Info to DHCP Server** is disabled, the scope is deleted from NetBox. Only scopes whose Scope Source links them to the server being synced (either directly as a standalone scope, or via a failover relationship where this server is primary) are considered.
 
 > When **Push Scope Info to DHCP Server** is enabled, a scope missing from the server will instead be created on the server.
 

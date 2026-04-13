@@ -214,19 +214,38 @@ def _push_reservations(job_logger, client, scope, scope_id: str):
         for r in client.list_reservations(scope_id=scope_id)
     }
 
-    for ip_obj in IPAddress.objects.filter(status__in=('reserved', 'dhcp-reserved')):
+    prefix_cidr = str(scope.prefix.prefix)
+    seen_client_ids = set()
+    for ip_obj in IPAddress.objects.filter(
+        status__in=('reserved', 'dhcp-reserved'),
+        address__net_contained_or_equal=prefix_cidr,
+    ):
         try:
             host = str(ip_obj.address.ip)
+            client_id = ip_obj.custom_field_data.get('dhcp_client_id') or ''
+            if not client_id:
+                job_logger.debug(
+                    f'Skipping reservation {host} — no dhcp_client_id set '
+                    f'(Windows DHCP requires a client MAC to create a reservation)'
+                )
+                continue
+            if client_id in seen_client_ids:
+                job_logger.warning(
+                    f'Skipping reservation {host} — client_id {client_id} already pushed '
+                    f'for another IP in scope {scope_id} (duplicate MACs not allowed per scope)'
+                )
+                continue
+            seen_client_ids.add(client_id)
             if host not in existing_reservations:
                 client.create_reservation({
                     'scope_id': scope_id,
                     'ip_address': host,
-                    'client_id': '',
+                    'client_id': client_id,
                     'name': ip_obj.dns_name or '',
                     'description': ip_obj.description or '',
                     'type': 'Dhcp',
                 })
-                job_logger.info(f'Pushed reservation {host} to server')
+                job_logger.info(f'Pushed reservation {host} to server (client_id={client_id})')
         except Exception as exc:
             job_logger.warning(f'Failed to push reservation {ip_obj}: {exc}')
 
@@ -399,7 +418,22 @@ def _push_scope(job_logger, client, scope, remote=None, scope_id: Optional[str] 
 
 def _sync_server(job_logger, server, sync_ip_addresses: bool, push_reservations: bool, push_scope_info: bool):
     from .api_client import PSUClient, PSUClientError
-    from .models import DHCPScope
+    from .models import DHCPFailover, DHCPScope
+
+    # Pre-flight check: skip connecting to this server entirely if there is nothing
+    # eligible to sync on it.
+    #   - Standalone scopes: only relevant if sync_standalone_scopes is enabled.
+    #   - Failover scopes: only synced via the PRIMARY server; secondary-only servers
+    #     serve no role in syncing scope data.
+    has_eligible_failover = DHCPFailover.objects.filter(
+        primary_server=server, sync_enabled=True
+    ).exists()
+    if not server.sync_standalone_scopes and not has_eligible_failover:
+        job_logger.info(
+            f'Skipping server {server.name}: sync_standalone_scopes is disabled and '
+            f'server is not primary for any active failover relationship.'
+        )
+        return
 
     job_logger.info(
         f'Syncing server: {server.name} ({server.hostname}) — '
@@ -442,6 +476,31 @@ def _sync_server(job_logger, server, sync_ip_addresses: bool, push_reservations:
         scope = local_scope_map.get(scope_id)
         if scope is None:
             job_logger.info(f'Remote scope {scope_id} has no matching DHCPScope in NetBox — skipping')
+            continue
+
+        # Sync eligibility check:
+        #   - Scopes with a failover relationship are synced only when that failover's
+        #     sync_enabled is True.
+        #   - Scopes with a server FK are synced only against their owning server, and
+        #     only when that server's sync_standalone_scopes is True.
+        #   - Scopes with neither set are skipped silently (legacy data).
+        if scope.failover:
+            if not scope.failover.sync_enabled:
+                job_logger.debug(
+                    f'Scope "{scope.name}": failover "{scope.failover.name}" has sync disabled — skipping'
+                )
+                continue
+        elif scope.server_id:
+            if scope.server_id != server.pk:
+                # Belongs to a different server — skip silently
+                continue
+            if not server.sync_standalone_scopes:
+                job_logger.debug(
+                    f'Scope "{scope.name}": standalone scopes disabled on {server.name} — skipping'
+                )
+                continue
+        else:
+            job_logger.debug(f'Scope "{scope.name}": no server or failover assigned — skipping')
             continue
 
         job_logger.info(f'Scope "{scope.name}" matched remote scope_id={scope_id} on {server.name}')
@@ -494,11 +553,17 @@ def _sync_server(job_logger, server, sync_ip_addresses: bool, push_reservations:
         if network in remote_scope_map:
             continue  # already handled in the loop above
 
-        is_this_server = scope.failover and (
-            scope.failover.primary_server_id == server.pk
-            or scope.failover.secondary_server_id == server.pk
+        is_this_server = (
+            (scope.server_id == server.pk) or
+            (scope.failover_id and (
+                scope.failover.primary_server_id == server.pk
+                or scope.failover.secondary_server_id == server.pk
+            ))
         )
         if not is_this_server:
+            continue
+
+        if scope.failover_id and not scope.failover.sync_enabled:
             continue
 
         if push_scope_info:

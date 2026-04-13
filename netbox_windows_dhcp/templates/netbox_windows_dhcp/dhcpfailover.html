@@ -38,7 +38,11 @@
           </tr>
           <tr>
             <th scope="row">Authentication</th>
-            <td>{% if object.enable_auth %}<span class="badge bg-success">Enabled</span>{% else %}<span class="badge bg-secondary">Disabled</span>{% endif %}</td>
+            <td>{% if object.enable_auth %}<i class="mdi mdi-check-bold text-success"></i>{% else %}<i class="mdi mdi-close text-danger"></i>{% endif %}</td>
+          </tr>
+          <tr>
+            <th scope="row">Sync Enabled</th>
+            <td>{% if object.sync_enabled %}<i class="mdi mdi-check-bold text-success"></i>{% else %}<i class="mdi mdi-close text-danger"></i>{% endif %}</td>
           </tr>
         </table>
       </div>

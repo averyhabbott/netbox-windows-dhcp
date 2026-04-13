@@ -1,0 +1,16 @@
+{% extends 'generic/object_list.html' %}
+
+{% block bulk_buttons %}
+<div class="bulk-action-buttons">
+  <button type="submit"
+          formaction="{% url 'plugins:netbox_windows_dhcp:dhcpfailover_bulk_toggle_sync' %}"
+          class="btn btn-warning">
+    <i class="mdi mdi-sync"></i> Toggle Sync for Selected
+  </button>
+  <button type="submit"
+          formaction="{% url 'plugins:netbox_windows_dhcp:dhcpfailover_bulk_delete' %}"
+          class="btn btn-danger">
+    <i class="mdi mdi-trash-can-outline"></i> Delete Selected
+  </button>
+</div>
+{% endblock bulk_buttons %}

@@ -30,11 +30,15 @@
           </tr>
           <tr>
             <th scope="row">Verify SSL</th>
-            <td>{% if object.verify_ssl %}<span class="badge bg-success">Yes</span>{% else %}<span class="badge bg-warning text-dark">No</span>{% endif %}</td>
+            <td>{% if object.verify_ssl %}<i class="mdi mdi-check-bold text-success"></i>{% else %}<i class="mdi mdi-close text-danger"></i>{% endif %}</td>
           </tr>
           <tr>
             <th scope="row">Base URL</th>
             <td><code>{{ object.base_url }}</code></td>
+          </tr>
+          <tr>
+            <th scope="row">Sync Standalone Scopes</th>
+            <td>{% if object.sync_standalone_scopes %}<i class="mdi mdi-check-bold text-success"></i>{% else %}<i class="mdi mdi-close text-danger"></i>{% endif %}</td>
           </tr>
         </table>
       </div>

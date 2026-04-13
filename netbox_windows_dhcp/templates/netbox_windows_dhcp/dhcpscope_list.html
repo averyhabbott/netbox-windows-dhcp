@@ -1,0 +1,13 @@
+{% extends 'generic/object_list.html' %}
+
+{% block content %}
+{% if not push_scope_info %}
+<div class="alert alert-warning d-flex align-items-center mb-3" role="alert">
+  <i class="mdi mdi-lock me-2"></i>
+  <span>Scopes are <strong>read-only</strong> — enable <em>Push Scope Info</em> in
+    <a href="{% url 'plugins:netbox_windows_dhcp:settings' %}">plugin settings</a>
+    to allow edits.</span>
+</div>
+{% endif %}
+{{ block.super }}
+{% endblock %}

@@ -74,6 +74,13 @@ class DHCPServer(NetBoxModel):
         verbose_name='Verify SSL Certificate',
         help_text='Uncheck to disable TLS certificate verification (for self-signed certs in test environments).',
     )
+    sync_standalone_scopes = models.BooleanField(
+        default=True,
+        verbose_name='Sync Standalone Scopes',
+        help_text=(
+            'When enabled, scopes with no failover relationship are included in sync operations for this server.'
+        ),
+    )
 
     class Meta:
         ordering = ['name']
@@ -131,6 +138,13 @@ class DHCPFailover(NetBoxModel):
         blank=True,
         verbose_name='State Switchover Interval (s)',
         help_text='Seconds. Leave blank to disable automatic switchover.',
+    )
+    sync_enabled = models.BooleanField(
+        default=True,
+        verbose_name='Sync Enabled',
+        help_text=(
+            'When enabled, scopes using this failover relationship are included in sync operations.'
+        ),
     )
     enable_auth = models.BooleanField(
         default=False,
@@ -343,6 +357,15 @@ class DHCPScope(NetBoxModel):
         verbose_name='Lease Lifetime',
         help_text='Lease duration in seconds',
     )
+    server = models.ForeignKey(
+        DHCPServer,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='standalone_scopes',
+        verbose_name='Server',
+        help_text='For standalone scopes not part of a failover relationship.',
+    )
     failover = models.ForeignKey(
         DHCPFailover,
         on_delete=models.SET_NULL,
@@ -376,6 +399,17 @@ class DHCPScope(NetBoxModel):
 
     def clean(self):
         super().clean()
+        has_server = bool(self.server_id)
+        has_failover = bool(self.failover_id)
+        if has_server and has_failover:
+            raise ValidationError(
+                'A scope cannot have both a server and a failover relationship. Set only one.'
+            )
+        if not has_server and not has_failover:
+            raise ValidationError(
+                'A scope must be associated with either a server or a failover relationship.'
+            )
+
         if not self.prefix_id or not self.start_ip or not self.end_ip:
             return
 

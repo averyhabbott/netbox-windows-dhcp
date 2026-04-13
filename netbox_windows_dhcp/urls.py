@@ -38,10 +38,12 @@ urlpatterns = [
     path('failover/', views.DHCPFailoverListView.as_view(), name='dhcpfailover_list'),
     path('failover/add/', views.DHCPFailoverCreateView.as_view(), name='dhcpfailover_add'),
     path('failover/delete/', views.DHCPFailoverBulkDeleteView.as_view(), name='dhcpfailover_bulk_delete'),
+    path('failover/toggle-sync/', views.DHCPFailoverBulkToggleSyncView.as_view(), name='dhcpfailover_bulk_toggle_sync'),
     path('failover/<int:pk>/', views.DHCPFailoverView.as_view(), name='dhcpfailover'),
     path('failover/<int:pk>/edit/', views.DHCPFailoverEditView.as_view(), name='dhcpfailover_edit'),
     path('failover/<int:pk>/delete/', views.DHCPFailoverDeleteView.as_view(), name='dhcpfailover_delete'),
     path('failover/<int:pk>/changelog/', ObjectChangeLogView.as_view(), {'model': DHCPFailover}, name='dhcpfailover_changelog'),
+    path('failover/<int:pk>/toggle-sync/', views.DHCPFailoverToggleSyncView.as_view(), name='dhcpfailover_toggle_sync'),
 
     # -----------------------------------------------------------------------
     # DHCPOptionCodeDefinition

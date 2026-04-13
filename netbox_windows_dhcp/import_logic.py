@@ -57,7 +57,7 @@ def run_import(server) -> Dict:
 
     for rs in remote_scopes:
         try:
-            _import_scope(client, rs, results)
+            _import_scope(client, rs, results, server=server)
         except Exception as exc:
             scope_id = rs.get('scope_id') or rs.get('ScopeId') or '(unknown)'
             results['scopes']['errors'].append(f'{scope_id}: {exc}')
@@ -131,7 +131,7 @@ def _import_failover(rf: Dict, results: Dict):
 # Scope helper
 # ---------------------------------------------------------------------- #
 
-def _import_scope(client, rs: Dict, results: Dict):
+def _import_scope(client, rs: Dict, results: Dict, server=None):
     from .models import DHCPFailover, DHCPScope
     from ipam.models import Prefix
 
@@ -195,6 +195,7 @@ def _import_scope(client, rs: Dict, results: Dict):
         router=router,
         lease_lifetime=lease_secs,
         failover=failover,
+        server=server if failover is None else None,
     )
     results['scopes']['created'].append(f'{name} ({cidr})')
 

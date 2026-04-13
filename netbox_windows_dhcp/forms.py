@@ -61,12 +61,13 @@ class DHCPExclusionRangeForm(NetBoxModelForm):
 class DHCPServerForm(NetBoxModelForm):
     fieldsets = (
         FieldSet('name', 'hostname', 'port', 'use_https', 'api_key', 'verify_ssl', name='Server'),
+        FieldSet('sync_standalone_scopes', name='Sync'),
         FieldSet('tags', name='Tags'),
     )
 
     class Meta:
         model = DHCPServer
-        fields = ('name', 'hostname', 'port', 'use_https', 'api_key', 'verify_ssl', 'tags')
+        fields = ('name', 'hostname', 'port', 'use_https', 'api_key', 'verify_ssl', 'sync_standalone_scopes', 'tags')
         labels = {
             'api_key': 'App Token',
         }
@@ -93,6 +94,7 @@ class DHCPFailoverForm(NetBoxModelForm):
         FieldSet('name', 'primary_server', 'secondary_server', 'mode', name='Failover'),
         FieldSet('max_client_lead_time', 'max_response_delay', 'state_switchover_interval', name='Timing'),
         FieldSet('enable_auth', 'shared_secret', name='Authentication'),
+        FieldSet('sync_enabled', name='Sync'),
         FieldSet('tags', name='Tags'),
     )
 
@@ -115,6 +117,7 @@ class DHCPFailoverForm(NetBoxModelForm):
             'max_client_lead_time',
             'max_response_delay',
             'state_switchover_interval',
+            'sync_enabled',
             'enable_auth',
             'shared_secret',
             'tags',
@@ -226,7 +229,7 @@ class DHCPScopeForm(NetBoxModelForm):
             InlineFields('lease_lifetime_value', 'lease_lifetime_unit', label='Lease Lifetime'),
             name='IP Range',
         ),
-        FieldSet('failover', 'option_values', name='DHCP Configuration'),
+        FieldSet('server', 'failover', 'option_values', name='Scope Source & Configuration'),
         FieldSet('tags', name='Tags'),
     )
 
@@ -234,10 +237,17 @@ class DHCPScopeForm(NetBoxModelForm):
         queryset=Prefix.objects.all(),
         label='Prefix',
     )
+    server = DynamicModelChoiceField(
+        queryset=DHCPServer.objects.all(),
+        required=False,
+        label='Server',
+        help_text='For standalone scopes. Leave blank if this scope uses a failover relationship.',
+    )
     failover = DynamicModelChoiceField(
         queryset=DHCPFailover.objects.all(),
         required=False,
         label='Failover Relationship',
+        help_text='Leave blank if this scope is standalone (set Server instead).',
     )
     option_values = DynamicModelMultipleChoiceField(
         queryset=DHCPOptionValue.objects.all(),
@@ -261,6 +271,7 @@ class DHCPScopeForm(NetBoxModelForm):
             'start_ip',
             'end_ip',
             'router',
+            'server',
             'failover',
             'option_values',
             'tags',
@@ -280,6 +291,18 @@ class DHCPScopeForm(NetBoxModelForm):
 
     def clean(self):
         cleaned = super().clean() or self.cleaned_data
+
+        # Enforce mutual exclusion: exactly one of server or failover must be set.
+        has_server = bool(cleaned.get('server'))
+        has_failover = bool(cleaned.get('failover'))
+        if has_server and has_failover:
+            raise forms.ValidationError(
+                'Set either Server or Failover Relationship, not both.'
+            )
+        if not has_server and not has_failover:
+            raise forms.ValidationError(
+                'A scope must be associated with either a Server or a Failover Relationship.'
+            )
 
         # Validate that no two selected option values share the same option code.
         option_values = cleaned.get('option_values')
@@ -309,6 +332,10 @@ class DHCPScopeForm(NetBoxModelForm):
 
 class DHCPScopeFilterForm(NetBoxModelFilterSetForm):
     model = DHCPScope
+    server = DynamicModelChoiceField(
+        queryset=DHCPServer.objects.all(),
+        required=False,
+    )
     failover = DynamicModelChoiceField(
         queryset=DHCPFailover.objects.all(),
         required=False,
@@ -323,6 +350,7 @@ class DHCPScopeBulkEditForm(NetBoxModelBulkEditForm):
         FieldSet(
             'router',
             InlineFields('lease_lifetime_value', 'lease_lifetime_unit', label='Lease Lifetime'),
+            'server',
             'failover',
             name='Scope',
         ),
@@ -360,6 +388,11 @@ class DHCPScopeBulkEditForm(NetBoxModelBulkEditForm):
             # Neither provided — don't touch lease_lifetime on any object
             cleaned.pop('lease_lifetime', None)
         return cleaned
+    server = DynamicModelChoiceField(
+        queryset=DHCPServer.objects.all(),
+        required=False,
+        label='Server',
+    )
     failover = DynamicModelChoiceField(
         queryset=DHCPFailover.objects.all(),
         required=False,
@@ -376,7 +409,7 @@ class DHCPScopeBulkEditForm(NetBoxModelBulkEditForm):
         label='Remove Option Values',
     )
 
-    nullable_fields = ('router', 'failover')
+    nullable_fields = ('router', 'server', 'failover')
 
 
 # ---------------------------------------------------------------------------
