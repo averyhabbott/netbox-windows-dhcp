@@ -33,8 +33,8 @@ def dhcpscope_post_save(sender, instance, created, **kwargs):
 
 def _patch_ipaddress_clean():
     """
-    Monkey-patch IPAddress.clean() to enforce that dhcp-* statuses are only
-    allowed when the IP falls within a DHCP scope and is not in an exclusion range.
+    Monkey-patch IPAddress.clean() to enforce that status 'dhcp' is only allowed
+    when the IP falls within a DHCP scope and is not in an exclusion range.
 
     This runs during form/API validation (full_clean → clean) but NOT during
     direct .save() calls from the background sync — which is intentional, as
@@ -49,7 +49,7 @@ def _patch_ipaddress_clean():
         def _dhcp_validated_clean(self):
             _original_clean(self)
 
-            if not self.status or not str(self.status).startswith('dhcp-'):
+            if self.status != 'dhcp':
                 return
 
             # Import here to avoid circular imports at module load time.
@@ -72,7 +72,7 @@ def _patch_ipaddress_clean():
 
             if matching_scope is None:
                 raise ValidationError(
-                    f'IP addresses with a dhcp-* status must fall within a configured DHCP '
+                    f'IP addresses with status "dhcp" must fall within a configured DHCP '
                     f'scope prefix. No matching scope found for {self.address.ip}.'
                 )
 
@@ -83,7 +83,7 @@ def _patch_ipaddress_clean():
                         raise ValidationError(
                             f'{self.address.ip} falls within exclusion range '
                             f'{ex.start_ip}–{ex.end_ip} of scope "{matching_scope.name}". '
-                            f'Excluded IPs cannot have a dhcp-* status.'
+                            f'Excluded IPs cannot have status "dhcp".'
                         )
                 except ValidationError:
                     raise

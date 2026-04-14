@@ -1,0 +1,31 @@
+<div class="card">
+  <h5 class="card-header">DHCP Lease Details</h5>
+  <div class="card-body">
+    <table class="table table-hover attr-table">
+      <tr>
+        <th scope="row">Lease Hostname</th>
+        <td>{{ dhcp_info.lease_hostname|default:'—' }}</td>
+      </tr>
+      <tr>
+        <th scope="row">Active</th>
+        <td>
+          {% if dhcp_info.active %}
+            <i class="mdi mdi-check-bold text-success"></i>
+          {% else %}
+            <i class="mdi mdi-close text-danger"></i>
+          {% endif %}
+        </td>
+      </tr>
+      <tr>
+        <th scope="row">Lease Expiration</th>
+        <td>
+          {% if dhcp_info.lease_expiration %}
+            {{ dhcp_info.lease_expiration }}
+          {% else %}
+            <span class="text-muted">—</span>
+          {% endif %}
+        </td>
+      </tr>
+    </table>
+  </div>
+</div>

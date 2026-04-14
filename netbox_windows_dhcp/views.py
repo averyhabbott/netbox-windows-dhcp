@@ -116,10 +116,13 @@ class DHCPServerSyncView(LoginRequiredMixin, View):
     def post(self, request, pk):
         server = get_object_or_404(DHCPServer, pk=pk)
         from .background_tasks import DHCPServerSyncJob
+        from .models import DHCPPluginSettings
+        cfg = DHCPPluginSettings.load()
         job = DHCPServerSyncJob.enqueue(
             name=f'Sync {server.name}',
             user=request.user,
             server_pk=server.pk,
+            queue_name=cfg.sync_queue,
         )
         messages.success(request, f'Sync job queued for {server.name}.')
         return redirect(job.get_absolute_url())
@@ -133,6 +136,8 @@ class DHCPGlobalSyncView(LoginRequiredMixin, View):
 
     def post(self, request):
         from .background_tasks import DHCPServerSyncJob
+        from .models import DHCPPluginSettings
+        cfg = DHCPPluginSettings.load()
         servers = DHCPServer.objects.all()
         count = 0
         for server in servers:
@@ -140,6 +145,7 @@ class DHCPGlobalSyncView(LoginRequiredMixin, View):
                 name=f'Sync {server.name}',
                 user=request.user,
                 server_pk=server.pk,
+                queue_name=cfg.sync_queue,
             )
             count += 1
         messages.success(request, f'Queued sync job for {count} server(s). Check System → Jobs for progress.')
@@ -161,10 +167,13 @@ class DHCPServerImportView(LoginRequiredMixin, View):
     def post(self, request, pk):
         server = get_object_or_404(DHCPServer, pk=pk)
         from .background_tasks import DHCPImportJob
+        from .models import DHCPPluginSettings
+        cfg = DHCPPluginSettings.load()
         job = DHCPImportJob.enqueue(
             name=f'Import from {server.name}',
             user=request.user,
             server_pk=server.pk,
+            queue_name=cfg.sync_queue,
         )
         messages.success(request, f'Import job queued for {server.name}.')
         return redirect(job.get_absolute_url())
@@ -372,7 +381,9 @@ class DHCPScopeView(generic.ObjectView):
             )
         ).filter(
             Q(_in_dynamic_range=True)
-            | Q(address__net_contained_or_equal=prefix_cidr, status__startswith='dhcp-')
+            | Q(address__net_contained_or_equal=prefix_cidr, status='dhcp')
+            | Q(address__net_contained_or_equal=prefix_cidr, status='reserved',
+                dhcp_lease_info__isnull=False)
         ).order_by('address')
         ip_table = IPAddressTable(ip_qs)
         ip_table.configure(request)
@@ -548,15 +559,6 @@ class SettingsView(LoginRequiredMixin, View):
 
     template_name = 'netbox_windows_dhcp/settings.html'
 
-    def _check_custom_statuses(self):
-        from django.apps import apps
-        try:
-            IPAddress = apps.get_model('ipam', 'IPAddress')
-            choices = [c[0] for c in IPAddress._meta.get_field('status').choices]
-            return [s for s in ('dhcp-lease', 'dhcp-reserved') if s not in choices]
-        except Exception:
-            return []
-
     def get(self, request):
         if not request.user.is_superuser:
             messages.error(request, 'Only superusers can manage plugin settings.')
@@ -566,7 +568,6 @@ class SettingsView(LoginRequiredMixin, View):
         form = PluginSettingsForm(instance=DHCPPluginSettings.load())
         return render(request, self.template_name, {
             'form': form,
-            'missing_statuses': self._check_custom_statuses(),
             'next_sync_job': _get_next_sync_job(),
         })
 
@@ -585,7 +586,6 @@ class SettingsView(LoginRequiredMixin, View):
 
         return render(request, self.template_name, {
             'form': form,
-            'missing_statuses': self._check_custom_statuses(),
             'next_sync_job': _get_next_sync_job(),
         })
 
@@ -622,6 +622,7 @@ class ScheduleSyncView(LoginRequiredMixin, View):
             job = DHCPSyncJob.enqueue(
                 user=request.user,
                 interval=cfg.sync_interval,
+                queue_name=cfg.sync_queue,
             )
             messages.success(
                 request,
@@ -651,6 +652,7 @@ class ScheduleSyncView(LoginRequiredMixin, View):
                 user=request.user,
                 schedule_at=scheduled_at,
                 interval=cfg.sync_interval,
+                queue_name=cfg.sync_queue,
             )
             messages.success(
                 request,

@@ -48,6 +48,35 @@ class Migration(migrations.Migration):
                     verbose_name='Sync Interval (minutes)',
                     help_text='How often the background sync job runs (5–1440 minutes).',
                 )),
+                ('sync_queue', models.CharField(
+                    choices=[('high', 'High'), ('default', 'Default'), ('low', 'Low')],
+                    default='default',
+                    max_length=20,
+                    verbose_name='Sync Job Queue',
+                    help_text='Worker queue priority used for all DHCP sync and import jobs.',
+                )),
+                ('sync_protect_tag', models.ForeignKey(
+                    blank=True,
+                    null=True,
+                    on_delete=django.db.models.deletion.SET_NULL,
+                    related_name='+',
+                    to='extras.tag',
+                    verbose_name='Sync-Protected Tag',
+                    help_text=(
+                        'IP Addresses carrying this tag are fully protected from sync: '
+                        'status, DNS name, and the IP itself are never modified or removed by the sync. '
+                        'Leave blank to disable.'
+                    ),
+                )),
+                ('sync_protect_update_client_id', models.BooleanField(
+                    default=False,
+                    verbose_name='Update Client ID for Protected IPs',
+                    help_text=(
+                        "When enabled, the sync updates the DHCP Client ID field on protected IPs to match "
+                        "the DHCP server's active lease (useful after a server replacement when the client "
+                        "MAC changes). All other sync writes are still blocked for protected IPs."
+                    ),
+                )),
             ],
             options={
                 'verbose_name': 'Plugin Settings',
@@ -77,6 +106,14 @@ class Migration(migrations.Migration):
                     default=True,
                     verbose_name='Verify SSL Certificate',
                     help_text='Uncheck to disable TLS certificate verification (for self-signed certs in test environments).',
+                )),
+                ('sync_standalone_scopes', models.BooleanField(
+                    default=True,
+                    verbose_name='Sync Standalone Scopes',
+                    help_text=(
+                        'When enabled, scopes with no failover relationship are included '
+                        'in sync operations for this server.'
+                    ),
                 )),
                 ('tags', taggit.managers.TaggableManager(through='extras.TaggedItem', to='extras.Tag')),
             ],
@@ -161,6 +198,14 @@ class Migration(migrations.Migration):
                     blank=True,
                     verbose_name='State Switchover Interval (s)',
                     help_text='Seconds. Leave blank to disable automatic switchover.',
+                )),
+                ('sync_enabled', models.BooleanField(
+                    default=True,
+                    verbose_name='Sync Enabled',
+                    help_text=(
+                        'When enabled, scopes using this failover relationship are included '
+                        'in sync operations.'
+                    ),
                 )),
                 ('enable_auth', models.BooleanField(
                     default=False,
@@ -247,6 +292,15 @@ class Migration(migrations.Migration):
                     to='ipam.prefix',
                     verbose_name='Prefix',
                 )),
+                ('server', models.ForeignKey(
+                    blank=True,
+                    null=True,
+                    on_delete=django.db.models.deletion.SET_NULL,
+                    related_name='standalone_scopes',
+                    to='netbox_windows_dhcp.dhcpserver',
+                    verbose_name='Server',
+                    help_text='For standalone scopes not part of a failover relationship.',
+                )),
                 ('failover', models.ForeignKey(
                     blank=True,
                     null=True,
@@ -278,7 +332,6 @@ class Migration(migrations.Migration):
                 ('custom_field_data', models.JSONField(blank=True, default=dict, encoder=utilities.json.CustomFieldJSONEncoder)),
                 ('start_ip', models.GenericIPAddressField(verbose_name='Start IP')),
                 ('end_ip', models.GenericIPAddressField(verbose_name='End IP')),
-                ('description', models.CharField(max_length=200, blank=True)),
                 ('scope', models.ForeignKey(
                     on_delete=django.db.models.deletion.CASCADE,
                     related_name='exclusion_ranges',
@@ -292,6 +345,39 @@ class Migration(migrations.Migration):
                 'verbose_name_plural': 'DHCP Exclusion Ranges',
                 'ordering': ['scope', 'start_ip'],
                 'unique_together': {('scope', 'start_ip', 'end_ip')},
+            },
+        ),
+        migrations.CreateModel(
+            name='DHCPLeaseInfo',
+            fields=[
+                ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False)),
+                ('lease_hostname', models.CharField(
+                    blank=True,
+                    default='',
+                    max_length=255,
+                    verbose_name='Lease Hostname',
+                    help_text='Hostname reported by the DHCP server for this lease or reservation.',
+                )),
+                ('active', models.BooleanField(
+                    default=False,
+                    verbose_name='Active',
+                    help_text='True if this IP was seen as an active lease or reservation on the last sync.',
+                )),
+                ('lease_expiration', models.DateTimeField(
+                    blank=True,
+                    null=True,
+                    verbose_name='Lease Expiration',
+                    help_text='When this lease expires. Null for reservations (they do not expire).',
+                )),
+                ('ip_address', models.OneToOneField(
+                    on_delete=django.db.models.deletion.CASCADE,
+                    related_name='dhcp_lease_info',
+                    to='ipam.ipaddress',
+                )),
+            ],
+            options={
+                'verbose_name': 'DHCP Lease Info',
+                'verbose_name_plural': 'DHCP Lease Info',
             },
         ),
     ]

@@ -54,28 +54,10 @@ class NetBoxWindowsDHCPConfig(PluginConfig):
 
     def ready(self):
         super().ready()
-        self._check_custom_statuses()
         from django.db.models.signals import post_migrate
         post_migrate.connect(_ensure_custom_fields, sender=self)
         from . import signals  # noqa: F401
         from . import background_tasks  # noqa: F401 — registers DHCPSyncJob with system_job scheduler
-
-    def _check_custom_statuses(self):
-        """Warn if the required custom IP Address statuses are not configured."""
-        try:
-            from django.apps import apps
-            IPAddress = apps.get_model('ipam', 'IPAddress')
-            choices = [c[0] for c in IPAddress._meta.get_field('status').choices]
-            missing = [s for s in ('dhcp-lease', 'dhcp-reserved') if s not in choices]
-            if missing:
-                logger.warning(
-                    'netbox-windows-dhcp: The following custom IP Address status values are '
-                    'not configured: %s. Add them to FIELD_CHOICES in configuration.py. '
-                    'See the plugin README for details.',
-                    ', '.join(missing),
-                )
-        except Exception:
-            pass
 
 
 config = NetBoxWindowsDHCPConfig

@@ -1,5 +1,6 @@
 from django import forms
 
+from extras.models import Tag
 from ipam.models import Prefix
 from netbox.forms import NetBoxModelBulkEditForm, NetBoxModelForm, NetBoxModelFilterSetForm
 from utilities.forms.fields import (
@@ -423,7 +424,35 @@ class PluginSettingsForm(forms.ModelForm):
         label='Sync Interval (minutes)',
         help_text='How often the background sync job runs (5–1440 minutes).',
     )
+    sync_protect_tag = DynamicModelChoiceField(
+        queryset=Tag.objects.all(),
+        required=False,
+        label='Sync-Protected Tag',
+        help_text=(
+            'IP Addresses carrying this tag are fully protected from sync: '
+            'status, DNS name, and the IP itself are never modified or removed by the sync. '
+            'Leave blank to disable.'
+        ),
+    )
 
     class Meta:
         model = DHCPPluginSettings
-        fields = ('sync_ip_addresses', 'push_reservations', 'push_scope_info', 'sync_interval')
+        fields = (
+            'sync_ip_addresses',
+            'push_reservations',
+            'push_scope_info',
+            'sync_interval',
+            'sync_queue',
+            'sync_protect_tag',
+            'sync_protect_update_client_id',
+        )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        try:
+            from django.contrib.contenttypes.models import ContentType
+            from ipam.models import IPAddress
+            ct = ContentType.objects.get_for_model(IPAddress)
+            self.fields['sync_protect_tag'].widget.add_query_param('for_object_type_id', ct.pk)
+        except Exception:
+            pass

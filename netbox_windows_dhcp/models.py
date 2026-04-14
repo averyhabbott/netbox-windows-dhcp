@@ -4,6 +4,7 @@ from django.urls import reverse
 from netaddr import IPAddress as NetAddrIP, IPNetwork
 
 from netbox.models import NetBoxModel
+from utilities.querysets import RestrictedQuerySet
 
 
 class DHCPPluginSettings(models.Model):
@@ -41,6 +42,44 @@ class DHCPPluginSettings(models.Model):
         default=60,
         verbose_name='Sync Interval (minutes)',
         help_text='How often the background sync job runs (5–1440 minutes).',
+    )
+    QUEUE_HIGH = 'high'
+    QUEUE_DEFAULT = 'default'
+    QUEUE_LOW = 'low'
+    QUEUE_CHOICES = [
+        (QUEUE_HIGH, 'High'),
+        (QUEUE_DEFAULT, 'Default'),
+        (QUEUE_LOW, 'Low'),
+    ]
+
+    sync_queue = models.CharField(
+        max_length=20,
+        choices=QUEUE_CHOICES,
+        default=QUEUE_DEFAULT,
+        verbose_name='Sync Job Queue',
+        help_text='Worker queue priority used for all DHCP sync and import jobs.',
+    )
+    sync_protect_tag = models.ForeignKey(
+        'extras.Tag',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='+',
+        verbose_name='Sync-Protected Tag',
+        help_text=(
+            'IP Addresses carrying this tag are fully protected from sync: '
+            'status, DNS name, and the IP itself are never modified or removed by the sync. '
+            'Leave blank to disable.'
+        ),
+    )
+    sync_protect_update_client_id = models.BooleanField(
+        default=False,
+        verbose_name='Update Client ID for Protected IPs',
+        help_text=(
+            'When enabled, the sync updates the DHCP Client ID field on protected IPs to match '
+            'the DHCP server\'s active lease (useful after a server replacement when the client '
+            'MAC changes). All other sync writes are still blocked for protected IPs.'
+        ),
     )
 
     class Meta:
@@ -432,3 +471,54 @@ class DHCPScope(NetBoxModel):
             raise ValidationError(
                 {'end_ip': 'End IP must be greater than or equal to the Start IP.'}
             )
+
+
+class DHCPLeaseInfo(models.Model):
+    """
+    DHCP lease/reservation metadata for a NetBox IPAddress.
+
+    Stored separately from IPAddress to avoid flooding the changelog on every sync.
+    Created and updated exclusively by the background sync job.
+    The presence of this record marks an IP address as DHCP-managed — used by
+    cleanup logic to distinguish plugin-managed 'reserved' IPs from manually-created ones.
+    Cascades on IPAddress deletion so it always stays in sync.
+
+    Uses RestrictedQuerySet so NetBox's search backend can call .restrict() when
+    resolving search results through its permission system.
+    """
+    objects = RestrictedQuerySet.as_manager()
+
+    ip_address = models.OneToOneField(
+        'ipam.IPAddress',
+        on_delete=models.CASCADE,
+        related_name='dhcp_lease_info',
+    )
+    lease_hostname = models.CharField(
+        max_length=255,
+        blank=True,
+        default='',
+        verbose_name='Lease Hostname',
+        help_text='Hostname reported by the DHCP server for this lease or reservation.',
+    )
+    active = models.BooleanField(
+        default=False,
+        verbose_name='Active',
+        help_text='True if this IP was seen as an active lease or reservation on the last sync.',
+    )
+    lease_expiration = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name='Lease Expiration',
+        help_text='When this lease expires. Null for reservations (they do not expire).',
+    )
+
+    class Meta:
+        verbose_name = 'DHCP Lease Info'
+        verbose_name_plural = 'DHCP Lease Info'
+
+    def __str__(self):
+        return self.lease_hostname or f'DHCP info for {self.ip_address}'
+
+    def get_absolute_url(self):
+        """Return the IP Address detail URL so search results link to the right page."""
+        return self.ip_address.get_absolute_url()

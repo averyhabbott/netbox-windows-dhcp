@@ -51,25 +51,7 @@ PLUGINS = [
 
 No `PLUGINS_CONFIG` entry is required. All settings are managed through the plugin's **Admin → Settings** page in the NetBox UI.
 
-### 3. Add custom IP Address statuses
-
-Active sync mode sets IP Address status to `dhcp-lease` or `dhcp-reserved`. These values must be added to NetBox's field choices in `configuration.py`:
-
-```python
-FIELD_CHOICES = {
-    'ipam.IPAddress.status+': [
-        ('dhcp-lease',    'DHCP-Lease',    'blue'),
-        ('dhcp-reserved', 'DHCP-Reserved', 'cyan'),
-        ('dhcp-staged',   'DHCP-Staged',   'green'),  # optional — see Pre-Staging IPs below
-    ]
-}
-```
-
-`dhcp-lease` and `dhcp-reserved` are required when **Sync IP Addresses from Leases & Reservations** is enabled. If these are missing, the plugin displays a warning on the Settings page and logs a warning at startup.
-
-`dhcp-staged` is optional and only needed if you use the pre-staging workflow described below.
-
-### 4. Run migrations
+### 3. Run migrations
 
 ```bash
 python manage.py migrate
@@ -77,7 +59,7 @@ python manage.py migrate
 
 Running migrations also triggers the `post_migrate` signal which auto-registers the `dhcp_client_id` custom field on IP Address objects.
 
-### 5. Restart NetBox
+### 4. Restart NetBox
 
 Restart gunicorn/uwsgi and the RQ workers.
 
@@ -108,9 +90,12 @@ Go to **Windows DHCP → Admin → Settings** to configure:
 | Setting | Description |
 | --- | --- |
 | Sync IP Addresses from Leases & Reservations | When checked, pull leases and reservations and create/update/delete NetBox IP Address records. When unchecked, sync scope config only. |
-| Push Reservations to DHCP Server | Push NetBox `reserved`/`dhcp-reserved` IPs to the DHCP server as reservations |
+| Push Reservations to DHCP Server | Push NetBox `reserved` IPs to the DHCP server as reservations |
 | Push Scope Info to DHCP Server | Push scope config changes from NetBox to the DHCP server |
 | Sync Interval (minutes) | How often the background sync runs (5–1440) |
+| Sync Job Queue | Worker queue priority (`High` / `Default` / `Low`) used for all sync and import background jobs. Default: `Default`. |
+| Sync-Protected Tag | A NetBox tag. Any IP Address carrying this tag is fully shielded from sync — its status, DNS name, and record itself are never modified or removed. Leave blank to disable. |
+| Update Client ID for Protected IPs | When enabled, the sync updates the `dhcp_client_id` custom field on protected IPs to match the DHCP server's active lease. All other sync writes remain blocked. Useful after a server replacement when the client MAC changes. |
 
 ## Editing Rules
 
@@ -144,14 +129,16 @@ When **Push Scope Info to DHCP Server** is enabled, NetBox becomes the source of
 
 ### IP Address Status Validation
 
-Any IP Address with a status that begins with `dhcp-` (e.g. `dhcp-lease`, `dhcp-reserved`, `dhcp-staged`) must satisfy both of the following conditions when saved through the UI or REST API:
+Any IP Address with status `dhcp` must satisfy both of the following conditions when saved through the UI or REST API:
 
 1. The IP address must fall within the prefix of at least one configured DHCP Scope.
 2. The IP address must **not** fall within any exclusion range of that scope.
 
 This validation runs during form submission and API writes. It does **not** run during background sync — the sync sets statuses based on authoritative data from the DHCP server and bypasses this check by design.
 
-There are no UI-level restrictions on editing IP addresses with `dhcp-lease` or `dhcp-reserved` status beyond the above. Changes made manually will be overwritten on the next sync if **Sync IP Addresses from Leases & Reservations** is enabled.
+The `reserved` status is not validated against DHCP scope membership — it is a general-purpose NetBox status used for both DHCP reservations and non-DHCP purposes.
+
+There are no UI-level restrictions on editing IP addresses with `dhcp` or `reserved` status beyond the above. Changes made manually to DHCP-managed IPs will be overwritten on the next sync if **Sync IP Addresses from Leases & Reservations** is enabled.
 
 ## Scope Source
 
@@ -192,30 +179,36 @@ When checked, the sync pulls leases and reservations from each DHCP server and c
 
 | Source | `IPAddress.status` | `dns_name` | `dhcp_client_id` |
 | --- | --- | --- | --- |
-| Active DHCP lease | `dhcp-lease` | Hostname from DHCP (lowercased) | Client MAC address |
-| DHCP reservation | `dhcp-reserved` | Name from reservation (lowercased) | Client MAC address |
+| Active DHCP lease | `dhcp` | Hostname from DHCP (lowercased) | Client MAC address |
+| DHCP reservation | `reserved` | Name from reservation (lowercased) | Client MAC address |
 
-Reservations take precedence — a `dhcp-reserved` IP is not overwritten by a lease record for the same address.
+Reservations take precedence — a `reserved` IP is not overwritten by a lease record for the same address.
+
+**Special case — `reserved` IP with no `dhcp_client_id`:** If a `reserved` IP address has no `dhcp_client_id` set (e.g. it was manually created before the client MAC was known), and a lease is discovered on the DHCP server for that address, the sync will populate `dhcp_client_id` from the lease but will not change the status or `dns_name`. This allows the IP to be pre-registered before provisioning.
 
 New IP Addresses are created using the prefix length of the associated scope's NetBox Prefix (not `/32`).
 
 The `dhcp_client_id` custom field (auto-registered on IP Address) stores the client MAC address in Windows DHCP hyphen-separated format (`00-11-22-33-44-55`).
 
-All IP Address creates and updates are recorded in the NetBox changelog, attributed to the user who queued the sync job.
+All IP Address creates and updates are recorded in the NetBox changelog, attributed to the user who queued the sync job. DHCP lease metadata (lease hostname, active status, expiration) is stored in a separate non-changelog side-table (`DHCPLeaseInfo`) and displayed on the IP Address detail page — these updates do not generate changelog entries.
 
 **Cleanup (stale record removal):**
 
 After syncing leases and reservations for a scope, the plugin removes records that no longer exist on the server:
 
-| NetBox status | Server state | Action |
-| --- | --- | --- |
-| `dhcp-reserved` | Reservation still exists | No change |
-| `dhcp-reserved` | No reservation, but lease exists | Downgraded to `dhcp-lease` |
-| `dhcp-reserved` | Neither reservation nor lease | Deleted |
-| `dhcp-lease` | Lease still active | No change |
-| `dhcp-lease` | Lease expired or gone | Deleted |
+| NetBox status | `dhcp_client_id` | DHCP-managed? | Server state | Action |
+| --- | --- | --- | --- | --- |
+| `dhcp` | — | — | Lease still active | No change |
+| `dhcp` | — | — | Lease expired or gone | Deleted |
+| `reserved` | — | — | Any | Never auto-deleted (pre-staged or manual) |
+| `reserved` | set | No (manually created) | Any | Never auto-deleted |
+| `reserved` | set | Yes (sync-created) | Reservation still exists | No change |
+| `reserved` | set | Yes (sync-created) | No reservation, but lease exists | Downgraded to `dhcp` |
+| `reserved` | set | Yes (sync-created) | Neither reservation nor lease | Deleted |
 
-> **Note:** When **Push Reservations to DHCP Server** is enabled, NetBox is the source of truth for reservations. `dhcp-reserved` IP Addresses are never deleted or downgraded based on server state — they will be pushed to the server on the next sync instead.
+"DHCP-managed" means the record was created or previously updated by the sync (indicated by a `DHCPLeaseInfo` side-record). Manually-created `reserved` IPs are never auto-deleted even if they have a `dhcp_client_id`.
+
+> **Note:** When **Push Reservations to DHCP Server** is enabled, NetBox is the source of truth for reservations. `reserved` IP Addresses with a `dhcp_client_id` are never deleted or downgraded based on server state — they will be pushed to the server on the next sync instead.
 
 **Scope cleanup:**
 
@@ -225,22 +218,33 @@ When a scope exists in NetBox but is no longer reported by the DHCP server, and 
 
 **Safety:** If the API call to fetch leases/reservations fails for a scope, cleanup is skipped for that scope. If `list_scopes()` fails entirely, the server is unreachable and no cleanup runs at all.
 
-### Pre-Staging IPs (`dhcp-staged`)
+### Pre-Staging IPs
 
-Sometimes a device needs to be registered in NetBox weeks before it is provisioned — before a lease has been issued and before the client MAC is known (making a DHCP reservation impossible).
+To register a device in NetBox before its client MAC is known, create the IP Address with:
 
-Set the IP Address status to `DHCP-Staged` (requires the optional `dhcp-staged` entry in `FIELD_CHOICES`) and set `dns_name` to the planned canonical hostname. The sync will never overwrite or delete a `dhcp-staged` IP:
+- Status `reserved`
+- `dns_name` set to the planned canonical hostname
+- Leave `dhcp_client_id` blank
 
-- If a lease or reservation appears for the same address, the sync logs a skip message and leaves the IP untouched.
-- Cleanup never removes `dhcp-staged` IPs regardless of server state.
+The sync will never delete or overwrite the status or `dns_name` of a `reserved` IP with no `dhcp_client_id`. If a lease appears on the DHCP server for that address, the sync populates `dhcp_client_id` from the lease (so the reservation can be pushed once the MAC is known) but leaves everything else unchanged.
 
 **Typical lifecycle:**
 
-1. Create the IP in NetBox with status `DHCP-Staged` and the planned `dns_name`.
-2. Device is provisioned; it receives a DHCP lease. The sync skips the address and logs `"IP x.x.x.x is dhcp-staged — skipping"`.
-3. Once the client MAC is known, edit the IP: set status to `DHCP-Reserved`, fill in `dhcp_client_id`, and optionally push the reservation to the DHCP server.
+1. Create the IP in NetBox with status `reserved`, `dns_name` set to the planned hostname, and no `dhcp_client_id`.
+2. Device is provisioned; it receives a DHCP lease. The sync populates `dhcp_client_id` from the lease.
+3. Once `dhcp_client_id` is set, the reservation is pushed to the DHCP server on the next sync (if **Push Reservations** is enabled). The `dns_name` is used as the reservation name on the server.
 
-The planned `dns_name` is preserved throughout this process — it will not be overwritten with the DHCP-assigned hostname.
+### Sync-Protected IPs
+
+Any IP Address tagged with the configured **Sync-Protected Tag** is fully shielded from sync writes. The sync will never change its status, DNS name, or `dhcp_client_id`, and will never delete the record during cleanup.
+
+DHCP lease metadata (`DHCPLeaseInfo`) is always updated for protected IPs regardless of protection status — the lease hostname, active state, and expiration are still recorded and visible on the IP Address detail page.
+
+#### Update Client ID for Protected IPs
+
+Enable this checkbox to allow one narrow exception: the sync may update the `dhcp_client_id` custom field on a protected IP when the server's active lease carries a different client MAC. All other writes (status, DNS name, record deletion) remain blocked. This is useful after a DHCP server replacement where the client MAC for the same device changes.
+
+**Typical use:** Tag an IP as protected when it has been manually configured and should not be overwritten by automated sync, even if the DHCP server has a conflicting record.
 
 ### Sync Now
 

@@ -90,6 +90,9 @@ URL path parameters (`:param`) and the `$Body` variable are injected automatical
 | POST | `/api/dhcp/failover` | Create a failover relationship |
 | GET | `/api/dhcp/options/server` | Server-level option values |
 | GET | `/api/dhcp/options/scope/:scope_id` | Scope-level option values |
+| GET | `/api/dhcp/exclusions?scope_id=` | List exclusion ranges for a scope |
+| POST | `/api/dhcp/exclusions` | Create an exclusion range |
+| DELETE | `/api/dhcp/exclusions` | Delete an exclusion range (body: `scope_id`, `start_ip`, `end_ip`) |
 
 ## Response Shapes
 
