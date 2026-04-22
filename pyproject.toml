@@ -7,14 +7,42 @@ name = "netbox-windows-dhcp"
 version = "1.0.0"
 description = "NetBox plugin for full integration with Windows DHCP Server via PowerShell Universal"
 readme = "README.md"
-license = { text = "Apache-2.0" }
+license = { file = "LICENSE" }
+authors = [
+    { name = "Avery Abbott", email = "averyhabbott@yahoo.com" },
+]
 requires-python = ">=3.10"
 dependencies = [
     "requests>=2.28.0",
 ]
+keywords = [
+    "netbox",
+    "dhcp",
+    "windows",
+    "plugin",
+    "powershell",
+    "ipam",
+    "network",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Plugins",
+    "Framework :: Django",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Networking",
+    "Topic :: System :: Systems Administration",
+]
 
 [project.urls]
-Homepage = "https://github.com/your-org/netbox-windows-dhcp"
+Homepage = "https://github.com/averyhabbott/netbox-windows-dhcp"
+Repository = "https://github.com/averyhabbott/netbox-windows-dhcp"
+"Bug Tracker" = "https://github.com/averyhabbott/netbox-windows-dhcp/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]

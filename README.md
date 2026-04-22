@@ -22,10 +22,18 @@ A NetBox v4.5.0+ plugin for full integration with Windows DHCP Server via [Power
 
 ## Requirements
 
+### NetBox host
+
 - NetBox >= 4.5.0
 - Python >= 3.10
 - `requests` >= 2.28
-- PowerShell Universal **v5.x** running on each Windows DHCP server (see [PSU Setup](#psu-setup))
+- NetBox RQ workers running (required for background sync and import jobs)
+
+### Each Windows DHCP server
+
+- Windows Server 2016 or later with the **DHCP Server** role installed
+- PowerShell Universal **v5.x** (tested on 5.6.11+) — see [PSU Setup](#psu-setup)
+- `DhcpServer` PowerShell module (included with the DHCP Server role)
 
 ## Installation
 
@@ -276,7 +284,7 @@ The plugin adds a **Windows DHCP** menu to the NetBox left sidebar:
 
 See [psu/README.md](psu/README.md) for full deployment instructions.
 
-The plugin expects PowerShell Universal **v5.x** on each DHCP server, exposing endpoints under `/api/dhcp/`. The PSU script is at `psu/dhcp_api_endpoints.ps1`.
+The plugin expects PowerShell Universal **v5.x** (tested on 5.6.11+) on each DHCP server, exposing endpoints under `/api/dhcp/`. The PSU script is at `psu/dhcp_api_endpoints.ps1`.
 
 ### Endpoint reference
 
