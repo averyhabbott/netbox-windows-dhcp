@@ -38,7 +38,7 @@
 # Set to $true to require a PSU App Token on all endpoints.
 # Generate a token in the PSU admin console under Security > App Tokens,
 # then paste it into the App Token field on the DHCP Server object in NetBox.
-$RequireAuthentication = $false
+$RequireAuthentication = $true
 
 # Internal — builds the -Authentication splat used on every New-PSUEndpoint call.
 # Do not edit this line.
@@ -154,6 +154,17 @@ function Write-ApiError {
         -ContentType 'application/json'
 }
 
+function Assert-ValidIPv4 {
+    # Returns $true if $Value is a valid IPv4 address, otherwise writes a 400 response and returns $false.
+    param([string]$Value, [string]$FieldName = 'value')
+    $addr = $null
+    if ([System.Net.IPAddress]::TryParse($Value, [ref]$addr) -and $addr.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
+        return $true
+    }
+    Write-ApiError -Message "'$FieldName' must be a valid IPv4 address." -StatusCode 400
+    return $false
+}
+
 '@
 
 
@@ -214,12 +225,13 @@ New-PSUEndpoint -Url '/api/dhcp/scopes' -Method GET @_epAuth -Endpoint ([scriptb
 # Returns a single scope by its network address (e.g. "10.0.1.0").
 # ---------------------------------------------------------------------------
 New-PSUEndpoint -Url '/api/dhcp/scopes/:scope_id' -Method GET @_epAuth -Endpoint ([scriptblock]::Create($H + {
+    if (-not (Assert-ValidIPv4 -Value $scope_id -FieldName 'scope_id')) { return }
     try {
         $scope = Get-DhcpServerv4Scope -ScopeId $scope_id -ErrorAction Stop
         ConvertTo-ScopeObject $scope | ConvertTo-Json -Depth 4 -Compress
     }
     catch {
-        Write-ApiError -Message "Scope '$scope_id' not found." -StatusCode 404
+        Write-ApiError -Message 'Scope not found.' -StatusCode 404
     }
 }.ToString()))
 
@@ -250,6 +262,11 @@ New-PSUEndpoint -Url '/api/dhcp/scopes' -Method POST @_epAuth -Endpoint ([script
                 -ContentType 'application/json'
             return
         }
+        if (-not (Assert-ValidIPv4 -Value $body.scope_id   -FieldName 'scope_id'))   { return }
+        if (-not (Assert-ValidIPv4 -Value $body.start_ip   -FieldName 'start_ip'))   { return }
+        if (-not (Assert-ValidIPv4 -Value $body.end_ip     -FieldName 'end_ip'))     { return }
+        if (-not (Assert-ValidIPv4 -Value $body.subnet_mask -FieldName 'subnet_mask')) { return }
+        if ($body.router -and $body.router -ne '' -and -not (Assert-ValidIPv4 -Value $body.router -FieldName 'router')) { return }
 
         $addParams = @{
             ScopeId     = $body.scope_id
@@ -295,11 +312,15 @@ New-PSUEndpoint -Url '/api/dhcp/scopes' -Method POST @_epAuth -Endpoint ([script
 # Accepts the same body shape as POST.  Only provided fields are updated.
 # ---------------------------------------------------------------------------
 New-PSUEndpoint -Url '/api/dhcp/scopes/:scope_id' -Method PUT @_epAuth -Endpoint ([scriptblock]::Create($H + {
+    if (-not (Assert-ValidIPv4 -Value $scope_id -FieldName 'scope_id')) { return }
     try {
         # Verify scope exists first
         $null = Get-DhcpServerv4Scope -ScopeId $scope_id -ErrorAction Stop
 
         $body = $Body | ConvertFrom-Json
+        if ($body.PSObject.Properties.Name -contains 'start_ip'  -and $body.start_ip  -and -not (Assert-ValidIPv4 -Value $body.start_ip  -FieldName 'start_ip'))  { return }
+        if ($body.PSObject.Properties.Name -contains 'end_ip'    -and $body.end_ip    -and -not (Assert-ValidIPv4 -Value $body.end_ip    -FieldName 'end_ip'))    { return }
+        if ($body.PSObject.Properties.Name -contains 'router'    -and $body.router    -and -not (Assert-ValidIPv4 -Value $body.router    -FieldName 'router'))    { return }
 
         $setParams = @{
             ScopeId     = $scope_id
@@ -332,7 +353,7 @@ New-PSUEndpoint -Url '/api/dhcp/scopes/:scope_id' -Method PUT @_epAuth -Endpoint
         ConvertTo-ScopeObject $scope | ConvertTo-Json -Depth 4 -Compress
     }
     catch [Microsoft.Management.Infrastructure.CimException] {
-        Write-ApiError -Message "Scope '$scope_id' not found." -StatusCode 404
+        Write-ApiError -Message 'Scope not found.' -StatusCode 404
     }
     catch {
         Write-ApiError -Message $_.Exception.Message -StatusCode 500
@@ -352,6 +373,7 @@ New-PSUEndpoint -Url '/api/dhcp/scopes/:scope_id' -Method PUT @_epAuth -Endpoint
 New-PSUEndpoint -Url '/api/dhcp/leases' -Method GET @_epAuth -Endpoint ([scriptblock]::Create($H + {
     try {
         # $scope_id comes from the query string automatically in PSU
+        if ($scope_id -and -not (Assert-ValidIPv4 -Value $scope_id -FieldName 'scope_id')) { return }
         $targetScopes = if ($scope_id) {
             Get-DhcpServerv4Scope -ScopeId $scope_id -ErrorAction Stop
         }
@@ -385,6 +407,7 @@ New-PSUEndpoint -Url '/api/dhcp/leases' -Method GET @_epAuth -Endpoint ([scriptb
 # ---------------------------------------------------------------------------
 New-PSUEndpoint -Url '/api/dhcp/reservations' -Method GET @_epAuth -Endpoint ([scriptblock]::Create($H + {
     try {
+        if ($scope_id -and -not (Assert-ValidIPv4 -Value $scope_id -FieldName 'scope_id')) { return }
         $targetScopes = if ($scope_id) {
             Get-DhcpServerv4Scope -ScopeId $scope_id -ErrorAction Stop
         }
@@ -431,6 +454,8 @@ New-PSUEndpoint -Url '/api/dhcp/reservations' -Method POST @_epAuth -Endpoint ([
                 -ContentType 'application/json'
             return
         }
+        if (-not (Assert-ValidIPv4 -Value $body.scope_id   -FieldName 'scope_id'))   { return }
+        if (-not (Assert-ValidIPv4 -Value $body.ip_address -FieldName 'ip_address')) { return }
 
         # Normalise client_id to Windows DHCP format (aa-bb-cc-dd-ee-ff)
         $clientId = $body.client_id.ToLower() -replace '[^0-9a-f]', '' -replace '(..)(?!$)', '$1-'
@@ -658,6 +683,7 @@ New-PSUEndpoint -Url '/api/dhcp/options/server' -Method GET @_epAuth -Endpoint (
 # Returns all option values set on a specific scope.
 # ---------------------------------------------------------------------------
 New-PSUEndpoint -Url '/api/dhcp/options/scope/:scope_id' -Method GET @_epAuth -Endpoint ([scriptblock]::Create($H + {
+    if (-not (Assert-ValidIPv4 -Value $scope_id -FieldName 'scope_id')) { return }
     try {
         # Verify scope exists
         $null = Get-DhcpServerv4Scope -ScopeId $scope_id -ErrorAction Stop
@@ -669,7 +695,7 @@ New-PSUEndpoint -Url '/api/dhcp/options/scope/:scope_id' -Method GET @_epAuth -E
         ConvertTo-Json -InputObject $result -Depth 4 -Compress
     }
     catch [Microsoft.Management.Infrastructure.CimException] {
-        Write-ApiError -Message "Scope '$scope_id' not found." -StatusCode 404
+        Write-ApiError -Message 'Scope not found.' -StatusCode 404
     }
     catch {
         Write-ApiError -Message $_.Exception.Message -StatusCode 500
@@ -694,6 +720,7 @@ New-PSUEndpoint -Url '/api/dhcp/exclusions' -Method GET @_epAuth -Endpoint ([scr
                 -ContentType 'application/json'
             return
         }
+        if (-not (Assert-ValidIPv4 -Value $scope_id -FieldName 'scope_id')) { return }
 
         # Verify scope exists
         $null = Get-DhcpServerv4Scope -ScopeId $scope_id -ErrorAction Stop
@@ -705,7 +732,7 @@ New-PSUEndpoint -Url '/api/dhcp/exclusions' -Method GET @_epAuth -Endpoint ([scr
         ConvertTo-Json -InputObject $result -Depth 4 -Compress
     }
     catch [Microsoft.Management.Infrastructure.CimException] {
-        Write-ApiError -Message "Scope '$scope_id' not found." -StatusCode 404
+        Write-ApiError -Message 'Scope not found.' -StatusCode 404
     }
     catch {
         Write-ApiError -Message $_.Exception.Message -StatusCode 500
@@ -734,6 +761,9 @@ New-PSUEndpoint -Url '/api/dhcp/exclusions' -Method POST @_epAuth -Endpoint ([sc
                 -ContentType 'application/json'
             return
         }
+        if (-not (Assert-ValidIPv4 -Value $body.scope_id -FieldName 'scope_id')) { return }
+        if (-not (Assert-ValidIPv4 -Value $body.start_ip -FieldName 'start_ip')) { return }
+        if (-not (Assert-ValidIPv4 -Value $body.end_ip   -FieldName 'end_ip'))   { return }
 
         Add-DhcpServerv4ExclusionRange `
             -ScopeId    $body.scope_id `
@@ -777,6 +807,9 @@ New-PSUEndpoint -Url '/api/dhcp/exclusions' -Method DELETE @_epAuth -Endpoint ([
                 -ContentType 'application/json'
             return
         }
+        if (-not (Assert-ValidIPv4 -Value $body.scope_id -FieldName 'scope_id')) { return }
+        if (-not (Assert-ValidIPv4 -Value $body.start_ip -FieldName 'start_ip')) { return }
+        if (-not (Assert-ValidIPv4 -Value $body.end_ip   -FieldName 'end_ip'))   { return }
 
         Remove-DhcpServerv4ExclusionRange `
             -ScopeId    $body.scope_id `

@@ -160,10 +160,21 @@ def _import_scope(client, rs: Dict, results: Dict, server=None):
         return
 
     # Find or create the NetBox Prefix
-    prefix_obj, _ = Prefix.objects.get_or_create(
-        prefix=cidr,
-        defaults={'status': 'active'},
-    )
+    from .models import DHCPPluginSettings
+    if DHCPPluginSettings.load().create_missing_prefixes:
+        prefix_obj, _ = Prefix.objects.get_or_create(
+            prefix=cidr,
+            defaults={'status': 'active'},
+        )
+    else:
+        try:
+            prefix_obj = Prefix.objects.get(prefix=cidr)
+        except Prefix.DoesNotExist:
+            results['scopes']['errors'].append(
+                f'{scope_id}: prefix {cidr} does not exist in NetBox and '
+                f'"Create Missing Prefixes on Import" is disabled — skipped.'
+            )
+            return
 
     # Skip if a scope with this name + prefix already exists, but still import
     # exclusion ranges in case they were added after the scope was first imported.

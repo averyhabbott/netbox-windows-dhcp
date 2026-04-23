@@ -81,6 +81,15 @@ class DHCPPluginSettings(models.Model):
             'MAC changes). All other sync writes are still blocked for protected IPs.'
         ),
     )
+    create_missing_prefixes = models.BooleanField(
+        default=True,
+        verbose_name='Create Missing Prefixes on Import',
+        help_text=(
+            'When enabled, importing a scope whose CIDR does not exist in NetBox will '
+            'automatically create the Prefix. Disable if Prefixes are managed by another '
+            'source and should never be created by the DHCP plugin.'
+        ),
+    )
 
     class Meta:
         verbose_name = 'Plugin Settings'

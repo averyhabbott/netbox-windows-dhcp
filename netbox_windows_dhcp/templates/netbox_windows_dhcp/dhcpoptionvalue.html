@@ -22,7 +22,7 @@
           </tr>
           <tr>
             <th scope="row">Friendly Name</th>
-            <td>{{ object.friendly_name|default:'<span class="text-muted">—</span>'|safe }}</td>
+            <td>{% if object.friendly_name %}{{ object.friendly_name }}{% else %}<span class="text-muted">—</span>{% endif %}</td>
           </tr>
         </table>
       </div>

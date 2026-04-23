@@ -114,6 +114,9 @@ class DHCPServerSyncView(LoginRequiredMixin, View):
     """Enqueues a background sync job for a single DHCP server."""
 
     def post(self, request, pk):
+        if not request.user.has_perm('netbox_windows_dhcp.change_dhcpserver'):
+            messages.error(request, 'You do not have permission to sync DHCP servers.')
+            return redirect('plugins:netbox_windows_dhcp:dhcpserver_list')
         server = get_object_or_404(DHCPServer, pk=pk)
         from .background_tasks import DHCPServerSyncJob
         from .models import DHCPPluginSettings
@@ -127,14 +130,14 @@ class DHCPServerSyncView(LoginRequiredMixin, View):
         messages.success(request, f'Sync job queued for {server.name}.')
         return redirect(job.get_absolute_url())
 
-    def get(self, request, pk):
-        return self.post(request, pk)
-
 
 class DHCPGlobalSyncView(LoginRequiredMixin, View):
     """Enqueues a background sync job for every configured DHCP server."""
 
     def post(self, request):
+        if not request.user.has_perm('netbox_windows_dhcp.change_dhcpserver'):
+            messages.error(request, 'You do not have permission to sync DHCP servers.')
+            return redirect('plugins:netbox_windows_dhcp:dhcpserver_list')
         from .background_tasks import DHCPServerSyncJob
         from .models import DHCPPluginSettings
         cfg = DHCPPluginSettings.load()
@@ -151,20 +154,27 @@ class DHCPGlobalSyncView(LoginRequiredMixin, View):
         messages.success(request, f'Queued sync job for {count} server(s). Check System → Jobs for progress.')
         return redirect('plugins:netbox_windows_dhcp:dhcpserver_list')
 
-    def get(self, request):
-        return self.post(request)
-
 
 class DHCPServerImportView(LoginRequiredMixin, View):
     """Enqueues a background import job for a DHCP server."""
 
     template_name = 'netbox_windows_dhcp/dhcpserver_import.html'
 
+    def _check_permission(self, request):
+        if not request.user.has_perm('netbox_windows_dhcp.change_dhcpserver'):
+            messages.error(request, 'You do not have permission to import from DHCP servers.')
+            return False
+        return True
+
     def get(self, request, pk):
+        if not self._check_permission(request):
+            return redirect('plugins:netbox_windows_dhcp:dhcpserver_list')
         server = get_object_or_404(DHCPServer, pk=pk)
         return render(request, self.template_name, {'object': server})
 
     def post(self, request, pk):
+        if not self._check_permission(request):
+            return redirect('plugins:netbox_windows_dhcp:dhcpserver_list')
         server = get_object_or_404(DHCPServer, pk=pk)
         from .background_tasks import DHCPImportJob
         from .models import DHCPPluginSettings
@@ -233,6 +243,9 @@ class DHCPFailoverToggleSyncView(LoginRequiredMixin, View):
     """Toggle sync_enabled on a single failover relationship."""
 
     def post(self, request, pk):
+        if not request.user.has_perm('netbox_windows_dhcp.change_dhcpfailover'):
+            messages.error(request, 'You do not have permission to modify failover sync settings.')
+            return redirect('plugins:netbox_windows_dhcp:dhcpfailover_list')
         failover = get_object_or_404(DHCPFailover, pk=pk)
         failover.sync_enabled = not failover.sync_enabled
         failover.save(update_fields=['sync_enabled'])
@@ -245,6 +258,9 @@ class DHCPFailoverBulkToggleSyncView(LoginRequiredMixin, View):
     """Toggle sync_enabled on all selected failover relationships."""
 
     def post(self, request):
+        if not request.user.has_perm('netbox_windows_dhcp.change_dhcpfailover'):
+            messages.error(request, 'You do not have permission to modify failover sync settings.')
+            return redirect('plugins:netbox_windows_dhcp:dhcpfailover_list')
         pk_list = [int(pk) for pk in request.POST.getlist('pk') if str(pk).isdigit()]
         if not pk_list:
             messages.warning(request, 'No failover relationships selected.')

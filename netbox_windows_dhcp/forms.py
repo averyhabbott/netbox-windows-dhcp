@@ -73,12 +73,14 @@ class DHCPServerForm(NetBoxModelForm):
             'api_key': 'App Token',
         }
         widgets = {
-            'api_key': forms.PasswordInput(render_value=True),
+            'api_key': forms.PasswordInput(render_value=False),
         }
 
     def clean_api_key(self):
-        """Strip whitespace that may have been introduced by copy-pasting the token."""
-        return self.cleaned_data.get('api_key', '').strip()
+        value = self.cleaned_data.get('api_key', '').strip()
+        if not value and self.instance.pk:
+            return self.instance.api_key
+        return value
 
 
 class DHCPServerFilterForm(NetBoxModelFilterSetForm):
@@ -124,8 +126,14 @@ class DHCPFailoverForm(NetBoxModelForm):
             'tags',
         )
         widgets = {
-            'shared_secret': forms.PasswordInput(render_value=True),
+            'shared_secret': forms.PasswordInput(render_value=False),
         }
+
+    def clean_shared_secret(self):
+        value = self.cleaned_data.get('shared_secret', '').strip()
+        if not value and self.instance.pk:
+            return self.instance.shared_secret
+        return value
 
 
 class DHCPFailoverFilterForm(NetBoxModelFilterSetForm):
@@ -441,6 +449,7 @@ class PluginSettingsForm(forms.ModelForm):
             'sync_ip_addresses',
             'push_reservations',
             'push_scope_info',
+            'create_missing_prefixes',
             'sync_interval',
             'sync_queue',
             'sync_protect_tag',
