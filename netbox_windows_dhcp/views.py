@@ -85,9 +85,28 @@ class DHCPServerView(generic.ObjectView):
         scope_table = DHCPScopeTable(related_scopes)
         scope_table.configure(request)
 
+        from django.conf import settings as django_settings
+        server_overrides = (
+            getattr(django_settings, 'PLUGINS_CONFIG', {})
+            .get('netbox_windows_dhcp', {})
+            .get('server_overrides', {})
+        )
+
+        cert_expired = False
+        cert_expiring_soon = False
+        if instance.ca_cert_expiry:
+            from datetime import timedelta
+            from django.utils import timezone
+            now = timezone.now()
+            cert_expired = instance.ca_cert_expiry < now
+            cert_expiring_soon = not cert_expired and instance.ca_cert_expiry < now + timedelta(days=90)
+
         return {
             'failover_table': failover_table,
             'scope_table': scope_table,
+            'has_credential_override': instance.hostname in server_overrides,
+            'cert_expired': cert_expired,
+            'cert_expiring_soon': cert_expiring_soon,
         }
 
 
@@ -187,6 +206,78 @@ class DHCPServerImportView(LoginRequiredMixin, View):
         )
         messages.success(request, f'Import job queued for {server.name}.')
         return redirect(job.get_absolute_url())
+
+
+class DHCPServerCertImportView(LoginRequiredMixin, View):
+    """Fetch and trust a TLS certificate from a PSU server (TOFU model)."""
+
+    template_name = 'netbox_windows_dhcp/dhcpserver_certimport.html'
+
+    def _check_permission(self, request):
+        if not request.user.has_perm('netbox_windows_dhcp.change_dhcpserver'):
+            messages.error(request, 'You do not have permission to manage DHCP server certificates.')
+            return False
+        return True
+
+    def get(self, request, pk):
+        if not self._check_permission(request):
+            return redirect('plugins:netbox_windows_dhcp:dhcpserver_list')
+        server = get_object_or_404(DHCPServer, pk=pk)
+        if not server.use_https:
+            messages.error(request, 'Certificate import is only available for HTTPS servers.')
+            return redirect(server.get_absolute_url())
+        import ssl
+        from .cert_utils import fetch_cert_info
+        try:
+            cert_info = fetch_cert_info(server.hostname, server.port)
+        except (ssl.SSLError, OSError) as exc:
+            messages.error(request, f'Could not fetch certificate from {server.hostname}:{server.port}: {exc}')
+            return redirect(server.get_absolute_url())
+        except Exception as exc:
+            messages.error(request, f'Unexpected error fetching certificate: {exc}')
+            return redirect(server.get_absolute_url())
+        return render(request, self.template_name, {
+            'object': server,
+            'cert_info': cert_info,
+        })
+
+    def post(self, request, pk):
+        if not self._check_permission(request):
+            return redirect('plugins:netbox_windows_dhcp:dhcpserver_list')
+        server = get_object_or_404(DHCPServer, pk=pk)
+        import ssl
+        from .cert_utils import fetch_cert_info
+        try:
+            cert_info = fetch_cert_info(server.hostname, server.port)
+        except (ssl.SSLError, OSError) as exc:
+            messages.error(request, f'Could not fetch certificate: {exc}')
+            return redirect(server.get_absolute_url())
+        except Exception as exc:
+            messages.error(request, f'Unexpected error fetching certificate: {exc}')
+            return redirect(server.get_absolute_url())
+        server.ca_cert = cert_info['pem']
+        server.ca_cert_expiry = cert_info['not_after']
+        server.save(update_fields=['ca_cert', 'ca_cert_expiry'])
+        messages.success(
+            request,
+            f'Certificate imported for {server.name} (expires {cert_info["not_after"].date()}).',
+        )
+        return redirect(server.get_absolute_url())
+
+
+class DHCPServerCertRemoveView(LoginRequiredMixin, View):
+    """Remove a stored CA certificate from a DHCP server."""
+
+    def post(self, request, pk):
+        if not request.user.has_perm('netbox_windows_dhcp.change_dhcpserver'):
+            messages.error(request, 'You do not have permission to manage DHCP server certificates.')
+            return redirect('plugins:netbox_windows_dhcp:dhcpserver_list')
+        server = get_object_or_404(DHCPServer, pk=pk)
+        server.ca_cert = ''
+        server.ca_cert_expiry = None
+        server.save(update_fields=['ca_cert', 'ca_cert_expiry'])
+        messages.success(request, f'Certificate removed from {server.name}.')
+        return redirect(server.get_absolute_url())
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +480,8 @@ class DHCPScopeView(generic.ObjectView):
         # The range condition uses a RawSQL annotation because Django has no built-in inet
         # range lookup; host(address)::inet strips the prefix length for a pure IP comparison.
         prefix_cidr = str(instance.prefix.prefix)
+        from .models import DHCPPluginSettings
+        _s = DHCPPluginSettings.load()
         ip_qs = IPAddress.objects.annotate(
             _in_dynamic_range=RawSQL(
                 "host(address)::inet >= %s::inet AND host(address)::inet <= %s::inet",
@@ -397,8 +490,8 @@ class DHCPScopeView(generic.ObjectView):
             )
         ).filter(
             Q(_in_dynamic_range=True)
-            | Q(address__net_contained_or_equal=prefix_cidr, status='dhcp')
-            | Q(address__net_contained_or_equal=prefix_cidr, status='reserved',
+            | Q(address__net_contained_or_equal=prefix_cidr, status=_s.lease_status)
+            | Q(address__net_contained_or_equal=prefix_cidr, status=_s.reservation_status,
                 dhcp_lease_info__isnull=False)
         ).order_by('address')
         ip_table = IPAddressTable(ip_qs)
@@ -570,6 +663,25 @@ def _apply_interval_to_job(new_interval):
 # Settings view
 # ---------------------------------------------------------------------------
 
+_SETTINGS_OVERRIDE_LABELS = {
+    'sync_ips_from_dhcp': 'Sync IP Addresses from Leases & Reservations',
+    'push_reservations': 'Push Reservations to DHCP Server',
+    'push_scope_info': 'Push Scope Info to DHCP Server',
+}
+
+
+def _get_active_settings_overrides():
+    """Return list of (label, value) tuples for any active PLUGINS_CONFIG boolean overrides."""
+    from django.conf import settings as django_settings
+    plugin_cfg = getattr(django_settings, 'PLUGINS_CONFIG', {}).get('netbox_windows_dhcp', {})
+    result = []
+    for cfg_key, label in _SETTINGS_OVERRIDE_LABELS.items():
+        val = plugin_cfg.get(cfg_key)
+        if val is not None:
+            result.append((label, val))
+    return result
+
+
 class SettingsView(LoginRequiredMixin, View):
     """View/edit plugin-wide settings. Superuser only."""
 
@@ -585,6 +697,7 @@ class SettingsView(LoginRequiredMixin, View):
         return render(request, self.template_name, {
             'form': form,
             'next_sync_job': _get_next_sync_job(),
+            'active_global_overrides': _get_active_settings_overrides(),
         })
 
     def post(self, request):
@@ -603,6 +716,7 @@ class SettingsView(LoginRequiredMixin, View):
         return render(request, self.template_name, {
             'form': form,
             'next_sync_job': _get_next_sync_job(),
+            'active_global_overrides': _get_active_settings_overrides(),
         })
 
 

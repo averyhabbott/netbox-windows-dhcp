@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.0] - 2026-04-23
+
+### Added
+
+- **Configurable IP address statuses** — Plugin Settings now exposes `DHCP Lease Status` and `DHCP Reservation Status` dropdowns. Any NetBox IP Address status (including custom statuses defined via `FIELD_CHOICES`) can be used instead of the hardcoded `dhcp` and `reserved` literals. The sync, cleanup, push-reservations, and status-validation logic all follow the configured values.
+- **Import HTTPS Certificate** — Admins can import a self-signed or internally CA-signed TLS certificate from a PSU server directly from the Server detail page. The certificate is stored in the database and used automatically for SSL verification, eliminating the need to disable `verify_ssl` for servers that don't have a publicly trusted certificate. The confirmation page displays the SHA-256 fingerprint for manual verification. The stored certificate panel shows expiry date and warns when expiry is within 90 days.
+- **PLUGINS_CONFIG credential and behavior overrides** — `configuration.py` can now override per-server API keys via `server_overrides` and globally suppress `sync_ips_from_dhcp`, `push_reservations`, and `push_scope_info` via top-level keys. Overridden settings are applied in memory without touching the database, making it safe to share a production database replica in a development environment. The Server detail page and Plugin Settings page both show a notice when an override is active.
+
+### Fixed
+
+- "Expiring Soon" badge on the Stored Certificate panel was appearing for certificates more than a year away from expiry due to fragile `timeuntil` string parsing; expiry state is now computed in Python (expired / within 90 days / healthy).
+
+---
+
 ## [1.0.1] - 2026-04-22
 
 ### Security

@@ -425,6 +425,14 @@ class DHCPScopeBulkEditForm(NetBoxModelBulkEditForm):
 # Plugin Settings
 # ---------------------------------------------------------------------------
 
+# Maps PLUGINS_CONFIG key → model field name for boolean overrides
+_SETTINGS_OVERRIDE_FIELD_MAP = {
+    'sync_ips_from_dhcp': 'sync_ip_addresses',
+    'push_reservations': 'push_reservations',
+    'push_scope_info': 'push_scope_info',
+}
+
+
 class PluginSettingsForm(forms.ModelForm):
     sync_interval = forms.IntegerField(
         min_value=5,
@@ -442,26 +450,67 @@ class PluginSettingsForm(forms.ModelForm):
             'Leave blank to disable.'
         ),
     )
+    lease_status = forms.ChoiceField(
+        choices=[],
+        label='DHCP Lease Status',
+    )
+    reservation_status = forms.ChoiceField(
+        choices=[],
+        label='DHCP Reservation Status',
+    )
 
     class Meta:
         model = DHCPPluginSettings
         fields = (
+            'lease_status',
+            'reservation_status',
+            'sync_protect_tag',
+            'sync_protect_update_client_id',
             'sync_ip_addresses',
             'push_reservations',
             'push_scope_info',
             'create_missing_prefixes',
             'sync_interval',
             'sync_queue',
-            'sync_protect_tag',
-            'sync_protect_update_client_id',
         )
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+
+        # Populate status choices from NetBox (includes any custom statuses from FIELD_CHOICES)
+        try:
+            from ipam.choices import IPAddressStatusChoices
+            status_choices = [(v, label) for v, label, *_ in IPAddressStatusChoices.CHOICES]
+        except Exception:
+            status_choices = [('dhcp', 'DHCP'), ('reserved', 'Reserved')]
+        self.fields['lease_status'].choices = status_choices
+        self.fields['reservation_status'].choices = status_choices
+
         try:
             from django.contrib.contenttypes.models import ContentType
             from ipam.models import IPAddress
             ct = ContentType.objects.get_for_model(IPAddress)
             self.fields['sync_protect_tag'].widget.add_query_param('for_object_type_id', ct.pk)
+        except Exception:
+            pass
+
+        # Disable fields that are overridden by PLUGINS_CONFIG. Django's field.disabled
+        # causes the POST value to be ignored and the initial value to be used instead,
+        # preserving the DB value regardless of what the browser submits.
+        try:
+            from django.conf import settings as django_settings
+            plugin_cfg = getattr(django_settings, 'PLUGINS_CONFIG', {}).get('netbox_windows_dhcp', {})
+            # Need the raw DB values (without overrides) to keep as initial for disabled fields.
+            raw_db = None
+            if self.instance and self.instance.pk:
+                try:
+                    raw_db = type(self.instance).objects.get(pk=self.instance.pk)
+                except type(self.instance).DoesNotExist:
+                    pass
+            for cfg_key, field_name in _SETTINGS_OVERRIDE_FIELD_MAP.items():
+                if plugin_cfg.get(cfg_key) is not None:
+                    self.fields[field_name].disabled = True
+                    if raw_db is not None:
+                        self.initial[field_name] = getattr(raw_db, field_name)
         except Exception:
             pass

@@ -26,8 +26,30 @@
           </tr>
           <tr>
             <th scope="row">API Key</th>
-            <td>{% if object.api_key %}<span class="text-muted">(configured)</span>{% else %}<span class="text-muted">None</span>{% endif %}</td>
+            <td>
+              {% if has_credential_override %}
+                <span class="badge bg-info text-dark">
+                  <i class="mdi mdi-information-outline"></i> Overridden by PLUGINS_CONFIG
+                </span>
+              {% elif object.api_key %}
+                <span class="text-muted">(configured)</span>
+              {% else %}
+                <span class="text-muted">None</span>
+              {% endif %}
+            </td>
           </tr>
+          {% if has_credential_override %}
+          <tr>
+            <td colspan="2">
+              <div class="alert alert-info mb-0 py-2 small">
+                <i class="mdi mdi-information-outline"></i>
+                The API key for this server is overridden by
+                <code>PLUGINS_CONFIG['netbox_windows_dhcp']['server_overrides']['{{ object.hostname }}']</code>
+                in <code>configuration.py</code>. The value stored here is not used.
+              </div>
+            </td>
+          </tr>
+          {% endif %}
           <tr>
             <th scope="row">Verify SSL</th>
             <td>{% if object.verify_ssl %}<i class="mdi mdi-check-bold text-success"></i>{% else %}<i class="mdi mdi-close text-danger"></i>{% endif %}</td>
@@ -64,6 +86,61 @@
         <span class="text-muted ms-2">One-time import of scopes, failovers, and option values</span>
       </div>
     </div>
+
+    {% if object.use_https %}
+    <div class="card mt-3">
+      {% if object.ca_cert %}
+        {% if cert_expired %}
+          <h5 class="card-header text-white bg-danger">
+            <i class="mdi mdi-certificate-outline"></i> Stored Certificate
+            <span class="badge bg-light text-danger ms-2">Expired</span>
+          </h5>
+        {% elif cert_expiring_soon %}
+          <h5 class="card-header text-dark bg-warning">
+            <i class="mdi mdi-certificate-outline"></i> Stored Certificate
+            <span class="badge bg-light text-warning ms-2">Expiring Soon</span>
+          </h5>
+        {% else %}
+          <h5 class="card-header">
+            <i class="mdi mdi-certificate-outline"></i> Stored Certificate
+          </h5>
+        {% endif %}
+        <div class="card-body">
+          <table class="table table-hover attr-table mb-3">
+            {% if object.ca_cert_expiry %}
+            <tr>
+              <th scope="row">Expires</th>
+              <td>{{ object.ca_cert_expiry|date:"N j, Y" }}</td>
+            </tr>
+            {% endif %}
+          </table>
+          <form method="post" action="{% url 'plugins:netbox_windows_dhcp:dhcpserver_certimport' object.pk %}" class="d-inline">
+            {% csrf_token %}
+            <button type="submit" class="btn btn-sm btn-outline-secondary">
+              <i class="mdi mdi-refresh"></i> Replace Certificate
+            </button>
+          </form>
+          <form method="post" action="{% url 'plugins:netbox_windows_dhcp:dhcpserver_certremove' object.pk %}" class="d-inline ms-1">
+            {% csrf_token %}
+            <button type="submit" class="btn btn-sm btn-outline-danger">
+              <i class="mdi mdi-delete-outline"></i> Remove
+            </button>
+          </form>
+        </div>
+      {% else %}
+        <h5 class="card-header"><i class="mdi mdi-certificate-outline"></i> HTTPS Certificate</h5>
+        <div class="card-body">
+          <p class="text-muted small mb-2">
+            No certificate stored. If this server uses a self-signed certificate, import it here
+            to keep SSL verification enabled.
+          </p>
+          <a href="{% url 'plugins:netbox_windows_dhcp:dhcpserver_certimport' object.pk %}" class="btn btn-sm btn-outline-primary">
+            <i class="mdi mdi-certificate-outline"></i> Import HTTPS Certificate
+          </a>
+        </div>
+      {% endif %}
+    </div>
+    {% endif %}
   </div>
 </div>
 

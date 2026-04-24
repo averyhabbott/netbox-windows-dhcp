@@ -78,14 +78,24 @@ Restart gunicorn/uwsgi and the RQ workers.
 1. Go to **Windows DHCP → Infrastructure → Servers → Add**
 2. Enter the hostname/IP, port, and PSU App Token
 3. Toggle **Use HTTPS** as appropriate (default: on)
-4. Disable **Verify SSL Certificate** if the server uses a self-signed certificate
+4. If the server uses a self-signed certificate, leave **Verify SSL Certificate** enabled and use **Import HTTPS Certificate** instead of disabling verification (see below)
+
+> **Note:** The **App Token** and **Shared Secret** fields display blank when editing an existing record — this is intentional. Leaving the field blank preserves the stored value. Enter a new value only when you need to rotate the credential.
+
+### Import HTTPS Certificate
+
+If the PSU server uses a self-signed TLS certificate, click **Import HTTPS Certificate** on the server detail page. The plugin fetches the certificate directly from the server and displays its Subject, SANs, Issuer, expiry date, and SHA-256 fingerprint for verification. After confirming the fingerprint matches the server's actual certificate, click **Trust and Save** to store the PEM and use it for all future connections.
+
+Once a certificate is stored, it is used automatically whenever **Verify SSL Certificate** is enabled — no need to disable SSL verification. The server detail page shows the stored certificate's expiry and provides **Replace Certificate** and **Remove** buttons.
+
+> **Warning:** Always verify the SHA-256 fingerprint against the certificate on the server before trusting it. Trusting an unverified certificate can expose your DHCP API traffic to interception.
 
 ### Import from a Server
 
 Once a server is configured, click **Import from Server** on the server detail page to run a one-time background import of:
 
 - Failover relationships (matched to existing DHCP Server objects by hostname)
-- Scopes (NetBox Prefixes are created automatically if they don't exist)
+- Scopes (NetBox Prefixes are created automatically if they don't exist, when **Create Missing Prefixes on Import** is enabled — see Settings)
 - Scope-level option values (unknown option codes are created automatically)
   - Option 3 (Router) and Option 51 (Lease Time) are skipped — they are stored directly on the Scope object
 
@@ -97,13 +107,18 @@ Go to **Windows DHCP → Admin → Settings** to configure:
 
 | Setting | Description |
 | --- | --- |
+| DHCP Lease Status | IP Address status assigned to active DHCP leases by the sync. Defaults to `dhcp`. Changing this mid-deployment causes the next sync to update all managed lease IPs to the new status. |
+| DHCP Reservation Status | IP Address status assigned to DHCP reservations by the sync, and the status that triggers a push to the DHCP server when **Push Reservations** is enabled. Defaults to `reserved`. |
 | Sync IP Addresses from Leases & Reservations | When checked, pull leases and reservations and create/update/delete NetBox IP Address records. When unchecked, sync scope config only. |
-| Push Reservations to DHCP Server | Push NetBox `reserved` IPs to the DHCP server as reservations |
+| Push Reservations to DHCP Server | Push NetBox IPs with the configured reservation status to the DHCP server as reservations |
 | Push Scope Info to DHCP Server | Push scope config changes from NetBox to the DHCP server |
+| Create Missing Prefixes on Import | When checked (default), importing a scope whose CIDR does not exist in NetBox automatically creates the Prefix. Uncheck if Prefixes are managed by another source. |
 | Sync Interval (minutes) | How often the background sync runs (5–1440) |
 | Sync Job Queue | Worker queue priority (`High` / `Default` / `Low`) used for all sync and import background jobs. Default: `Default`. |
 | Sync-Protected Tag | A NetBox tag. Any IP Address carrying this tag is fully shielded from sync — its status, DNS name, and record itself are never modified or removed. Leave blank to disable. |
 | Update Client ID for Protected IPs | When enabled, the sync updates the `dhcp_client_id` custom field on protected IPs to match the DHCP server's active lease. All other sync writes remain blocked. Useful after a server replacement when the client MAC changes. |
+
+The **DHCP Lease Status** and **DHCP Reservation Status** settings allow the plugin to work with custom IP Address statuses defined in NetBox's `FIELD_CHOICES` configuration. The status validation, sync logic, cleanup rules, and push behavior all apply to whichever statuses are configured here.
 
 ## Editing Rules
 
@@ -147,6 +162,9 @@ This validation runs during form submission and API writes. It does **not** run 
 The `reserved` status is not validated against DHCP scope membership — it is a general-purpose NetBox status used for both DHCP reservations and non-DHCP purposes.
 
 There are no UI-level restrictions on editing IP addresses with `dhcp` or `reserved` status beyond the above. Changes made manually to DHCP-managed IPs will be overwritten on the next sync if **Sync IP Addresses from Leases & Reservations** is enabled.
+
+> [!IMPORTANT]
+> Throughout this documentation, `dhcp` and `reserved` are used as **placeholder names** for the statuses assigned to DHCP leases and reservations respectively. The actual statuses used by the plugin are configurable in **Windows DHCP → Admin → Settings** via the **DHCP Lease Status** and **DHCP Reservation Status** fields. The validation logic, sync behavior, and cleanup rules described here all apply to whichever statuses are configured, not specifically to the built-in `dhcp` and `reserved` values.
 
 ## Scope Source
 
@@ -308,6 +326,47 @@ The plugin expects PowerShell Universal **v5.x** (tested on 5.6.11+) on each DHC
 | DELETE | `/api/dhcp/exclusions` | Delete an exclusion range (body: scope_id, start_ip, end_ip) |
 
 Authentication: PSU v5 App Tokens are sent as `Authorization: Bearer <token>`. Generate a token in the PSU admin console under **Security → App Tokens** and paste it into the **App Token** field on the DHCP Server object in NetBox.
+
+## PLUGINS_CONFIG Overrides
+
+For environments where a production database is replicated to a dev or staging NetBox instance, `PLUGINS_CONFIG` in `configuration.py` can override credentials and sync behavior without touching the database.
+
+### Per-server API key
+
+```python
+PLUGINS_CONFIG = {
+    'netbox_windows_dhcp': {
+        'server_overrides': {
+            'dhcp01.example.com': {'api_key': 'dev-token-here'},
+            'dhcp02.example.com': {'api_key': 'dev-token-here'},
+        }
+    }
+}
+```
+
+The match key is the server's **Hostname** field (exact string match). When an override is active, the server detail page shows a notice and the value stored in the database is not used.
+
+The value is a dict to allow additional per-server overrides to be added in future versions without a breaking configuration change.
+
+### Global sync behavior
+
+Three boolean settings can be forced off (or on) regardless of what is saved in the Plugin Settings UI:
+
+```python
+PLUGINS_CONFIG = {
+    'netbox_windows_dhcp': {
+        'sync_ips_from_dhcp': False,   # disable IP sync in dev
+        'push_reservations': False,    # prevent pushing reservations to prod DHCP servers
+        'push_scope_info': False,      # prevent pushing scope changes to prod DHCP servers
+    }
+}
+```
+
+Use `None` (or simply omit the key) to leave the database value in effect. `True` or `False` forces the setting regardless of what is saved in the UI.
+
+When any of these overrides are active, the Plugin Settings page shows a banner listing the overridden fields and their current values. The affected checkboxes are disabled to prevent confusion.
+
+> **Note:** Overriding `push_scope_info` to `False` also blocks scope create, edit, and delete in the UI, since those operations are gated on this setting.
 
 ## REST API
 

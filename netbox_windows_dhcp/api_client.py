@@ -11,15 +11,30 @@ DHCP server must be implemented to match this contract.
 """
 
 import logging
+import ssl
+import tempfile
 from typing import Any, Dict, List, Optional
 
 import requests
+import requests.adapters
 from requests.exceptions import RequestException
 
 logger = logging.getLogger('netbox_windows_dhcp')
 
 # Default timeout (seconds) for PSU API calls
 REQUEST_TIMEOUT = 30
+
+
+class _SSLContextAdapter(requests.adapters.HTTPAdapter):
+    """HTTPAdapter that uses a caller-supplied SSLContext for certificate pinning."""
+
+    def __init__(self, ssl_context, **kwargs):
+        self._ssl_context = ssl_context
+        super().__init__(**kwargs)
+
+    def init_poolmanager(self, num_pools, maxsize, block=False, **connection_pool_kw):
+        connection_pool_kw['ssl_context'] = self._ssl_context
+        super().init_poolmanager(num_pools, maxsize, block, **connection_pool_kw)
 
 
 class PSUClientError(Exception):
@@ -39,14 +54,65 @@ class PSUClient:
         """
         self.server = server
         self.base_url = server.base_url
+        self._cert_tempfile = None  # keeps NamedTemporaryFile alive for the session lifetime
         self.session = requests.Session()
-        self.session.verify = server.verify_ssl
-        if server.api_key:
+        self._configure_ssl()
+        api_key = self._get_api_key()
+        if api_key:
             # PSU v5 uses JWT App Tokens passed as Bearer tokens.
             # Strip whitespace in case the token was copy-pasted with trailing newlines/spaces.
-            self.session.headers['Authorization'] = f'Bearer {server.api_key.strip()}'
+            self.session.headers['Authorization'] = f'Bearer {api_key.strip()}'
         self.session.headers['Accept'] = 'application/json'
         self.session.headers['Content-Type'] = 'application/json'
+
+    def _get_api_key(self) -> str:
+        """Return the effective API key, preferring any PLUGINS_CONFIG override."""
+        from django.conf import settings as django_settings
+        override = (
+            getattr(django_settings, 'PLUGINS_CONFIG', {})
+            .get('netbox_windows_dhcp', {})
+            .get('server_overrides', {})
+            .get(self.server.hostname, {})
+            .get('api_key')
+        )
+        return override or self.server.api_key
+
+    def _configure_ssl(self):
+        """Configure SSL verification on self.session."""
+        if not self.server.verify_ssl:
+            self.session.verify = False
+            return
+
+        ca_cert = getattr(self.server, 'ca_cert', '')
+        if not ca_cert:
+            self.session.verify = True
+            return
+
+        ca_cert_expiry = getattr(self.server, 'ca_cert_expiry', None)
+        if ca_cert_expiry:
+            from django.utils import timezone
+            if ca_cert_expiry < timezone.now():
+                raise PSUClientError(
+                    f'The stored CA certificate for "{self.server.name}" expired on '
+                    f'{ca_cert_expiry.date()}. '
+                    f'Re-import it from the Server detail page in NetBox.'
+                )
+
+        # Write PEM to a temp file that lives as long as this PSUClient instance.
+        self._cert_tempfile = tempfile.NamedTemporaryFile(suffix='.pem', mode='w', delete=True)
+        self._cert_tempfile.write(ca_cert)
+        self._cert_tempfile.flush()
+
+        # VERIFY_X509_PARTIAL_CHAIN (Python 3.10+) lets a non-CA leaf cert act as a
+        # trust anchor.  This enables pinning for both self-signed and CA-signed certs
+        # without requiring the full issuer chain to be stored.
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        ctx.check_hostname = True
+        ctx.verify_flags |= ssl.VERIFY_X509_PARTIAL_CHAIN
+        ctx.load_verify_locations(self._cert_tempfile.name)
+
+        self.session.mount('https://', _SSLContextAdapter(ctx))
 
     # ------------------------------------------------------------------
     # Internal helpers

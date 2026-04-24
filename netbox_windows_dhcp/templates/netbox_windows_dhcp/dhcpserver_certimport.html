@@ -1,0 +1,75 @@
+{% extends 'base/layout.html' %}
+
+{% block title %}Import HTTPS Certificate — {{ object.name }}{% endblock %}
+
+{% block content %}
+<div class="row">
+  <div class="col col-md-8 col-lg-6">
+
+    <div class="card">
+      <h5 class="card-header">
+        <i class="mdi mdi-certificate-outline"></i>
+        Import HTTPS Certificate — {{ object.name }}
+      </h5>
+      <div class="card-body">
+
+        <div class="alert alert-warning mb-3">
+          <i class="mdi mdi-alert-outline"></i>
+          <strong>Verify the fingerprint below</strong> against the certificate on your server
+          before clicking Trust and Save. Trusting an unverified certificate allows a
+          man-in-the-middle attacker to intercept your DHCP API traffic.
+        </div>
+
+        <table class="table table-hover attr-table mb-4">
+          <tr>
+            <th scope="row" style="width:160px">Server</th>
+            <td><code>{{ object.hostname }}:{{ object.port }}</code></td>
+          </tr>
+          <tr>
+            <th scope="row">Subject CN</th>
+            <td><code>{{ cert_info.subject_cn }}</code></td>
+          </tr>
+          {% if cert_info.sans %}
+          <tr>
+            <th scope="row">SANs</th>
+            <td>
+              {% for san in cert_info.sans %}<code>{{ san }}</code>{% if not forloop.last %}, {% endif %}{% endfor %}
+            </td>
+          </tr>
+          {% endif %}
+          <tr>
+            <th scope="row">Issuer CN</th>
+            <td><code>{{ cert_info.issuer_cn }}</code></td>
+          </tr>
+          <tr>
+            <th scope="row">Expires</th>
+            <td>{{ cert_info.not_after|date:"N j, Y" }}</td>
+          </tr>
+          <tr>
+            <th scope="row">SHA-256 Fingerprint</th>
+            <td><code class="small">{{ cert_info.fingerprint }}</code></td>
+          </tr>
+        </table>
+
+        {% if object.ca_cert %}
+        <div class="alert alert-info mb-3">
+          <i class="mdi mdi-information-outline"></i>
+          This will replace the certificate currently stored for {{ object.name }}
+          {% if object.ca_cert_expiry %}(expires {{ object.ca_cert_expiry|date:"N j, Y" }}){% endif %}.
+        </div>
+        {% endif %}
+
+        <form method="post">
+          {% csrf_token %}
+          <button type="submit" class="btn btn-primary">
+            <i class="mdi mdi-check-bold"></i> Trust and Save
+          </button>
+          <a href="{{ object.get_absolute_url }}" class="btn btn-outline-secondary ms-2">Cancel</a>
+        </form>
+
+      </div>
+    </div>
+
+  </div>
+</div>
+{% endblock %}

@@ -28,6 +28,8 @@ urlpatterns = [
     path('servers/<int:pk>/changelog/', ObjectChangeLogView.as_view(), {'model': DHCPServer}, name='dhcpserver_changelog'),
     path('servers/<int:pk>/sync/', views.DHCPServerSyncView.as_view(), name='dhcpserver_sync'),
     path('servers/<int:pk>/import/', views.DHCPServerImportView.as_view(), name='dhcpserver_import'),
+    path('servers/<int:pk>/cert/import/', views.DHCPServerCertImportView.as_view(), name='dhcpserver_certimport'),
+    path('servers/<int:pk>/cert/remove/', views.DHCPServerCertRemoveView.as_view(), name='dhcpserver_certremove'),
 
     # Global sync (all servers)
     path('sync/', views.DHCPGlobalSyncView.as_view(), name='global_sync'),

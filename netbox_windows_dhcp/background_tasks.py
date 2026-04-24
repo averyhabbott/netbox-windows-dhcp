@@ -83,18 +83,18 @@ def _upsert_lease_info(ip_obj, lease_hostname: str, active: bool, lease_expirati
 def _upsert_ip_address(job_logger, ip_str: str, prefix_len: int, status: str,
                        dns_name: str, client_id: str,
                        lease_hostname: str = '', lease_expiration=None,
-                       protect_tag: str = '', update_client_id: bool = False):
+                       protect_tag: str = '', update_client_id: bool = False,
+                       lease_status: str = 'dhcp', reservation_status: str = 'reserved'):
     """
     Create or update a NetBox IPAddress for ip_str, then upsert its DHCPLeaseInfo.
 
-    Special case — existing IP has status 'reserved' but this call is from a lease
-    (status='dhcp'):
+    Special case — existing IP has the reservation status but this call is from a lease:
       • Do NOT change status or dns_name (the reservation takes precedence).
       • If the IP has no dhcp_client_id, store the discovered client MAC.
       • Always upsert DHCPLeaseInfo so the lease hostname/expiry are visible.
 
     Sync-protection: if the IP carries the configured protect_tag, all writes are
-    skipped. The only exception is when update_client_id=True and status='dhcp':
+    skipped. The only exception is when update_client_id=True and status==lease_status:
     in that case dhcp_client_id is updated to match the server's lease (to track
     server replacements), but nothing else is touched.
     """
@@ -106,7 +106,7 @@ def _upsert_ip_address(job_logger, ip_str: str, prefix_len: int, status: str,
 
             # Sync-protection check — must come before any other writes.
             if protect_tag and protect_tag in obj.tags.slugs():
-                if update_client_id and status == 'dhcp' and client_id:
+                if update_client_id and status == lease_status and client_id:
                     stored_client_id = obj.custom_field_data.get('dhcp_client_id')
                     if client_id != stored_client_id:
                         obj.snapshot()
@@ -125,7 +125,7 @@ def _upsert_ip_address(job_logger, ip_str: str, prefix_len: int, status: str,
                                    lease_expiration=lease_expiration)
                 return
 
-            if obj.status == 'reserved' and status == 'dhcp':
+            if obj.status == reservation_status and status == lease_status:
                 # Reservation takes precedence — preserve status and dns_name.
                 stored_client_id = obj.custom_field_data.get('dhcp_client_id')
                 if client_id and not stored_client_id:
@@ -184,7 +184,8 @@ def _upsert_ip_address(job_logger, ip_str: str, prefix_len: int, status: str,
 
 
 def _update_ip_addresses_from_reservations(job_logger, scope, reservations: list,
-                                            protect_tag: str = '', update_client_id: bool = False):
+                                            protect_tag: str = '', update_client_id: bool = False,
+                                            lease_status: str = 'dhcp', reservation_status: str = 'reserved'):
     prefix_len = scope.prefix.prefix.prefixlen
     for res in reservations:
         ip_str = res.get('ip_address') or res.get('IPAddress')
@@ -196,18 +197,21 @@ def _update_ip_addresses_from_reservations(job_logger, scope, reservations: list
             job_logger,
             ip_str=ip_str,
             prefix_len=prefix_len,
-            status='reserved',
+            status=reservation_status,
             dns_name=name,
             client_id=client_id,
             lease_hostname=name,    # DHCP server's name for this reservation
             lease_expiration=None,  # Reservations do not expire
             protect_tag=protect_tag,
             update_client_id=update_client_id,
+            lease_status=lease_status,
+            reservation_status=reservation_status,
         )
 
 
 def _update_ip_addresses_from_leases(job_logger, scope, leases: list,
-                                      protect_tag: str = '', update_client_id: bool = False):
+                                      protect_tag: str = '', update_client_id: bool = False,
+                                      lease_status: str = 'dhcp', reservation_status: str = 'reserved'):
     from django.utils import timezone
     from django.utils.dateparse import parse_datetime
 
@@ -234,30 +238,33 @@ def _update_ip_addresses_from_leases(job_logger, scope, leases: list,
             job_logger,
             ip_str=ip_str,
             prefix_len=prefix_len,
-            status='dhcp',
+            status=lease_status,
             dns_name=hostname,
             client_id=client_id,
             lease_hostname=hostname,
             lease_expiration=lease_expiration,
             protect_tag=protect_tag,
             update_client_id=update_client_id,
+            lease_status=lease_status,
+            reservation_status=reservation_status,
         )
 
 
 def _cleanup_stale_ips(job_logger, scope, lease_ips: set, reservation_ips: set,
-                       push_reservations: bool, protect_tag: str = ''):
+                       push_reservations: bool, protect_tag: str = '',
+                       lease_status: str = 'dhcp', reservation_status: str = 'reserved'):
     """
     Remove or downgrade IPs within a scope that no longer exist on the DHCP server.
 
-    Status 'dhcp' (active lease):
+    Lease status IPs:
       - No matching lease → delete.
 
-    Status 'reserved':
+    Reservation status IPs:
       - push_reservations=True → never touch (NetBox is source of truth).
       - No dhcp_client_id → manually created / pre-staged → never auto-delete.
       - Has dhcp_client_id but no DHCPLeaseInfo → manually created → leave alone.
       - Has dhcp_client_id AND DHCPLeaseInfo (DHCP-managed):
-          no reservation but lease exists → downgrade to 'dhcp'
+          no reservation but lease exists → downgrade to lease_status
           neither reservation nor lease → delete
 
     Sync-protected IPs (carrying protect_tag) are always skipped.
@@ -276,7 +283,7 @@ def _cleanup_stale_ips(job_logger, scope, lease_ips: set, reservation_ips: set,
 
     managed = IPAddress.objects.filter(
         address__net_contained_or_equal=prefix_cidr,
-        status__in=('dhcp', 'reserved'),
+        status__in=(lease_status, reservation_status),
     ).prefetch_related('tags')
 
     for ip_obj in managed:
@@ -287,7 +294,7 @@ def _cleanup_stale_ips(job_logger, scope, lease_ips: set, reservation_ips: set,
             job_logger.debug(f'Protected IP {ip_str}: skipped cleanup by sync-protect tag')
             continue
 
-        if ip_obj.status == 'reserved':
+        if ip_obj.status == reservation_status:
             if push_reservations:
                 # NetBox is source of truth; never remove reservations based on server state
                 continue
@@ -302,22 +309,22 @@ def _cleanup_stale_ips(job_logger, scope, lease_ips: set, reservation_ips: set,
             if ip_str not in reservation_ips:
                 if ip_str in lease_ips:
                     ip_obj.snapshot()
-                    ip_obj.status = 'dhcp'
+                    ip_obj.status = lease_status
                     ip_obj.save()
                     job_logger.info(
-                        f'Downgraded IP {ip_str} reserved→dhcp '
+                        f'Downgraded IP {ip_str} {reservation_status}→{lease_status} '
                         f'(reservation removed, lease still active)'
                     )
                 else:
                     job_logger.info(f'Deleting IP {ip_str} — reservation and lease no longer exist on server')
                     ip_obj.delete()
 
-        elif ip_obj.status == 'dhcp' and ip_str not in lease_ips:
+        elif ip_obj.status == lease_status and ip_str not in lease_ips:
             job_logger.info(f'Deleting IP {ip_str} — lease expired or no longer exists on server')
             ip_obj.delete()
 
 
-def _push_reservations(job_logger, client, scope, scope_id: str):
+def _push_reservations(job_logger, client, scope, scope_id: str, reservation_status: str = 'reserved'):
     from ipam.models import IPAddress
 
     existing_reservations = {
@@ -328,7 +335,7 @@ def _push_reservations(job_logger, client, scope, scope_id: str):
     prefix_cidr = str(scope.prefix.prefix)
     seen_client_ids = set()
     for ip_obj in IPAddress.objects.filter(
-        status='reserved',
+        status=reservation_status,
         address__net_contained_or_equal=prefix_cidr,
     ):
         try:
@@ -528,7 +535,8 @@ def _push_scope(job_logger, client, scope, remote=None, scope_id: Optional[str] 
 
 
 def _sync_server(job_logger, server, sync_ip_addresses: bool, push_reservations: bool,
-                 push_scope_info: bool, protect_tag: str = '', update_client_id: bool = False):
+                 push_scope_info: bool, protect_tag: str = '', update_client_id: bool = False,
+                 lease_status: str = 'dhcp', reservation_status: str = 'reserved'):
     from .api_client import PSUClient, PSUClientError
     from .models import DHCPFailover, DHCPScope
 
@@ -632,10 +640,12 @@ def _sync_server(job_logger, server, sync_ip_addresses: bool, push_reservations:
                 _update_ip_addresses_from_reservations(
                     job_logger, scope, reservations,
                     protect_tag=protect_tag, update_client_id=update_client_id,
+                    lease_status=lease_status, reservation_status=reservation_status,
                 )
                 _update_ip_addresses_from_leases(
                     job_logger, scope, leases,
                     protect_tag=protect_tag, update_client_id=update_client_id,
+                    lease_status=lease_status, reservation_status=reservation_status,
                 )
 
                 lease_ips = {
@@ -651,13 +661,15 @@ def _sync_server(job_logger, server, sync_ip_addresses: bool, push_reservations:
                 _cleanup_stale_ips(
                     job_logger, scope, lease_ips, reservation_ips, push_reservations,
                     protect_tag=protect_tag,
+                    lease_status=lease_status, reservation_status=reservation_status,
                 )
         else:
             job_logger.info(f'Scope {scope_id}: skipping IP updates (sync_ip_addresses=False)')
 
         if push_reservations:
             try:
-                _push_reservations(job_logger, client, scope, scope_id)
+                _push_reservations(job_logger, client, scope, scope_id,
+                                   reservation_status=reservation_status)
             except PSUClientError as exc:
                 job_logger.error(f'Failed to push reservations for scope {scope_id}: {exc}')
 
@@ -737,11 +749,14 @@ class DHCPSyncJob(JobRunner):
             push_scope_info = cfg.push_scope_info
             protect_tag = cfg.sync_protect_tag.slug if cfg.sync_protect_tag_id else ''
             update_client_id = cfg.sync_protect_update_client_id
+            lease_status = cfg.lease_status
+            reservation_status = cfg.reservation_status
 
             self.logger.info(
                 f'Starting DHCP sync: sync_ip_addresses={sync_ip_addresses} '
                 f'push_reservations={push_reservations} push_scope_info={push_scope_info} '
-                f'protect_tag={protect_tag!r} update_client_id={update_client_id}'
+                f'protect_tag={protect_tag!r} update_client_id={update_client_id} '
+                f'lease_status={lease_status!r} reservation_status={reservation_status!r}'
             )
 
             with _change_logging(self.job.user):
@@ -750,6 +765,7 @@ class DHCPSyncJob(JobRunner):
                         _sync_server(
                             self.logger, server, sync_ip_addresses, push_reservations, push_scope_info,
                             protect_tag=protect_tag, update_client_id=update_client_id,
+                            lease_status=lease_status, reservation_status=reservation_status,
                         )
                     except Exception as exc:
                         self.logger.error(f'Error syncing server {server.name}: {exc}')
@@ -799,6 +815,8 @@ class DHCPServerSyncJob(JobRunner):
                 cfg.sync_ip_addresses, cfg.push_reservations, cfg.push_scope_info,
                 protect_tag=cfg.sync_protect_tag.slug if cfg.sync_protect_tag_id else '',
                 update_client_id=cfg.sync_protect_update_client_id,
+                lease_status=cfg.lease_status,
+                reservation_status=cfg.reservation_status,
             )
 
 

@@ -22,11 +22,29 @@ class DHCPPluginSettings(models.Model):
             'and client MAC.'
         ),
     )
+    lease_status = models.CharField(
+        max_length=50,
+        default='dhcp',
+        verbose_name='DHCP Lease Status',
+        help_text=(
+            'IP Address status assigned to active DHCP leases by the sync. '
+            'Changing this mid-deployment will cause the next sync to update all managed IPs to the new status.'
+        ),
+    )
+    reservation_status = models.CharField(
+        max_length=50,
+        default='reserved',
+        verbose_name='DHCP Reservation Status',
+        help_text=(
+            'IP Address status assigned to DHCP reservations by the sync, and the status that '
+            'triggers a push to the DHCP server when Push Reservations is enabled.'
+        ),
+    )
     push_reservations = models.BooleanField(
         default=False,
         verbose_name='Push Reservations to DHCP Server',
         help_text=(
-            'When enabled, NetBox IP Addresses with status "reserved" are '
+            'When enabled, NetBox IP Addresses with the configured reservation status are '
             'pushed to the DHCP server as reservations.'
         ),
     )
@@ -99,8 +117,25 @@ class DHCPPluginSettings(models.Model):
 
     @classmethod
     def load(cls):
-        """Return the singleton settings instance, creating it with defaults if absent."""
+        """Return the singleton settings instance, creating it with defaults if absent.
+
+        PLUGINS_CONFIG boolean overrides are applied in memory after loading so all
+        callers automatically receive the effective values without any call-site changes.
+        """
         obj, _ = cls.objects.get_or_create(pk=1)
+        try:
+            from django.conf import settings as django_settings
+            plugin_cfg = getattr(django_settings, 'PLUGINS_CONFIG', {}).get('netbox_windows_dhcp', {})
+            for cfg_key, field_name in {
+                'sync_ips_from_dhcp': 'sync_ip_addresses',
+                'push_reservations': 'push_reservations',
+                'push_scope_info': 'push_scope_info',
+            }.items():
+                val = plugin_cfg.get(cfg_key)
+                if val is not None:
+                    setattr(obj, field_name, bool(val))
+        except Exception:
+            pass
         return obj
 
 
@@ -120,7 +155,24 @@ class DHCPServer(NetBoxModel):
     verify_ssl = models.BooleanField(
         default=True,
         verbose_name='Verify SSL Certificate',
-        help_text='Uncheck to disable TLS certificate verification (for self-signed certs in test environments).',
+        help_text=(
+            'Uncheck to disable TLS certificate verification. '
+            'For self-signed certs, use "Import HTTPS Certificate" instead of disabling verification.'
+        ),
+    )
+    ca_cert = models.TextField(
+        blank=True,
+        default='',
+        verbose_name='Stored CA Certificate',
+        help_text=(
+            'PEM-encoded CA certificate imported via "Import HTTPS Certificate". '
+            'Used for TLS verification when Verify SSL is enabled.'
+        ),
+    )
+    ca_cert_expiry = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name='CA Certificate Expiry',
     )
     sync_standalone_scopes = models.BooleanField(
         default=True,

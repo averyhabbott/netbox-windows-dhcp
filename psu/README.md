@@ -21,22 +21,17 @@ Alternatively, in the PowerShell Universal admin UI:
 
 PSU will register all endpoints defined in the script on the next restart or reload.
 
-### Step 2 — Configure Authentication (recommended)
+### Step 2 — Configure the App Token
 
-PSU v5 uses JWT App Tokens for authentication.
+Authentication is enabled by default (`$RequireAuthentication = $true`). Generate an App Token in PSU and add it to NetBox:
 
 1. In the PSU admin console, go to **Security → App Tokens** and generate a new token
 2. Copy the token value
 3. In NetBox, edit the **DHCP Server** object and paste the token into the **App Token** field
-4. At the top of `dhcp_api_endpoints.ps1`, set `$RequireAuthentication = $true`
 
-Without authentication enabled, the endpoints are accessible to anyone who can reach the PSU server.
+The plugin sends the token as `Authorization: Bearer <token>`.
 
-The plugin sends the token as:
-
-```http
-Authorization: Bearer <token>
-```
+> **Disabling authentication:** Set `$RequireAuthentication = $false` at the top of `dhcp_api_endpoints.ps1`. Not recommended — any host that can reach the PSU port can read all DHCP data and make changes without credentials.
 
 ### Step 3 — Verify
 
@@ -68,6 +63,7 @@ Shared helpers defined in `$H`:
 - `ConvertTo-OptionValueObject` — maps a DHCP option value CIM object
 - `Find-ReservationByClientId` — searches all scopes for a reservation by client MAC address
 - `Write-ApiError` — returns a JSON error response with a given HTTP status code
+- `Assert-ValidIPv4` — validates that a string is a valid IPv4 address; returns a 400 error response and `$false` if not
 
 All list endpoints use `ConvertTo-Json -InputObject $result` (not `$result | ConvertTo-Json`) to prevent PowerShell's pipeline from unwrapping single-element arrays into bare objects.
 

@@ -45,11 +45,12 @@ def validate_dhcp_ip_status(sender, instance, **kwargs):
     from ipam.models import IPAddress
     if not isinstance(instance, IPAddress):
         return
-    if instance.status != 'dhcp':
+    from .models import DHCPPluginSettings, DHCPScope
+    lease_status = DHCPPluginSettings.load().lease_status
+    if instance.status != lease_status:
         return
 
     from netaddr import IPAddress as NetAddrIP, IPNetwork
-    from .models import DHCPScope
 
     try:
         ip = NetAddrIP(str(instance.address.ip))
@@ -67,7 +68,7 @@ def validate_dhcp_ip_status(sender, instance, **kwargs):
 
     if matching_scope is None:
         raise ValidationError(
-            f'IP addresses with status "dhcp" must fall within a configured DHCP '
+            f'IP addresses with status "{lease_status}" must fall within a configured DHCP '
             f'scope prefix. No matching scope found for {instance.address.ip}.'
         )
 
@@ -77,7 +78,7 @@ def validate_dhcp_ip_status(sender, instance, **kwargs):
                 raise ValidationError(
                     f'{instance.address.ip} falls within exclusion range '
                     f'{ex.start_ip}–{ex.end_ip} of scope "{matching_scope.name}". '
-                    f'Excluded IPs cannot have status "dhcp".'
+                    f'Excluded IPs cannot have status "{lease_status}".'
                 )
         except ValidationError:
             raise
