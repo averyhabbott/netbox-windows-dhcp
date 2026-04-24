@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.0] - 2026-04-23
+
+### Added
+
+- **PSU role-based access control** — `dhcp_api_endpoints.ps1` now enforces two PSU roles: `DHCPReader` (GET endpoints only) and `DHCPWriter` (all endpoints). Operators can issue a read-only token to NetBox instances that only sync, and write endpoints are protected at the API layer regardless of plugin settings. Existing tokens with no role assigned will receive 401 after deploying the updated script; assign the `DHCPWriter` role to restore access.
+- **`setup_roles.ps1`** — Idempotent PowerShell setup script that creates the `DHCPReader` and `DHCPWriter` PSU roles and one App Token per role via the PSU REST management API. Tokens expire in 365 days by default (configurable via `-LifespanDays`). Safe to re-run.
+- **Expanded PSU README** — Covers Windows Firewall inbound rule setup, HTTPS certificate options (self-signed import vs. CA-issued via `appsettings.json`), and splits the deployment guide into fresh-install and extending-existing-install sections with correct file paths and commands.
+
+---
+
 ## [1.1.0] - 2026-04-23
 
 ### Added
