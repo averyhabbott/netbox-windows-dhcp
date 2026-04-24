@@ -8,47 +8,164 @@ PowerShell Universal endpoint definitions for the `netbox-windows-dhcp` plugin.
 - **PowerShell Universal v5.x** (tested on 5.6.11+) running on the DHCP server
 - The `DhcpServer` PowerShell module (ships with the DHCP Server role)
 
-## Deployment
+### Network and HTTPS
 
-### Step 1 — Add the script to PSU
-
-The recommended approach is to place `dhcp_api_endpoints.ps1` in your PSU Git repository so it is version-controlled and automatically picked up on sync.
-
-Alternatively, in the PowerShell Universal admin UI:
-
-1. Go to **APIs → Scripts**
-2. Create a new script and paste in the contents of `dhcp_api_endpoints.ps1`
-
-PSU will register all endpoints defined in the script on the next restart or reload.
-
-### Step 2 — Configure the App Token
-
-Authentication is enabled by default (`$RequireAuthentication = $true`). Generate an App Token in PSU and add it to NetBox:
-
-1. In the PSU admin console, go to **Security → App Tokens** and generate a new token
-2. Copy the token value
-3. In NetBox, edit the **DHCP Server** object and paste the token into the **App Token** field
-
-The plugin sends the token as `Authorization: Bearer <token>`.
-
-> **Disabling authentication:** Set `$RequireAuthentication = $false` at the top of `dhcp_api_endpoints.ps1`. Not recommended — any host that can reach the PSU port can read all DHCP data and make changes without credentials.
-
-### Step 3 — Verify
-
-Test from a machine that can reach the PSU server:
+**Windows Firewall** — During installation, PSU prompts for a port number and Kestrel binds to all network interfaces (`*:port`) by default. However, Windows Firewall will block external connections until you create an inbound rule for that port. Run the following from an elevated PowerShell session on the DHCP server (replace `<port>` with your configured port):
 
 ```powershell
-$headers = @{ Authorization = 'Bearer your-app-token-here' }
-$base    = 'https://dhcp01.example.com:443/api/dhcp'
+New-NetFirewallRule -DisplayName "PSU HTTPS <port>" -Direction Inbound -Protocol TCP -LocalPort <port> -Action Allow
+```
 
-# List all scopes
+**HTTPS Certificate** — PSU generates a self-signed TLS certificate during installation. Two options:
+
+*Option A — Keep the self-signed cert (simplest):* Use the plugin's **Import HTTPS Certificate** button on the DHCP Server detail page in NetBox. This stores the certificate in the database and uses it for SSL pinning without disabling SSL verification.
+
+*Option B — Install a CA-issued cert (recommended for production):* Import the PFX into the Windows certificate store (`certlm.msc`), then update `C:\ProgramData\PowerShellUniversal\appsettings.json` to reference it by subject:
+
+```json
+"Kestrel": {
+  "Endpoints": {
+    "Https": {
+      "Url": "https://*:<port>",
+      "Certificate": {
+        "Subject": "dhcp01.example.com",
+        "Store": "My",
+        "Location": "LocalMachine",
+        "AllowInvalid": false
+      }
+    }
+  }
+}
+```
+
+Restart the PSU service after any `appsettings.json` change:
+
+```powershell
+Restart-Service -Name "PowerShellUniversal"
+```
+
+## Deployment
+
+### Fresh install
+
+Use this path if PSU is newly installed and you have not yet added endpoint scripts or App Tokens for this plugin.
+
+#### 1. Open the firewall and configure HTTPS
+
+Complete the [Network and HTTPS](#network-and-https) steps in the Prerequisites section above before continuing.
+
+#### 2. Add the endpoint script
+
+Copy `dhcp_api_endpoints.ps1` to the Windows server and place it at the path below. Run this from an elevated PowerShell session on the server (adjust the source path as needed):
+
+```powershell
+Copy-Item .\dhcp_api_endpoints.ps1 'C:\ProgramData\UniversalAutomation\Repository\.universal\endpoints.ps1'
+```
+
+Then restart the PSU service to load the endpoints:
+
+```powershell
+Restart-Service -Name "PowerShellUniversal"
+```
+
+#### 3. Create roles and App Tokens
+
+Copy `setup_roles.ps1` to the Windows server or any machine running PowerShell 5.1+ with HTTPS access to the PSU server.
+
+Before running the script, create a bootstrap Administrator App Token in the PSU admin UI:
+
+1. Go to **Security → Tokens → + Create Application Token**
+2. Check **System Identity** and enter a name (e.g. `bootstrap`)
+3. Set **Role** to `Administrator`
+4. A short expiration is fine — this token is only needed to run the setup script once
+
+Then run the script, replacing the hostname, port, and token:
+
+```powershell
+.\setup_roles.ps1 -BaseUrl https://dhcp01.example.com:8443 -AdminToken eyJ...
+```
+
+The script creates the `DHCPReader` and `DHCPWriter` roles and one App Token per role, then prints the token values. **Copy them immediately** — they cannot be retrieved again after the session ends.
+
+By default tokens expire in 365 days. Override with `-LifespanDays`:
+
+```powershell
+.\setup_roles.ps1 -BaseUrl https://dhcp01.example.com:8443 -AdminToken eyJ... -LifespanDays 730
+```
+
+Prefer clicking? See [Manual setup](#manual-setup) below.
+
+#### 4. Add the token to NetBox
+
+In NetBox, edit the **DHCP Server** object and paste the appropriate token into the **App Token** field:
+
+| Plugin configuration | Token to use |
+| --- | --- |
+| Sync only (Push Reservations and Push Scope Info both off) | `NetBox-DHCP-Read` (`DHCPReader` role) |
+| Either push operation enabled | `NetBox-DHCP-Write` (`DHCPWriter` role) |
+
+When in doubt, use `NetBox-DHCP-Write` — it covers all operations.
+
+#### 5. Verify
+
+Test from a machine with HTTPS access to the PSU server (replace hostname and port to match your install):
+
+```powershell
+$headers = @{ Authorization = 'Bearer your-token-here' }
+$base    = 'https://dhcp01.example.com:8443/api/dhcp'
+
 Invoke-RestMethod -Uri "$base/scopes" -Headers $headers | ConvertTo-Json -Depth 4
-
-# List leases for a specific scope
 Invoke-RestMethod -Uri "$base/leases?scope_id=10.0.1.0" -Headers $headers | ConvertTo-Json -Depth 4
 ```
 
-Or trigger **Sync Now** from the plugin's Server detail page in NetBox and view the job log.
+Or trigger **Sync Now** from the DHCP Server detail page in NetBox and check the job log.
+
+---
+
+### Extending an existing install
+
+Use this path if PSU is already running with a previous version of `dhcp_api_endpoints.ps1` — the one that used a single `$_epAuth` authentication splat with no role enforcement.
+
+> [!IMPORTANT]
+> **Existing tokens have no role assigned.** After deploying the updated script every request from a roleless token returns **401 Unauthorized**. Assign the `DHCPWriter` role to existing tokens (step 2 below) before or immediately after replacing the script.
+
+#### 1. Replace the endpoint script
+
+Replace `C:\ProgramData\UniversalAutomation\Repository\.universal\endpoints.ps1` with the updated version of `dhcp_api_endpoints.ps1`, then restart the PSU service:
+
+```powershell
+Restart-Service -Name "PowerShellUniversal"
+```
+
+#### 2. Assign the DHCPWriter role to existing tokens
+
+In the PSU admin UI, go to **Security → Tokens**, edit each existing DHCP token, and set its Role to `DHCPWriter`. This restores full access without interrupting NetBox operations.
+
+#### 3. Create scoped roles and tokens (optional)
+
+Run `setup_roles.ps1` as described in [step 3 of the fresh install](#3-create-roles-and-app-tokens) to add the `DHCPReader` and `DHCPWriter` roles and generate new scoped tokens. The script is idempotent — if the roles already exist it skips them.
+
+#### 4. Update the token in NetBox (optional)
+
+If you want to restrict a sync-only NetBox instance to the read-only `DHCPReader` token, swap the App Token on that DHCP Server object now.
+
+#### 5. Confirm the upgrade
+
+Same as [step 5 of the fresh install](#5-verify).
+
+---
+
+### Manual setup
+
+If you prefer not to run `setup_roles.ps1`, create the roles and tokens through the PSU admin UI:
+
+1. Go to **Security → Roles** and create two roles:
+   - Name: `DHCPReader` — Description: `Read-only access to DHCP API GET endpoints.`
+   - Name: `DHCPWriter` — Description: `Full read/write access to all DHCP API endpoints.`
+2. Go to **Security → Tokens → + Create Application Token** for each role. Check **System Identity**, enter a name, set the **Role** field, and copy each token value — shown only once.
+3. In NetBox, paste the token into the **App Token** field on the DHCP Server object.
+
+**Disabling authentication:** Set `$RequireAuthentication = $false` at the top of `dhcp_api_endpoints.ps1`. Not recommended — any host that can reach the PSU port can read all DHCP data and make changes without credentials.
 
 ## Script Architecture
 
