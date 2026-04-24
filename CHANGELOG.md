@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.1] - 2026-04-23
+
+### Fixed
+
+- `setup_roles.ps1` idempotency checks corrected for actual PSU API behavior: role existence is now determined by attempting `POST /api/v1/role` and treating a server error as "already exists" (PSU returns 200 with empty body for both existing and non-existing roles on the `GET` endpoint, and returns 500 on duplicate create). Revoked (soft-deleted) tokens are now filtered out of the `GET /api/v1/apptoken` response before the existence check.
+
+---
+
 ## [1.2.0] - 2026-04-23
 
 ### Added
