@@ -57,11 +57,10 @@ foreach ($r in @(
     @{ name = 'DHCPWriter'; description = 'Full read/write access to all DHCP API endpoints.' }
 )) {
     try {
-        Invoke-PSU GET "/api/v1/role/$($r.name)" | Out-Null
-        Write-Host "  [skip] Role '$($r.name)' already exists." -ForegroundColor Yellow
-    } catch {
         Invoke-PSU POST '/api/v1/role' $r | Out-Null
         Write-Host "  [ok]   Created role '$($r.name)'." -ForegroundColor Green
+    } catch {
+        Write-Host "  [skip] Role '$($r.name)' already exists." -ForegroundColor Yellow
     }
 }
 
@@ -69,7 +68,7 @@ foreach ($r in @(
 Write-Host "`n=== Creating App Tokens ===" -ForegroundColor Cyan
 
 $expiration = (Get-Date).ToUniversalTime().AddDays($LifespanDays).ToString('o')
-$existing   = @((Invoke-PSU GET '/api/v1/apptoken') | ForEach-Object { $_.identity.name })
+$existing   = @((Invoke-PSU GET '/api/v1/apptoken') | Where-Object { -not $_.revoked } | ForEach-Object { $_.identity.name })
 $results    = @{}
 
 foreach ($t in @(
