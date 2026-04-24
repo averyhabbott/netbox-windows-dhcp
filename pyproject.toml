@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,7 +7,8 @@ name = "netbox-windows-dhcp"
 version = "1.1.0"
 description = "NetBox plugin for full integration with Windows DHCP Server via PowerShell Universal"
 readme = "README.md"
-license = { file = "LICENSE" }
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [
     { name = "Avery Abbott", email = "averyhabbott@yahoo.com" },
 ]
@@ -29,7 +30,6 @@ classifiers = [
     "Environment :: Plugins",
     "Framework :: Django",
     "Intended Audience :: System Administrators",
-    "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
