@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.urls import reverse
@@ -108,6 +109,11 @@ class DHCPPluginSettings(models.Model):
             'source and should never be created by the DHCP plugin.'
         ),
     )
+    api_enabled = models.BooleanField(
+        default=True,
+        verbose_name='API Enabled',
+        help_text='When disabled, all plugin REST API endpoints return 503 Service Unavailable.',
+    )
 
     class Meta:
         verbose_name = 'Plugin Settings'
@@ -180,6 +186,40 @@ class DHCPServer(NetBoxModel):
         help_text=(
             'When enabled, scopes with no failover relationship are included in sync operations for this server.'
         ),
+    )
+
+    # Maintenance mode
+    maintenance_mode = models.BooleanField(default=False, verbose_name='Maintenance Mode')
+    maintenance_enabled_at = models.DateTimeField(null=True, blank=True)
+    maintenance_enabled_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='+',
+    )
+    maintenance_notes = models.TextField(blank=True, default='')
+
+    # Health tracking
+    HEALTH_UNKNOWN = 'unknown'
+    HEALTH_HEALTHY = 'healthy'
+    HEALTH_UNREACHABLE = 'unreachable'
+    HEALTH_CHOICES = [
+        (HEALTH_UNKNOWN, 'Unknown'),
+        (HEALTH_HEALTHY, 'Healthy'),
+        (HEALTH_UNREACHABLE, 'Unreachable'),
+    ]
+    health_status = models.CharField(
+        max_length=20,
+        choices=HEALTH_CHOICES,
+        default=HEALTH_UNKNOWN,
+        verbose_name='Health Status',
+    )
+    last_health_check = models.DateTimeField(null=True, blank=True)
+    health_error = models.TextField(blank=True, default='')
+    last_sync_at = models.DateTimeField(null=True, blank=True, verbose_name='Last Sync')
+    last_sync_error = models.TextField(blank=True, default='')
+    psu_script_version = models.CharField(
+        max_length=50, blank=True, default='', verbose_name='Remote Scripts Version'
     )
 
     class Meta:
@@ -256,6 +296,17 @@ class DHCPFailover(NetBoxModel):
         verbose_name='Shared Secret',
         help_text='Required when authentication is enabled',
     )
+
+    # Maintenance mode
+    maintenance_mode = models.BooleanField(default=False, verbose_name='Maintenance Mode')
+    maintenance_enabled_at = models.DateTimeField(null=True, blank=True)
+    maintenance_enabled_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='+',
+    )
+    maintenance_notes = models.TextField(blank=True, default='')
 
     class Meta:
         ordering = ['name']
@@ -480,6 +531,18 @@ class DHCPScope(NetBoxModel):
         related_name='scopes',
         verbose_name='Option Values',
     )
+
+    # Maintenance mode
+    maintenance_mode = models.BooleanField(default=False, verbose_name='Maintenance Mode')
+    maintenance_enabled_at = models.DateTimeField(null=True, blank=True)
+    maintenance_enabled_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='+',
+    )
+    maintenance_notes = models.TextField(blank=True, default='')
+    last_sync_at = models.DateTimeField(null=True, blank=True, verbose_name='Last Sync')
 
     class Meta:
         ordering = ['name']

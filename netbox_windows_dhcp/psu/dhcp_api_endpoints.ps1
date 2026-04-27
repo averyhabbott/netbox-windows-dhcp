@@ -57,6 +57,8 @@ $_epWrite = if ($RequireAuthentication) {
 # ===========================================================================
 
 $H = @'
+Import-Module DhcpServer -SkipEditionCheck -ErrorAction Stop
+
 $PSU_SCRIPT_VERSION = '1.0.0'
 
 function ConvertTo-ScopeObject {

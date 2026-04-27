@@ -17,7 +17,11 @@ A NetBox v4.5.0+ plugin for full integration with Windows DHCP Server via [Power
 - All sync and import operations run as background jobs — no HTTP timeouts on large servers
 - All background job changes appear in the NetBox changelog (attributed to the user who queued the job)
 - Scheduled background sync (hourly by default, configurable) + manual **Sync Now** per server or for all servers
-- Full REST API for all plugin objects
+- **Maintenance mode** on servers, failover relationships, and scopes — pauses sync without changing configuration
+- **Server health checks** — live connectivity status, PSU reachability, and script version visible in the UI
+- **Automatic secondary fallback** — when a failover primary is unreachable or in maintenance mode, failover-scope syncing routes through the secondary automatically
+- **Update PSU Scripts** — push the latest endpoint scriptBlocks to PSU directly from NetBox without manually touching the server
+- Full REST API for all plugin objects (with optional enable/disable toggle)
 - Plugin-wide settings managed via the NetBox UI (no `PLUGINS_CONFIG` entry required)
 
 ## Requirements
@@ -73,22 +77,35 @@ Restart gunicorn/uwsgi and the RQ workers.
 
 ## Getting Started
 
+### Set up PSU on each DHCP server
+
+Before adding a server to NetBox, PSU must be installed and configured on the Windows DHCP server. See [psu/README.md](psu/README.md) for the complete deployment guide, including:
+
+- Firewall and HTTPS configuration
+- Creating the `DHCPReader` and `DHCPWriter` PSU roles with `setup_roles.ps1`
+- Deploying the API endpoints from NetBox with the **Update PSU Scripts** button
+
 ### Add a DHCP Server
 
 1. Go to **Windows DHCP → Infrastructure → Servers → Add**
-2. Enter the hostname/IP, port, and PSU App Token
+2. Enter the hostname/IP, port, and PSU App Token (from `setup_roles.ps1` output)
 3. Toggle **Use HTTPS** as appropriate (default: on)
-4. If the server uses a self-signed certificate, leave **Verify SSL Certificate** enabled and use **Import HTTPS Certificate** instead of disabling verification (see below)
+4. If the server uses a self-signed certificate, leave **Verify SSL Certificate** enabled and click **Fetch Certificate** on the edit page to import it inline — no need to navigate away
+5. Click **Save**, then **Update PSU Scripts** on the server detail page to push the endpoint definitions to PSU
 
-> **Note:** The **App Token** and **Shared Secret** fields display blank when editing an existing record — this is intentional. Leaving the field blank preserves the stored value. Enter a new value only when you need to rotate the credential.
+> **Note:** The **App Token** field displays blank when editing an existing record — this is intentional. Leaving the field blank preserves the stored value. Enter a new value only when you need to rotate the credential.
 
-### Import HTTPS Certificate
+### CA Certificate
 
-If the PSU server uses a self-signed TLS certificate, click **Import HTTPS Certificate** on the server detail page. The plugin fetches the certificate directly from the server and displays its Subject, SANs, Issuer, expiry date, and SHA-256 fingerprint for verification. After confirming the fingerprint matches the server's actual certificate, click **Trust and Save** to store the PEM and use it for all future connections.
+If the PSU server uses a self-signed TLS certificate, import it inline on the server edit page:
 
-Once a certificate is stored, it is used automatically whenever **Verify SSL Certificate** is enabled — no need to disable SSL verification. The server detail page shows the stored certificate's expiry and provides **Replace Certificate** and **Remove** buttons.
+1. Click **Fetch Certificate** in the **CA Certificate** section of the edit form.
+2. The plugin retrieves the certificate and displays its Subject, SANs, Issuer, expiry date, and SHA-256 fingerprint.
+3. Verify the fingerprint against the actual server certificate, then click **Trust This Certificate**. The cert is staged in the form and saved to the database when you click **Save**.
 
-> **Warning:** Always verify the SHA-256 fingerprint against the certificate on the server before trusting it. Trusting an unverified certificate can expose your DHCP API traffic to interception.
+Once stored, the certificate is used automatically whenever **Verify SSL Certificate** is enabled. The server detail page shows the CN and expiry inline in the **DHCP Server** attributes table, with **Replace** and **Remove** buttons. A warning badge appears when the cert is within 90 days of expiry or has expired.
+
+> **Warning:** Always verify the SHA-256 fingerprint before trusting a certificate. Trusting an unverified certificate can expose your DHCP API traffic to interception.
 
 ### Import from a Server
 
@@ -115,8 +132,9 @@ Go to **Windows DHCP → Admin → Settings** to configure:
 | Create Missing Prefixes on Import | When checked (default), importing a scope whose CIDR does not exist in NetBox automatically creates the Prefix. Uncheck if Prefixes are managed by another source. |
 | Sync Interval (minutes) | How often the background sync runs (5–1440) |
 | Sync Job Queue | Worker queue priority (`High` / `Default` / `Low`) used for all sync and import background jobs. Default: `Default`. |
-| Sync-Protected Tag | A NetBox tag. Any IP Address carrying this tag is fully shielded from sync — its status, DNS name, and record itself are never modified or removed. Leave blank to disable. |
+| Sync-Protected Tag | A NetBox tag. Any IP Address carrying this tag, or whose IP falls within a Prefix carrying this tag, is fully shielded from sync — its status, DNS name, and record itself are never modified or removed. Leave blank to disable. |
 | Update Client ID for Protected IPs | When enabled, the sync updates the `dhcp_client_id` custom field on protected IPs to match the DHCP server's active lease. All other sync writes remain blocked. Useful after a server replacement when the client MAC changes. |
+| API Enabled | When unchecked, all plugin REST API endpoints return `503 Service Unavailable`. Use this to disable external API access without removing credentials or changing permissions. |
 
 The **DHCP Lease Status** and **DHCP Reservation Status** settings allow the plugin to work with custom IP Address statuses defined in NetBox's `FIELD_CHOICES` configuration. The status validation, sync logic, cleanup rules, and push behavior all apply to whichever statuses are configured here.
 
@@ -186,6 +204,29 @@ Not every scope is synced on every server. Before processing a scope, the sync c
 | Standalone (has Server) | Server's **Sync Standalone Scopes** is enabled, and the scope's assigned server matches the server being synced |
 | Failover-linked | The failover relationship's **Sync Enabled** is on, and the server being synced is the **primary** of that failover |
 | Neither assigned | Never synced |
+
+**Server pre-flight:** If a server has **Sync Standalone Scopes** disabled and is not the primary server for any active failover relationship, the sync skips it entirely — no network connection is made.
+
+### Server health checks
+
+At the start of every sync job run, the plugin checks the health of each server before performing any sync work:
+
+1. `GET /api/dhcp/health` is called for each server (if not in maintenance mode).
+2. A successful response marks the server **Healthy** and records the PSU script version in the database.
+3. If the request fails, the server is marked **Unreachable** and the error is recorded.
+4. Health status, last check time, and PSU script version are visible in the server list and detail view.
+
+Health check results from the single-server **Sync Now** action cover only the target server. If that server is unreachable, the job fails immediately with no fallback attempted.
+
+### Secondary failback
+
+When a failover primary is unreachable (health check failed) or in maintenance mode, and the secondary server is healthy and not in maintenance mode, the plugin automatically routes failover-scope sync through the secondary for that job run:
+
+- Failover-linked scopes are synced against the secondary instead of the primary.
+- The secondary's own standalone scopes are not affected — they sync independently based on the secondary's own **Sync Standalone Scopes** setting.
+- This is entirely automatic — no configuration change is needed.
+
+> **Note:** Secondary fallback applies only to failover-linked scopes. If a primary server is down, its standalone scopes are inaccessible via the secondary in Windows DHCP and are skipped.
 
 **Server pre-flight:** If a server has **Sync Standalone Scopes** disabled and is not the primary server for any active failover relationship, the sync skips it entirely — no network connection is made.
 
@@ -260,21 +301,46 @@ The sync will never delete or overwrite the status or `dns_name` of a `reserved`
 2. Device is provisioned; it receives a DHCP lease. The sync populates `dhcp_client_id` from the lease.
 3. Once `dhcp_client_id` is set, the reservation is pushed to the DHCP server on the next sync (if **Push Reservations** is enabled). The `dns_name` is used as the reservation name on the server.
 
-### Sync-Protected IPs
+### Sync Now
+
+The **Sync Now** button on a server detail page enqueues a background sync job and redirects to the job status page. The full sync log is visible there. A **Sync All Servers** action is also available from the server list page.
+
+**Sync Now is blocked when maintenance mode is enabled** on a server — disable maintenance mode first. Sync continues normally for other servers.
+
+## Maintenance Mode
+
+Maintenance mode is available on all three object types: **Servers**, **Failover Relationships**, and **Scopes**. When enabled, the object is skipped entirely during sync:
+
+- **Server in maintenance** — The entire server (all scopes) is skipped. Sync Now is also blocked on that server.
+- **Failover relationship in maintenance** — All scopes linked to that failover are skipped, regardless of server health.
+- **Scope in maintenance** — That individual scope is skipped; other scopes on the same server continue normally.
+
+Maintenance mode stores when it was enabled and by which user. A **Notes** field is available for free-form context (e.g. a ticket number or reason). All three fields are cleared automatically when maintenance mode is disabled.
+
+### Toggling maintenance mode
+
+- **Single-item:** Click the amber pause icon on the list row, or open the object detail page and use the action button. A confirmation form shows the current state with an option to enable or disable and add optional notes.
+- **Bulk:** Select objects on the list page and click **Bulk Maintenance Mode**. Choose enable or disable and optionally set notes (applied to all selected objects).
+
+### Current Maintenance view
+
+**Windows DHCP → Admin → Current Maintenance** shows a combined table of every object currently in maintenance mode across all three types — sorted by enabled time, filterable by type. Use this as a dashboard to see what is paused before triggering a sync.
+
+## Sync-Protected IPs
 
 Any IP Address tagged with the configured **Sync-Protected Tag** is fully shielded from sync writes. The sync will never change its status, DNS name, or `dhcp_client_id`, and will never delete the record during cleanup.
 
+**Prefix-level protection:** The tag can also be applied to a **NetBox Prefix** (any prefix, not just the scope's prefix). Every IP address that falls within a tagged prefix is protected, even if the IP itself does not carry the tag. This provides deep inheritance — a tag on a `/16` protects all IPs within it, including those in nested `/24` sub-prefixes that don't themselves carry the tag.
+
+Combined rule: an IP is protected if it carries the tag **or** falls within any prefix that carries the tag.
+
 DHCP lease metadata (`DHCPLeaseInfo`) is always updated for protected IPs regardless of protection status — the lease hostname, active state, and expiration are still recorded and visible on the IP Address detail page.
 
-#### Update Client ID for Protected IPs
+### Update Client ID for Protected IPs
 
 Enable this checkbox to allow one narrow exception: the sync may update the `dhcp_client_id` custom field on a protected IP when the server's active lease carries a different client MAC. All other writes (status, DNS name, record deletion) remain blocked. This is useful after a DHCP server replacement where the client MAC for the same device changes.
 
 **Typical use:** Tag an IP as protected when it has been manually configured and should not be overwritten by automated sync, even if the DHCP server has a conflicting record.
-
-### Sync Now
-
-The **Sync Now** button on a server detail page enqueues a background sync job and redirects to the job status page. The full sync log is visible there. A **Sync All Servers** action is also available from the server list page.
 
 ## Lease Lifetime Display
 
@@ -296,13 +362,13 @@ The plugin adds a **Windows DHCP** menu to the NetBox left sidebar:
 - **Infrastructure** → Servers, Failover
 - **Scopes** → Scopes
 - **Options** → Option Values, Option Code Definitions
-- **Admin** → Settings
+- **Admin** → Current Maintenance, Settings
 
 ## PSU Setup
 
-See [psu/README.md](psu/README.md) for full deployment instructions.
+See [psu/README.md](psu/README.md) for the full PSU deployment guide (fresh install, upgrades, manual setup).
 
-The plugin expects PowerShell Universal **v5.x** (tested on 5.6.11+) on each DHCP server, exposing endpoints under `/api/dhcp/`. The PSU script is at `psu/dhcp_api_endpoints.ps1`.
+The plugin expects PowerShell Universal **v5.x** (tested on 5.6.11+) on each DHCP server, exposing endpoints under `/api/dhcp/`. The endpoint script is bundled with the plugin and deployed to PSU via the **Update PSU Scripts** button — no manual file copying required.
 
 ### Endpoint reference
 
@@ -324,8 +390,30 @@ The plugin expects PowerShell Universal **v5.x** (tested on 5.6.11+) on each DHC
 | GET | `/api/dhcp/exclusions?scope_id=` | List exclusion ranges for a scope |
 | POST | `/api/dhcp/exclusions` | Create an exclusion range |
 | DELETE | `/api/dhcp/exclusions` | Delete an exclusion range (body: scope_id, start_ip, end_ip) |
+| GET | `/api/dhcp/health` | Health check (read) — returns `{"status":"ok","version":"x.y.z"}` |
+| POST | `/api/dhcp/health` | Health check (write) — tests write access; returns `{"status":"ok"}` |
 
 Authentication: PSU v5 App Tokens are sent as `Authorization: Bearer <token>`. Generate a token in the PSU admin console under **Security → App Tokens** and paste it into the **App Token** field on the DHCP Server object in NetBox.
+
+### PSU script version tracking
+
+The PSU script embeds a version constant (`$PSUScriptVersion`). The plugin defines a matching `PSU_SCRIPT_VERSION` Python constant and checks it during the health check phase of every sync:
+
+- When the versions **match**, a green check mark and version number appear in the server list.
+- When they **mismatch**, an amber warning icon and the observed version appear. The sync continues normally — the mismatch is advisory only, logged in the job output.
+- When the version is **unknown** (no health check has run yet), a gray question mark appears.
+
+The health check also confirms read/write access on every sync run; results update the server's **Health Status** (`Healthy` / `Unreachable` / `Unknown`) and **Last Health Check** time visible in the server list and detail view.
+
+### Updating PSU scripts from NetBox
+
+When a new plugin version includes updated endpoint scriptBlocks, push them directly from NetBox without touching the server:
+
+1. Open the DHCP Server detail page and click **Update PSU Scripts**.
+2. The job fetches the current endpoint records from PSU, updates each one's `scriptBlock` in place, creates any new endpoints, removes any deleted endpoints, then restarts PSU's endpoint definitions.
+3. A follow-up health check verifies the new version is live and updates `psu_script_version` in the database.
+
+The App Token used for sync must have `apis/*` permission on the PSU `DHCPWriter` role (configured automatically by `setup_roles.ps1`). **Bulk update** is available from the server list page.
 
 ## PLUGINS_CONFIG Overrides
 

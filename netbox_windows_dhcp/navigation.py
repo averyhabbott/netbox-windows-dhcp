@@ -82,6 +82,11 @@ menu = PluginMenu(
             'Admin',
             (
                 PluginMenuItem(
+                    link='plugins:netbox_windows_dhcp:current_maintenance',
+                    link_text='Current Maintenance',
+                    permissions=['netbox_windows_dhcp.view_dhcpserver'],
+                ),
+                PluginMenuItem(
                     link='plugins:netbox_windows_dhcp:settings',
                     link_text='Settings',
                     permissions=['netbox_windows_dhcp.view_dhcpserver'],

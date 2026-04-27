@@ -12,6 +12,20 @@ from .models import (
     DHCPServer,
 )
 
+# Callable queryset factories for filters that reference models from other apps.
+# Using callables avoids the need to set querysets in __init__.
+def _site_qs(request=None):
+    from dcim.models import Site
+    return Site.objects.all()
+
+def _location_qs(request=None):
+    from dcim.models import Location
+    return Location.objects.all()
+
+def _vrf_qs(request=None):
+    from ipam.models import VRF
+    return VRF.objects.all()
+
 
 @register_filterset
 class DHCPServerFilterSet(NetBoxModelFilterSet):
@@ -146,10 +160,38 @@ class DHCPScopeFilterSet(NetBoxModelFilterSet):
         field_name='failover',
         label='Failover',
     )
+    site = django_filters.ModelMultipleChoiceFilter(
+        field_name='prefix__site',
+        queryset=_site_qs,
+        label='Site',
+    )
+    location = django_filters.ModelMultipleChoiceFilter(
+        field_name='prefix__location',
+        queryset=_location_qs,
+        label='Location',
+    )
+    vrf = django_filters.ModelMultipleChoiceFilter(
+        field_name='prefix__vrf',
+        queryset=_vrf_qs,
+        label='VRF',
+    )
+    within_prefix = django_filters.CharFilter(
+        method='filter_within_prefix',
+        label='Within Prefix',
+    )
+
+    def filter_within_prefix(self, queryset, name, value):
+        value = value.strip()
+        if not value:
+            return queryset
+        try:
+            return queryset.filter(prefix__prefix__net_contained_or_equal=value)
+        except Exception:
+            return queryset.none()
 
     class Meta:
         model = DHCPScope
-        fields = ('name', 'prefix', 'server', 'failover', 'router')
+        fields = ('name', 'prefix', 'server', 'failover', 'router', 'site', 'location', 'vrf', 'within_prefix')
 
     def search(self, queryset, name, value):
         if not value.strip():

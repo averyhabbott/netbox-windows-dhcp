@@ -1,0 +1,77 @@
+{% extends 'base/layout.html' %}
+
+{% block title %}Current Maintenance{% endblock %}
+
+{% block content %}
+<div class="row mb-3">
+  <div class="col">
+    <h2><i class="mdi mdi-pause-circle-outline text-azure"></i> Current Maintenance</h2>
+    <p class="text-muted">Objects currently in maintenance mode. Sync operations are skipped for these items.</p>
+  </div>
+</div>
+
+<div class="row mb-3">
+  <div class="col">
+    <div class="btn-group" role="group" aria-label="Filter by type">
+      <a href="?type=all"
+         class="btn btn-sm {% if filter_type == 'all' %}btn-secondary{% else %}btn-outline-secondary{% endif %}">
+        All
+      </a>
+      <a href="?type=server"
+         class="btn btn-sm {% if filter_type == 'server' %}btn-primary{% else %}btn-outline-secondary{% endif %}">
+        Servers
+      </a>
+      <a href="?type=failover"
+         class="btn btn-sm {% if filter_type == 'failover' %}btn-info{% else %}btn-outline-secondary{% endif %}">
+        Failovers
+      </a>
+      <a href="?type=scope"
+         class="btn btn-sm {% if filter_type == 'scope' %}btn-secondary{% else %}btn-outline-secondary{% endif %}">
+        Scopes
+      </a>
+    </div>
+  </div>
+</div>
+
+{% if items %}
+<div class="card">
+  <div class="card-body p-0">
+    <table class="table table-hover mb-0">
+      <thead>
+        <tr>
+          <th>Type</th>
+          <th>Name</th>
+          <th>Notes</th>
+          <th>Enabled By</th>
+          <th>Enabled At</th>
+          <th>Health</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for item in items %}
+        <tr>
+          <td><span class="badge {{ item.type_class }}">{{ item.type }}</span></td>
+          <td><a href="{{ item.url }}">{{ item.object }}</a></td>
+          <td>{% if item.notes %}<em class="small">{{ item.notes }}</em>{% else %}<span class="text-muted">—</span>{% endif %}</td>
+          <td>{% if item.enabled_by %}{{ item.enabled_by }}{% else %}<span class="text-muted">—</span>{% endif %}</td>
+          <td>{% if item.enabled_at %}{{ item.enabled_at|date:"N j, Y H:i" }}{% else %}<span class="text-muted">—</span>{% endif %}</td>
+          <td>
+            {% if item.health_status %}
+            <span class="badge {{ item.health_class }}">{{ item.health_status|title }}</span>
+            {% else %}
+            <span class="text-muted">—</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% else %}
+<div class="alert alert-success">
+  <i class="mdi mdi-check-circle-outline"></i>
+  No objects are currently in maintenance mode{% if filter_type != 'all' %} ({{ filter_type }}s){% endif %}.
+</div>
+{% endif %}
+{% endblock %}

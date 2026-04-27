@@ -66,9 +66,15 @@ class DHCPServerForm(NetBoxModelForm):
         FieldSet('tags', name='Tags'),
     )
 
+    ca_cert = forms.CharField(widget=forms.HiddenInput(), required=False)
+    ca_cert_expiry = forms.CharField(widget=forms.HiddenInput(), required=False)
+
     class Meta:
         model = DHCPServer
-        fields = ('name', 'hostname', 'port', 'use_https', 'api_key', 'verify_ssl', 'sync_standalone_scopes', 'tags')
+        fields = (
+            'name', 'hostname', 'port', 'use_https', 'api_key', 'verify_ssl',
+            'sync_standalone_scopes', 'tags', 'ca_cert', 'ca_cert_expiry',
+        )
         labels = {
             'api_key': 'App Token',
         }
@@ -76,11 +82,40 @@ class DHCPServerForm(NetBoxModelForm):
             'api_key': forms.PasswordInput(render_value=False),
         }
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.instance.pk:
+            self.initial['ca_cert'] = self.instance.ca_cert or ''
+            expiry = self.instance.ca_cert_expiry
+            self.initial['ca_cert_expiry'] = expiry.isoformat() if expiry else ''
+
     def clean_api_key(self):
         value = self.cleaned_data.get('api_key', '').strip()
         if not value and self.instance.pk:
             return self.instance.api_key
         return value
+
+    def clean_ca_cert(self):
+        value = self.cleaned_data.get('ca_cert', '').strip()
+        if not value and self.instance.pk:
+            return self.instance.ca_cert
+        return value
+
+    def clean_ca_cert_expiry(self):
+        value = self.cleaned_data.get('ca_cert_expiry', '').strip()
+        if not value:
+            if self.instance.pk and self.cleaned_data.get('ca_cert') == self.instance.ca_cert:
+                return self.instance.ca_cert_expiry
+            return None
+        from django.utils.dateparse import parse_datetime
+        dt = parse_datetime(value)
+        if dt is None:
+            from datetime import datetime
+            try:
+                dt = datetime.fromisoformat(value)
+            except ValueError:
+                return None
+        return dt
 
 
 class DHCPServerFilterForm(NetBoxModelFilterSetForm):
@@ -339,6 +374,13 @@ class DHCPScopeForm(NetBoxModelForm):
         return cleaned
 
 
+def _get_scope_filter_fields():
+    """Return Site, Location, VRF querysets — deferred to avoid circular import at module load."""
+    from dcim.models import Location, Site
+    from ipam.models import VRF
+    return Site.objects.all(), Location.objects.all(), VRF.objects.all()
+
+
 class DHCPScopeFilterForm(NetBoxModelFilterSetForm):
     model = DHCPScope
     server = DynamicModelChoiceField(
@@ -349,7 +391,26 @@ class DHCPScopeFilterForm(NetBoxModelFilterSetForm):
         queryset=DHCPFailover.objects.all(),
         required=False,
     )
+    within_prefix = forms.CharField(
+        required=False,
+        label='Within Prefix',
+        widget=forms.TextInput(attrs={'placeholder': '10.0.0.0/8'}),
+    )
     tag = TagFilterField(model)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        from dcim.models import Location, Site
+        from ipam.models import VRF
+        self.fields['site'] = DynamicModelMultipleChoiceField(
+            queryset=Site.objects.all(), required=False, label='Site',
+        )
+        self.fields['location'] = DynamicModelMultipleChoiceField(
+            queryset=Location.objects.all(), required=False, label='Location',
+        )
+        self.fields['vrf'] = DynamicModelMultipleChoiceField(
+            queryset=VRF.objects.all(), required=False, label='VRF',
+        )
 
 
 class DHCPScopeBulkEditForm(NetBoxModelBulkEditForm):
@@ -472,6 +533,7 @@ class PluginSettingsForm(forms.ModelForm):
             'create_missing_prefixes',
             'sync_interval',
             'sync_queue',
+            'api_enabled',
         )
 
     def __init__(self, *args, **kwargs):

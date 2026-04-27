@@ -11,6 +11,19 @@ from .models import (
     DHCPServer,
 )
 
+_MAINTENANCE_COLUMN = tables.TemplateColumn(
+    template_code=(
+        '{% if record.maintenance_mode %}'
+        '<span class="text-azure" title="In Maintenance">'
+        '<i class="mdi mdi-pause-circle"></i>'
+        '</span>'
+        '{% endif %}'
+    ),
+    verbose_name='Maint.',
+    orderable=True,
+    attrs={'td': {'style': 'width:30px; text-align:center'}},
+)
+
 
 class DHCPServerTable(NetBoxTable):
     name = tables.Column(linkify=True)
@@ -24,23 +37,67 @@ class DHCPServerTable(NetBoxTable):
         verbose_name='API Key',
         orderable=False,
     )
+    health_status = tables.TemplateColumn(
+        template_code=(
+            '{% if record.health_status == "healthy" %}'
+            '<span class="badge text-bg-success">Healthy</span>'
+            '{% elif record.health_status == "unreachable" %}'
+            '<span class="badge text-bg-danger">Unreachable</span>'
+            '{% else %}'
+            '<span class="badge text-bg-secondary">Unknown</span>'
+            '{% endif %}'
+        ),
+        verbose_name='Health',
+        orderable=True,
+    )
+    psu_script_version = tables.Column(verbose_name='Remote Scripts Version', orderable=False)
+    maintenance_mode = _MAINTENANCE_COLUMN
     actions = ActionsColumn(
-        extra_buttons="""
-            <a href="{% url 'plugins:netbox_windows_dhcp:dhcpserver_sync' record.pk %}"
-               class="btn btn-sm btn-primary"
-               title="Sync Now">
-                <i class="mdi mdi-sync"></i>
-            </a>
-        """,
+        extra_buttons=(
+            '<a href="{% url \'plugins:netbox_windows_dhcp:dhcpserver_maintenance\' record.pk %}"'
+            '   class="btn btn-sm btn-azure" title="Maintenance Mode">'
+            '<i class="mdi mdi-pause-circle-outline"></i>'
+            '</a>'
+            '<a href="{% url \'plugins:netbox_windows_dhcp:dhcpserver_sync\' record.pk %}"'
+            '   class="btn btn-sm btn-primary" title="Sync Now">'
+            '<i class="mdi mdi-sync"></i>'
+            '</a>'
+        ),
     )
 
     class Meta(NetBoxTable.Meta):
         model = DHCPServer
-        fields = ('pk', 'name', 'hostname', 'port', 'use_https', 'verify_ssl', 'sync_standalone_scopes', 'has_api_key', 'actions')
-        default_columns = ('name', 'hostname', 'use_https', 'verify_ssl', 'sync_standalone_scopes', 'actions')
+        fields = (
+            'pk', 'name', 'hostname', 'port', 'use_https', 'verify_ssl',
+            'sync_standalone_scopes', 'has_api_key',
+            'health_status', 'psu_script_version', 'maintenance_mode', 'actions',
+        )
+        default_columns = (
+            'name', 'hostname', 'use_https', 'verify_ssl', 'sync_standalone_scopes',
+            'health_status', 'maintenance_mode', 'actions',
+        )
 
     def render_has_api_key(self, value):
         return 'Yes' if value else 'No'
+
+    def render_psu_script_version(self, value):
+        from .constants import PSU_SCRIPT_VERSION
+        if not value:
+            return format_html(
+                '<span class="text-secondary" title="No version recorded">'
+                '<i class="mdi mdi-help-circle-outline"></i></span>'
+            )
+        if value == PSU_SCRIPT_VERSION:
+            return format_html(
+                '<span class="text-success"><i class="mdi mdi-check-circle-outline"></i> {}</span>',
+                value,
+            )
+        return format_html(
+            '<span class="text-warning" title="Expected {}">'
+            '<i class="mdi mdi-alert-outline"></i> {}</span>',
+            PSU_SCRIPT_VERSION,
+            value,
+        )
 
 
 class DHCPFailoverTable(NetBoxTable):
@@ -50,26 +107,33 @@ class DHCPFailoverTable(NetBoxTable):
     mode = tables.Column()
     enable_auth = BooleanColumn(verbose_name='Auth')
     sync_enabled = BooleanColumn(verbose_name='Sync')
+    maintenance_mode = _MAINTENANCE_COLUMN
     actions = ActionsColumn(
         actions=('delete', 'changelog'),
-        extra_buttons="""
-            <button type="submit"
-                    formaction="{% url 'plugins:netbox_windows_dhcp:dhcpfailover_toggle_sync' record.pk %}"
-                    class="btn btn-sm {% if record.sync_enabled %}btn-success{% else %}btn-secondary{% endif %}"
-                    title="Toggle Sync">
-              <i class="mdi mdi-sync{% if not record.sync_enabled %}-off{% endif %}"></i>
-            </button>
-        """,
+        extra_buttons=(
+            '<a href="{% url \'plugins:netbox_windows_dhcp:dhcpfailover_maintenance\' record.pk %}"'
+            '   class="btn btn-sm btn-azure" title="Maintenance Mode">'
+            '<i class="mdi mdi-pause-circle-outline"></i>'
+            '</a>'
+            '<button type="submit"'
+            '        formaction="{% url \'plugins:netbox_windows_dhcp:dhcpfailover_toggle_sync\' record.pk %}"'
+            '        class="btn btn-sm {% if record.sync_enabled %}btn-success{% else %}btn-secondary{% endif %}"'
+            '        title="Toggle Sync">'
+            '  <i class="mdi mdi-sync{% if not record.sync_enabled %}-off{% endif %}"></i>'
+            '</button>'
+        ),
     )
 
     class Meta(NetBoxTable.Meta):
         model = DHCPFailover
         fields = (
             'pk', 'name', 'primary_server', 'secondary_server',
-            'mode', 'max_client_lead_time', 'max_response_delay', 'enable_auth', 'sync_enabled', 'actions',
+            'mode', 'max_client_lead_time', 'max_response_delay',
+            'enable_auth', 'sync_enabled', 'maintenance_mode', 'actions',
         )
         default_columns = (
-            'name', 'primary_server', 'secondary_server', 'mode', 'sync_enabled', 'actions',
+            'name', 'primary_server', 'secondary_server', 'mode',
+            'sync_enabled', 'maintenance_mode', 'actions',
         )
 
 
@@ -129,6 +193,15 @@ class DHCPScopeTable(NetBoxTable):
         orderable=False,
     )
     lease_lifetime = tables.Column(verbose_name='Lease Life')
+    maintenance_mode = _MAINTENANCE_COLUMN
+    actions = ActionsColumn(
+        extra_buttons=(
+            '<a href="{% url \'plugins:netbox_windows_dhcp:dhcpscope_maintenance\' record.pk %}"'
+            '   class="btn btn-sm btn-azure" title="Maintenance Mode">'
+            '<i class="mdi mdi-pause-circle-outline"></i>'
+            '</a>'
+        ),
+    )
 
     def render_lease_lifetime(self, value):
         from .utils import lease_lifetime_display
@@ -151,8 +224,8 @@ class DHCPScopeTable(NetBoxTable):
         model = DHCPScope
         fields = (
             'pk', 'name', 'prefix', 'start_ip', 'end_ip',
-            'router', 'source', 'lease_lifetime', 'tags', 'actions',
+            'router', 'source', 'lease_lifetime', 'tags', 'maintenance_mode', 'actions',
         )
         default_columns = (
-            'name', 'prefix', 'start_ip', 'end_ip', 'source', 'tags', 'actions',
+            'name', 'prefix', 'start_ip', 'end_ip', 'source', 'tags', 'maintenance_mode', 'actions',
         )

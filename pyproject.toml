@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "netbox-windows-dhcp"
-version = "1.2.1"
+version = "1.3.0"
 description = "NetBox plugin for full integration with Windows DHCP Server via PowerShell Universal"
 readme = "README.md"
 license = "Apache-2.0"
@@ -51,4 +51,5 @@ include = ["netbox_windows_dhcp*"]
 [tool.setuptools.package-data]
 netbox_windows_dhcp = [
     "templates/**/*.html",
+    "psu/*.ps1",
 ]

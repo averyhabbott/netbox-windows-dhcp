@@ -28,7 +28,7 @@
             <th scope="row">API Key</th>
             <td>
               {% if has_credential_override %}
-                <span class="badge bg-info text-dark">
+                <span class="badge text-bg-info">
                   <i class="mdi mdi-information-outline"></i> Overridden by PLUGINS_CONFIG
                 </span>
               {% elif object.api_key %}
@@ -54,6 +54,44 @@
             <th scope="row">Verify SSL</th>
             <td>{% if object.verify_ssl %}<i class="mdi mdi-check-bold text-success"></i>{% else %}<i class="mdi mdi-close text-danger"></i>{% endif %}</td>
           </tr>
+          {% if object.use_https %}
+          <tr>
+            <th scope="row">CA Certificate</th>
+            <td>
+              {% if object.ca_cert %}
+                {% if cert_expired %}
+                  <i class="mdi mdi-certificate-outline text-danger"></i>
+                  {% if stored_cert_cn %}CN={{ stored_cert_cn }}, {% endif %}expires {{ object.ca_cert_expiry|date:"N j, Y" }}
+                  <span class="badge text-bg-danger ms-1">Expired</span>
+                {% elif cert_expiring_soon %}
+                  <i class="mdi mdi-certificate-outline text-warning"></i>
+                  {% if stored_cert_cn %}CN={{ stored_cert_cn }}, {% endif %}expires {{ object.ca_cert_expiry|date:"N j, Y" }}
+                  <span class="badge text-bg-warning ms-1">Expiring Soon</span>
+                {% else %}
+                  <i class="mdi mdi-check-circle-outline text-success"></i>
+                  {% if stored_cert_cn %}CN={{ stored_cert_cn }}, {% endif %}expires {{ object.ca_cert_expiry|date:"N j, Y" }}
+                {% endif %}
+                <form method="post" action="{% url 'plugins:netbox_windows_dhcp:dhcpserver_certimport' object.pk %}" class="d-inline ms-2">
+                  {% csrf_token %}
+                  <button type="submit" class="btn btn-sm btn-outline-secondary">
+                    <i class="mdi mdi-refresh"></i> Replace
+                  </button>
+                </form>
+                <form method="post" action="{% url 'plugins:netbox_windows_dhcp:dhcpserver_certremove' object.pk %}" class="d-inline ms-1">
+                  {% csrf_token %}
+                  <button type="submit" class="btn btn-sm btn-outline-danger">
+                    <i class="mdi mdi-delete-outline"></i> Remove
+                  </button>
+                </form>
+              {% else %}
+                <span class="text-muted">None</span>
+                <a href="{% url 'plugins:netbox_windows_dhcp:dhcpserver_certimport' object.pk %}" class="btn btn-sm btn-outline-primary ms-2">
+                  <i class="mdi mdi-certificate-outline"></i> Import
+                </a>
+              {% endif %}
+            </td>
+          </tr>
+          {% endif %}
           <tr>
             <th scope="row">Base URL</th>
             <td><code>{{ object.base_url }}</code></td>
@@ -84,63 +122,17 @@
           <i class="mdi mdi-import"></i> Import from Server
         </a>
         <span class="text-muted ms-2">One-time import of scopes, failovers, and option values</span>
+        <hr>
+        <form method="post" action="{% url 'plugins:netbox_windows_dhcp:dhcpserver_psu_update' object.pk %}">
+          {% csrf_token %}
+          <button type="submit" class="btn btn-secondary">
+            <i class="mdi mdi-upload-outline"></i> Update PSU Scripts
+          </button>
+          <span class="text-muted ms-2">Push latest endpoint scripts to PowerShell Universal</span>
+        </form>
       </div>
     </div>
 
-    {% if object.use_https %}
-    <div class="card mt-3">
-      {% if object.ca_cert %}
-        {% if cert_expired %}
-          <h5 class="card-header text-white bg-danger">
-            <i class="mdi mdi-certificate-outline"></i> Stored Certificate
-            <span class="badge bg-light text-danger ms-2">Expired</span>
-          </h5>
-        {% elif cert_expiring_soon %}
-          <h5 class="card-header text-dark bg-warning">
-            <i class="mdi mdi-certificate-outline"></i> Stored Certificate
-            <span class="badge bg-light text-warning ms-2">Expiring Soon</span>
-          </h5>
-        {% else %}
-          <h5 class="card-header">
-            <i class="mdi mdi-certificate-outline"></i> Stored Certificate
-          </h5>
-        {% endif %}
-        <div class="card-body">
-          <table class="table table-hover attr-table mb-3">
-            {% if object.ca_cert_expiry %}
-            <tr>
-              <th scope="row">Expires</th>
-              <td>{{ object.ca_cert_expiry|date:"N j, Y" }}</td>
-            </tr>
-            {% endif %}
-          </table>
-          <form method="post" action="{% url 'plugins:netbox_windows_dhcp:dhcpserver_certimport' object.pk %}" class="d-inline">
-            {% csrf_token %}
-            <button type="submit" class="btn btn-sm btn-outline-secondary">
-              <i class="mdi mdi-refresh"></i> Replace Certificate
-            </button>
-          </form>
-          <form method="post" action="{% url 'plugins:netbox_windows_dhcp:dhcpserver_certremove' object.pk %}" class="d-inline ms-1">
-            {% csrf_token %}
-            <button type="submit" class="btn btn-sm btn-outline-danger">
-              <i class="mdi mdi-delete-outline"></i> Remove
-            </button>
-          </form>
-        </div>
-      {% else %}
-        <h5 class="card-header"><i class="mdi mdi-certificate-outline"></i> HTTPS Certificate</h5>
-        <div class="card-body">
-          <p class="text-muted small mb-2">
-            No certificate stored. If this server uses a self-signed certificate, import it here
-            to keep SSL verification enabled.
-          </p>
-          <a href="{% url 'plugins:netbox_windows_dhcp:dhcpserver_certimport' object.pk %}" class="btn btn-sm btn-outline-primary">
-            <i class="mdi mdi-certificate-outline"></i> Import HTTPS Certificate
-          </a>
-        </div>
-      {% endif %}
-    </div>
-    {% endif %}
   </div>
 </div>
 

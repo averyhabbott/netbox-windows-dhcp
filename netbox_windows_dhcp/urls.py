@@ -30,6 +30,13 @@ urlpatterns = [
     path('servers/<int:pk>/import/', views.DHCPServerImportView.as_view(), name='dhcpserver_import'),
     path('servers/<int:pk>/cert/import/', views.DHCPServerCertImportView.as_view(), name='dhcpserver_certimport'),
     path('servers/<int:pk>/cert/remove/', views.DHCPServerCertRemoveView.as_view(), name='dhcpserver_certremove'),
+    path('servers/<int:pk>/maintenance/', views.DHCPServerMaintenanceView.as_view(), name='dhcpserver_maintenance'),
+    path('servers/maintenance/', views.DHCPServerBulkMaintenanceView.as_view(), name='dhcpserver_bulk_maintenance'),
+    path('servers/<int:pk>/test-connection/', views.DHCPServerTestConnectionView.as_view(), name='dhcpserver_test_connection'),
+    path('servers/new/test-connection/', views.DHCPServerTestConnectionView.as_view(), name='dhcpserver_test_connection_new'),
+    path('servers/cert/fetch/', views.DHCPServerCertFetchView.as_view(), name='dhcpserver_cert_fetch'),
+    path('servers/<int:pk>/psu-update/', views.DHCPServerPSUUpdateView.as_view(), name='dhcpserver_psu_update'),
+    path('servers/psu-update/', views.DHCPServerBulkPSUUpdateView.as_view(), name='dhcpserver_bulk_psu_update'),
 
     # Global sync (all servers)
     path('sync/', views.DHCPGlobalSyncView.as_view(), name='global_sync'),
@@ -46,6 +53,8 @@ urlpatterns = [
     path('failover/<int:pk>/delete/', views.DHCPFailoverDeleteView.as_view(), name='dhcpfailover_delete'),
     path('failover/<int:pk>/changelog/', ObjectChangeLogView.as_view(), {'model': DHCPFailover}, name='dhcpfailover_changelog'),
     path('failover/<int:pk>/toggle-sync/', views.DHCPFailoverToggleSyncView.as_view(), name='dhcpfailover_toggle_sync'),
+    path('failover/<int:pk>/maintenance/', views.DHCPFailoverMaintenanceView.as_view(), name='dhcpfailover_maintenance'),
+    path('failover/maintenance/', views.DHCPFailoverBulkMaintenanceView.as_view(), name='dhcpfailover_bulk_maintenance'),
 
     # -----------------------------------------------------------------------
     # DHCPOptionCodeDefinition
@@ -80,6 +89,8 @@ urlpatterns = [
     path('scopes/<int:pk>/edit/', views.DHCPScopeEditView.as_view(), name='dhcpscope_edit'),
     path('scopes/<int:pk>/delete/', views.DHCPScopeDeleteView.as_view(), name='dhcpscope_delete'),
     path('scopes/<int:pk>/changelog/', ObjectChangeLogView.as_view(), {'model': DHCPScope}, name='dhcpscope_changelog'),
+    path('scopes/<int:pk>/maintenance/', views.DHCPScopeMaintenanceView.as_view(), name='dhcpscope_maintenance'),
+    path('scopes/maintenance/', views.DHCPScopeBulkMaintenanceView.as_view(), name='dhcpscope_bulk_maintenance'),
 
     # -----------------------------------------------------------------------
     # DHCPExclusionRange
@@ -89,6 +100,11 @@ urlpatterns = [
     path('exclusion-ranges/<int:pk>/edit/', views.DHCPExclusionRangeEditView.as_view(), name='dhcpexclusionrange_edit'),
     path('exclusion-ranges/<int:pk>/delete/', views.DHCPExclusionRangeDeleteView.as_view(), name='dhcpexclusionrange_delete'),
     path('exclusion-ranges/<int:pk>/changelog/', ObjectChangeLogView.as_view(), {'model': DHCPExclusionRange}, name='dhcpexclusionrange_changelog'),
+
+    # -----------------------------------------------------------------------
+    # Current Maintenance (combined view)
+    # -----------------------------------------------------------------------
+    path('maintenance/', views.DHCPCurrentMaintenanceView.as_view(), name='current_maintenance'),
 
     # -----------------------------------------------------------------------
     # Settings

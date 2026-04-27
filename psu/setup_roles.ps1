@@ -10,7 +10,7 @@
     Tokens are created only if no token with that identity name already exists;
     if one does, you will be instructed to assign the role manually in the PSU UI.
 
-    Token values are printed once — copy them into NetBox immediately.
+    Token values are printed once - copy them into NetBox immediately.
     They cannot be retrieved again after this session.
 
 .PARAMETER BaseUrl
@@ -35,11 +35,11 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $headers  = @{ Authorization = "Bearer $AdminToken"; 'Content-Type' = 'application/json' }
-$splatSsl = if ($PSVersionTable.PSVersion.Major -ge 7) {
-    @{ SkipCertificateCheck = $true }
+if ($PSVersionTable.PSVersion.Major -ge 7) {
+    $splatSsl = @{ SkipCertificateCheck = $true }
 } else {
     [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
-    @{}
+    $splatSsl = @{}
 }
 
 function Invoke-PSU {
@@ -49,7 +49,7 @@ function Invoke-PSU {
     Invoke-RestMethod @irmArgs
 }
 
-# ── Roles ──────────────────────────────────────────────────────────────────
+# -- Roles --
 Write-Host "`n=== Creating Roles ===" -ForegroundColor Cyan
 
 foreach ($r in @(
@@ -64,7 +64,28 @@ foreach ($r in @(
     }
 }
 
-# ── Tokens ─────────────────────────────────────────────────────────────────
+# Grant DHCPWriter the apis/* permission so it can update and restart endpoint
+# records via the PSU management API (used by the plugin's Update PSU Scripts job).
+Write-Host "`n=== Granting DHCPWriter management API permission ===" -ForegroundColor Cyan
+$writerRole = (Invoke-PSU GET '/api/v1/role') | Where-Object { $_.name -eq 'DHCPWriter' } | Select-Object -First 1
+if ($writerRole) {
+    $updateBody = @{
+        id          = $writerRole.id
+        name        = $writerRole.name
+        description = $writerRole.description
+        permissions = @('apis/*')
+    }
+    try {
+        Invoke-PSU PUT "/api/v1/role/$($writerRole.id)" $updateBody | Out-Null
+        Write-Host "  [ok]   Granted DHCPWriter 'apis/*' permission." -ForegroundColor Green
+    } catch {
+        Write-Host "  [fail] Could not update DHCPWriter role: $_" -ForegroundColor Red
+    }
+} else {
+    Write-Host "  [fail] DHCPWriter role not found - skipping permission grant." -ForegroundColor Red
+}
+
+# -- Tokens --
 Write-Host "`n=== Creating App Tokens ===" -ForegroundColor Cyan
 
 $expiration = (Get-Date).ToUniversalTime().AddDays($LifespanDays).ToString('o')
@@ -91,7 +112,7 @@ foreach ($t in @(
     }
 }
 
-# ── Output ─────────────────────────────────────────────────────────────────
+# -- Output --
 Write-Host "`n=== Token Values -- copy into NetBox now ===" -ForegroundColor Cyan
 Write-Host "(Token values cannot be retrieved after this session.)`n"
 

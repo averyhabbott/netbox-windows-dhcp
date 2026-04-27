@@ -3,17 +3,17 @@
 {% block bulk_buttons %}
 <div class="bulk-action-buttons">
   <button type="submit"
-          formaction="{% url 'plugins:netbox_windows_dhcp:dhcpfailover_bulk_maintenance' %}"
+          formaction="{% url 'plugins:netbox_windows_dhcp:dhcpserver_bulk_maintenance' %}"
           class="btn btn-warning">
     <i class="mdi mdi-pause-circle-outline"></i> Bulk Maintenance Mode
   </button>
   <button type="submit"
-          formaction="{% url 'plugins:netbox_windows_dhcp:dhcpfailover_bulk_toggle_sync' %}"
+          formaction="{% url 'plugins:netbox_windows_dhcp:dhcpserver_bulk_psu_update' %}"
           class="btn btn-secondary">
-    <i class="mdi mdi-sync"></i> Toggle Sync for Selected
+    <i class="mdi mdi-upload-outline"></i> Update PSU Scripts
   </button>
   <button type="submit"
-          formaction="{% url 'plugins:netbox_windows_dhcp:dhcpfailover_bulk_delete' %}"
+          formaction="{% url 'plugins:netbox_windows_dhcp:dhcpserver_bulk_delete' %}"
           class="btn btn-danger">
     <i class="mdi mdi-trash-can-outline"></i> Delete Selected
   </button>

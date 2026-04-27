@@ -1,0 +1,77 @@
+{% extends 'base/layout.html' %}
+
+{% block title %}Bulk Maintenance Mode — {{ object_type }}s{% endblock %}
+
+{% block content %}
+<div class="row">
+  <div class="col col-md-8 col-lg-6">
+
+    <div class="card">
+      <h5 class="card-header">
+        <i class="mdi mdi-pause-circle-outline text-warning"></i>
+        Bulk Maintenance Mode — {{ objects.count }} {{ object_type }}(s) Selected
+      </h5>
+      <div class="card-body">
+
+        <ul class="list-unstyled mb-4">
+          {% for obj in objects %}
+          <li><i class="mdi mdi-circle-small text-muted"></i> <a href="{{ obj.get_absolute_url }}">{{ obj }}</a>
+            {% if obj.maintenance_mode %}<span class="badge text-bg-warning ms-1">In Maintenance</span>{% endif %}
+          </li>
+          {% endfor %}
+        </ul>
+
+        <form method="post">
+          {% csrf_token %}
+          {% for pk in pk_list %}<input type="hidden" name="pk" value="{{ pk }}">{% endfor %}
+          <input type="hidden" name="confirm" value="1">
+
+          <div class="mb-3">
+            <label class="form-label fw-semibold">Maintenance Mode</label>
+            <div>
+              <div class="form-check form-check-inline">
+                <input class="form-check-input" type="radio" name="maintenance_mode"
+                       id="mm_enable" value="1" required>
+                <label class="form-check-label" for="mm_enable">Enable</label>
+              </div>
+              <div class="form-check form-check-inline">
+                <input class="form-check-input" type="radio" name="maintenance_mode"
+                       id="mm_disable" value="0" required>
+                <label class="form-check-label" for="mm_disable">Disable</label>
+              </div>
+            </div>
+          </div>
+
+          <div class="mb-4" id="mm-notes-field" style="display:none">
+            <label for="mm_notes" class="form-label fw-semibold">
+              Notes <span class="text-muted fw-normal">(optional — applied to all selected)</span>
+            </label>
+            <textarea name="maintenance_notes" id="mm_notes" class="form-control" rows="3"
+                      placeholder="Describe the reason for this maintenance window..."></textarea>
+          </div>
+
+          <button type="submit" class="btn btn-warning">
+            <i class="mdi mdi-check"></i> Apply to All
+          </button>
+          <a href="{{ return_url }}" class="btn btn-outline-secondary ms-2">Cancel</a>
+        </form>
+
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+(function () {
+  var enableRadio  = document.getElementById('mm_enable');
+  var notesWrapper = document.getElementById('mm-notes-field');
+  function syncVisibility() {
+    notesWrapper.style.display = enableRadio.checked ? '' : 'none';
+  }
+  document.querySelectorAll('[name="maintenance_mode"]').forEach(function (r) {
+    r.addEventListener('change', syncVisibility);
+  });
+}());
+</script>
+{% endblock %}

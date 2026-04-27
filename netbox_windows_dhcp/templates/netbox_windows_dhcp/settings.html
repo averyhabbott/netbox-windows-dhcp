@@ -48,7 +48,7 @@
                   {{ next_sync_job.scheduled|date:"N j, Y, g:i a" }}
                   <span class="text-muted ms-1">({{ next_sync_job.scheduled|timeuntil }} from now)</span>
                 {% elif next_sync_job.status == 'pending' %}
-                  <span class="badge bg-warning text-dark">Queued — running shortly</span>
+                  <span class="badge text-bg-warning">Queued — running shortly</span>
                 {% else %}
                   <span class="text-muted">N/A</span>
                 {% endif %}

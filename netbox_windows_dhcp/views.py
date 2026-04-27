@@ -1,7 +1,9 @@
+import json
 import logging
 
 from django.contrib import messages
 from django.contrib.auth.mixins import LoginRequiredMixin
+from django.http import JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.views import View
 from netbox.object_actions import BulkDelete, BulkExport, CloneObject, DeleteObject
@@ -56,6 +58,23 @@ def _setting(name: str):
     return getattr(DHCPPluginSettings.load(), name)
 
 
+def _cert_cn_from_pem(pem: str) -> str:
+    """Extract subject CN from a PEM string. Returns '' on any failure."""
+    if not pem:
+        return ''
+    try:
+        import ssl
+        der = ssl.PEM_cert_to_DER_cert(pem)
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+        cert = x509.load_der_x509_certificate(der)
+        return next(
+            (attr.value for attr in cert.subject if attr.oid == NameOID.COMMON_NAME), ''
+        )
+    except Exception:
+        return ''
+
+
 # ---------------------------------------------------------------------------
 # DHCPServer views
 # ---------------------------------------------------------------------------
@@ -65,6 +84,7 @@ class DHCPServerListView(generic.ObjectListView):
     table = DHCPServerTable
     filterset = DHCPServerFilterSet
     filterset_form = DHCPServerFilterForm
+    template_name = 'netbox_windows_dhcp/dhcpserver_list.html'
 
 
 class DHCPServerView(generic.ObjectView):
@@ -101,23 +121,55 @@ class DHCPServerView(generic.ObjectView):
             cert_expired = instance.ca_cert_expiry < now
             cert_expiring_soon = not cert_expired and instance.ca_cert_expiry < now + timedelta(days=90)
 
+        stored_cert_cn = _cert_cn_from_pem(instance.ca_cert) if instance.ca_cert else ''
+
         return {
             'failover_table': failover_table,
             'scope_table': scope_table,
             'has_credential_override': instance.hostname in server_overrides,
             'cert_expired': cert_expired,
             'cert_expiring_soon': cert_expiring_soon,
+            'stored_cert_cn': stored_cert_cn,
         }
 
 
 class DHCPServerCreateView(generic.ObjectEditView):
     queryset = DHCPServer.objects.all()
     form = DHCPServerForm
+    template_name = 'netbox_windows_dhcp/dhcpserver_edit.html'
+
+    def get_extra_context(self, request, instance):
+        from django.urls import reverse
+        return {
+            'cert_fetch_url': reverse('plugins:netbox_windows_dhcp:dhcpserver_cert_fetch'),
+            'test_connection_url': reverse('plugins:netbox_windows_dhcp:dhcpserver_test_connection_new'),
+            'stored_cert_cn': '',
+            'stored_cert_expiry': '',
+        }
 
 
 class DHCPServerEditView(generic.ObjectEditView):
     queryset = DHCPServer.objects.all()
     form = DHCPServerForm
+    template_name = 'netbox_windows_dhcp/dhcpserver_edit.html'
+
+    def get_extra_context(self, request, instance):
+        from django.urls import reverse
+        stored_cn = ''
+        stored_expiry = ''
+        if instance.pk and instance.ca_cert:
+            stored_cn = _cert_cn_from_pem(instance.ca_cert)
+            if instance.ca_cert_expiry:
+                stored_expiry = instance.ca_cert_expiry.strftime('%B %-d, %Y')
+        return {
+            'cert_fetch_url': reverse('plugins:netbox_windows_dhcp:dhcpserver_cert_fetch'),
+            'test_connection_url': reverse(
+                'plugins:netbox_windows_dhcp:dhcpserver_test_connection',
+                args=[instance.pk],
+            ),
+            'stored_cert_cn': stored_cn,
+            'stored_cert_expiry': stored_expiry,
+        }
 
 
 class DHCPServerDeleteView(generic.ObjectDeleteView):
@@ -132,11 +184,23 @@ class DHCPServerBulkDeleteView(generic.BulkDeleteView):
 class DHCPServerSyncView(LoginRequiredMixin, View):
     """Enqueues a background sync job for a single DHCP server."""
 
+    def get(self, request, pk):
+        return self._enqueue(request, pk)
+
     def post(self, request, pk):
+        return self._enqueue(request, pk)
+
+    def _enqueue(self, request, pk):
         if not request.user.has_perm('netbox_windows_dhcp.change_dhcpserver'):
             messages.error(request, 'You do not have permission to sync DHCP servers.')
             return redirect('plugins:netbox_windows_dhcp:dhcpserver_list')
         server = get_object_or_404(DHCPServer, pk=pk)
+        if server.maintenance_mode:
+            messages.warning(
+                request,
+                f'"{server.name}" is in maintenance mode. Disable maintenance mode before syncing.'
+            )
+            return redirect(server.get_absolute_url())
         from .background_tasks import DHCPServerSyncJob
         from .models import DHCPPluginSettings
         cfg = DHCPPluginSettings.load()
@@ -453,6 +517,7 @@ class DHCPScopeListView(generic.ObjectListView):
     table = DHCPScopeTable
     filterset = DHCPScopeFilterSet
     filterset_form = DHCPScopeFilterForm
+    template_name = 'netbox_windows_dhcp/dhcpscope_list.html'
 
     def get_extra_context(self, request):
         return {'push_scope_info': _setting('push_scope_info')}
@@ -613,6 +678,262 @@ class DHCPExclusionRangeEditView(generic.ObjectEditView):
 
 class DHCPExclusionRangeDeleteView(generic.ObjectDeleteView):
     queryset = DHCPExclusionRange.objects.all()
+
+
+# ---------------------------------------------------------------------------
+# Maintenance mode — shared helper
+# ---------------------------------------------------------------------------
+
+def _apply_maintenance(obj, enabled: bool, notes: str, user):
+    from django.utils import timezone
+    obj.maintenance_mode = enabled
+    if enabled:
+        obj.maintenance_notes = notes
+        obj.maintenance_enabled_at = timezone.now()
+        obj.maintenance_enabled_by = user
+    else:
+        obj.maintenance_notes = ''
+        obj.maintenance_enabled_at = None
+        obj.maintenance_enabled_by = None
+    obj.save(update_fields=[
+        'maintenance_mode', 'maintenance_notes',
+        'maintenance_enabled_at', 'maintenance_enabled_by',
+    ])
+
+
+# ---------------------------------------------------------------------------
+# Maintenance mode — single-item toggle views
+# ---------------------------------------------------------------------------
+
+class DHCPServerMaintenanceView(LoginRequiredMixin, View):
+    def get(self, request, pk):
+        server = get_object_or_404(DHCPServer, pk=pk)
+        return render(request, 'netbox_windows_dhcp/dhcpmaintenance_toggle.html', {
+            'object': server,
+            'object_type': 'Server',
+            'default_enabled': not server.maintenance_mode,
+            'return_url': server.get_absolute_url(),
+        })
+
+    def post(self, request, pk):
+        if not request.user.has_perm('netbox_windows_dhcp.change_dhcpserver'):
+            messages.error(request, 'You do not have permission to modify server maintenance settings.')
+            return redirect('plugins:netbox_windows_dhcp:dhcpserver_list')
+        server = get_object_or_404(DHCPServer, pk=pk)
+        enabled = request.POST.get('maintenance_mode') == '1'
+        notes = request.POST.get('maintenance_notes', '')
+        _apply_maintenance(server, enabled, notes, request.user)
+        action = 'enabled' if enabled else 'disabled'
+        messages.success(request, f'Maintenance mode {action} for server "{server}".')
+        return redirect('plugins:netbox_windows_dhcp:dhcpserver_list')
+
+
+class DHCPFailoverMaintenanceView(LoginRequiredMixin, View):
+    def get(self, request, pk):
+        failover = get_object_or_404(DHCPFailover, pk=pk)
+        return render(request, 'netbox_windows_dhcp/dhcpmaintenance_toggle.html', {
+            'object': failover,
+            'object_type': 'Failover',
+            'default_enabled': not failover.maintenance_mode,
+            'return_url': failover.get_absolute_url(),
+        })
+
+    def post(self, request, pk):
+        if not request.user.has_perm('netbox_windows_dhcp.change_dhcpfailover'):
+            messages.error(request, 'You do not have permission to modify failover maintenance settings.')
+            return redirect('plugins:netbox_windows_dhcp:dhcpfailover_list')
+        failover = get_object_or_404(DHCPFailover, pk=pk)
+        enabled = request.POST.get('maintenance_mode') == '1'
+        notes = request.POST.get('maintenance_notes', '')
+        _apply_maintenance(failover, enabled, notes, request.user)
+        action = 'enabled' if enabled else 'disabled'
+        messages.success(request, f'Maintenance mode {action} for failover "{failover}".')
+        return redirect('plugins:netbox_windows_dhcp:dhcpfailover_list')
+
+
+class DHCPScopeMaintenanceView(LoginRequiredMixin, View):
+    def get(self, request, pk):
+        from .models import DHCPScope
+        scope = get_object_or_404(DHCPScope, pk=pk)
+        return render(request, 'netbox_windows_dhcp/dhcpmaintenance_toggle.html', {
+            'object': scope,
+            'object_type': 'Scope',
+            'default_enabled': not scope.maintenance_mode,
+            'return_url': scope.get_absolute_url(),
+        })
+
+    def post(self, request, pk):
+        if not request.user.has_perm('netbox_windows_dhcp.change_dhcpscope'):
+            messages.error(request, 'You do not have permission to modify scope maintenance settings.')
+            return redirect('plugins:netbox_windows_dhcp:dhcpscope_list')
+        from .models import DHCPScope
+        scope = get_object_or_404(DHCPScope, pk=pk)
+        enabled = request.POST.get('maintenance_mode') == '1'
+        notes = request.POST.get('maintenance_notes', '')
+        _apply_maintenance(scope, enabled, notes, request.user)
+        action = 'enabled' if enabled else 'disabled'
+        messages.success(request, f'Maintenance mode {action} for scope "{scope}".')
+        return redirect('plugins:netbox_windows_dhcp:dhcpscope_list')
+
+
+# ---------------------------------------------------------------------------
+# Maintenance mode — bulk toggle views
+# ---------------------------------------------------------------------------
+
+class DHCPServerBulkMaintenanceView(LoginRequiredMixin, View):
+    def post(self, request):
+        if not request.user.has_perm('netbox_windows_dhcp.change_dhcpserver'):
+            messages.error(request, 'You do not have permission to modify server maintenance settings.')
+            return redirect('plugins:netbox_windows_dhcp:dhcpserver_list')
+        pk_list = [int(pk) for pk in request.POST.getlist('pk') if str(pk).isdigit()]
+        if not pk_list:
+            messages.warning(request, 'No servers selected.')
+            return redirect('plugins:netbox_windows_dhcp:dhcpserver_list')
+        if request.POST.get('confirm'):
+            enabled = request.POST.get('maintenance_mode') == '1'
+            notes = request.POST.get('maintenance_notes', '')
+            objs = DHCPServer.objects.filter(pk__in=pk_list)
+            count = objs.count()
+            for obj in objs:
+                _apply_maintenance(obj, enabled, notes, request.user)
+            action = 'enabled' if enabled else 'disabled'
+            messages.success(request, f'Maintenance mode {action} for {count} server(s).')
+            return redirect('plugins:netbox_windows_dhcp:dhcpserver_list')
+        from django.urls import reverse
+        return render(request, 'netbox_windows_dhcp/dhcpmaintenance_bulk.html', {
+            'objects': DHCPServer.objects.filter(pk__in=pk_list),
+            'object_type': 'Server',
+            'pk_list': pk_list,
+            'return_url': reverse('plugins:netbox_windows_dhcp:dhcpserver_list'),
+        })
+
+
+class DHCPFailoverBulkMaintenanceView(LoginRequiredMixin, View):
+    def post(self, request):
+        if not request.user.has_perm('netbox_windows_dhcp.change_dhcpfailover'):
+            messages.error(request, 'You do not have permission to modify failover maintenance settings.')
+            return redirect('plugins:netbox_windows_dhcp:dhcpfailover_list')
+        pk_list = [int(pk) for pk in request.POST.getlist('pk') if str(pk).isdigit()]
+        if not pk_list:
+            messages.warning(request, 'No failover relationships selected.')
+            return redirect('plugins:netbox_windows_dhcp:dhcpfailover_list')
+        if request.POST.get('confirm'):
+            enabled = request.POST.get('maintenance_mode') == '1'
+            notes = request.POST.get('maintenance_notes', '')
+            objs = DHCPFailover.objects.filter(pk__in=pk_list)
+            count = objs.count()
+            for obj in objs:
+                _apply_maintenance(obj, enabled, notes, request.user)
+            action = 'enabled' if enabled else 'disabled'
+            messages.success(request, f'Maintenance mode {action} for {count} failover relationship(s).')
+            return redirect('plugins:netbox_windows_dhcp:dhcpfailover_list')
+        from django.urls import reverse
+        return render(request, 'netbox_windows_dhcp/dhcpmaintenance_bulk.html', {
+            'objects': DHCPFailover.objects.filter(pk__in=pk_list),
+            'object_type': 'Failover',
+            'pk_list': pk_list,
+            'return_url': reverse('plugins:netbox_windows_dhcp:dhcpfailover_list'),
+        })
+
+
+class DHCPScopeBulkMaintenanceView(LoginRequiredMixin, View):
+    def post(self, request):
+        if not request.user.has_perm('netbox_windows_dhcp.change_dhcpscope'):
+            messages.error(request, 'You do not have permission to modify scope maintenance settings.')
+            return redirect('plugins:netbox_windows_dhcp:dhcpscope_list')
+        pk_list = [int(pk) for pk in request.POST.getlist('pk') if str(pk).isdigit()]
+        if not pk_list:
+            messages.warning(request, 'No scopes selected.')
+            return redirect('plugins:netbox_windows_dhcp:dhcpscope_list')
+        if request.POST.get('confirm'):
+            enabled = request.POST.get('maintenance_mode') == '1'
+            notes = request.POST.get('maintenance_notes', '')
+            from .models import DHCPScope
+            objs = DHCPScope.objects.filter(pk__in=pk_list)
+            count = objs.count()
+            for obj in objs:
+                _apply_maintenance(obj, enabled, notes, request.user)
+            action = 'enabled' if enabled else 'disabled'
+            messages.success(request, f'Maintenance mode {action} for {count} scope(s).')
+            return redirect('plugins:netbox_windows_dhcp:dhcpscope_list')
+        from django.urls import reverse
+        from .models import DHCPScope
+        return render(request, 'netbox_windows_dhcp/dhcpmaintenance_bulk.html', {
+            'objects': DHCPScope.objects.filter(pk__in=pk_list),
+            'object_type': 'Scope',
+            'pk_list': pk_list,
+            'return_url': reverse('plugins:netbox_windows_dhcp:dhcpscope_list'),
+        })
+
+
+# ---------------------------------------------------------------------------
+# Current Maintenance combined view
+# ---------------------------------------------------------------------------
+
+class DHCPCurrentMaintenanceView(LoginRequiredMixin, View):
+    template_name = 'netbox_windows_dhcp/dhcpcurrentmaintenance.html'
+
+    def get(self, request):
+        from .models import DHCPScope
+        filter_type = request.GET.get('type', 'all')
+
+        items = []
+
+        if filter_type in ('all', 'server'):
+            for server in DHCPServer.objects.filter(maintenance_mode=True).select_related(
+                'maintenance_enabled_by'
+            ):
+                items.append({
+                    'type': 'Server',
+                    'type_class': 'badge-outline text-primary',
+                    'object': server,
+                    'url': server.get_absolute_url(),
+                    'enabled_by': server.maintenance_enabled_by,
+                    'enabled_at': server.maintenance_enabled_at,
+                    'notes': server.maintenance_notes,
+                    'health_status': server.health_status,
+                    'health_class': {
+                        'healthy': 'text-bg-success',
+                        'unreachable': 'text-bg-danger',
+                    }.get(server.health_status, 'text-bg-secondary'),
+                })
+
+        if filter_type in ('all', 'failover'):
+            for fo in DHCPFailover.objects.filter(maintenance_mode=True).select_related(
+                'maintenance_enabled_by', 'primary_server', 'secondary_server'
+            ):
+                items.append({
+                    'type': 'Failover',
+                    'type_class': 'badge-outline text-info',
+                    'object': fo,
+                    'url': fo.get_absolute_url(),
+                    'enabled_by': fo.maintenance_enabled_by,
+                    'enabled_at': fo.maintenance_enabled_at,
+                    'notes': fo.maintenance_notes,
+                    'health_status': None,
+                    'health_class': None,
+                })
+
+        if filter_type in ('all', 'scope'):
+            for scope in DHCPScope.objects.filter(maintenance_mode=True).select_related(
+                'maintenance_enabled_by', 'prefix', 'server', 'failover'
+            ):
+                items.append({
+                    'type': 'Scope',
+                    'type_class': 'badge-outline text-secondary',
+                    'object': scope,
+                    'url': scope.get_absolute_url(),
+                    'enabled_by': scope.maintenance_enabled_by,
+                    'enabled_at': scope.maintenance_enabled_at,
+                    'notes': scope.maintenance_notes,
+                    'health_status': None,
+                    'health_class': None,
+                })
+
+        return render(request, self.template_name, {
+            'items': items,
+            'filter_type': filter_type,
+        })
 
 
 # ---------------------------------------------------------------------------
@@ -790,3 +1111,183 @@ class ScheduleSyncView(LoginRequiredMixin, View):
                 f'then every {cfg.sync_interval} minute(s) thereafter.',
             )
             return redirect('plugins:netbox_windows_dhcp:settings')
+
+
+# ---------------------------------------------------------------------------
+# AJAX — Cert Fetch
+# ---------------------------------------------------------------------------
+
+class DHCPServerCertFetchView(LoginRequiredMixin, View):
+    """AJAX POST: fetch TLS cert from a hostname. Returns JSON with cert details."""
+
+    def post(self, request):
+        from .cert_utils import fetch_cert_info
+
+        hostname = request.POST.get('hostname', '').strip()
+        port_str = request.POST.get('port', '443').strip()
+        use_https = request.POST.get('use_https', 'true').lower() in ('1', 'true', 'on')
+
+        if not hostname:
+            return JsonResponse({'ok': False, 'message': 'Hostname is required'})
+        if not use_https:
+            return JsonResponse({'ok': False, 'message': 'Certificate fetch requires HTTPS to be enabled'})
+
+        try:
+            port = int(port_str)
+        except (ValueError, TypeError):
+            port = 443
+
+        try:
+            info = fetch_cert_info(hostname, port)
+            not_after = info['not_after']
+            return JsonResponse({
+                'ok': True,
+                'cert_info': {
+                    'pem': info['pem'],
+                    'fingerprint': info.get('fingerprint', ''),
+                    'subject_cn': info.get('subject_cn', ''),
+                    'sans': info.get('sans', []),
+                    'issuer_cn': info.get('issuer_cn', ''),
+                    'expiry_display': not_after.strftime('%B %-d, %Y') if not_after else '',
+                    'expiry_iso': not_after.isoformat() if not_after else '',
+                },
+            })
+        except OSError as exc:
+            return JsonResponse({'ok': False, 'message': f'Could not connect to {hostname}:{port} — {exc}'})
+        except Exception as exc:
+            return JsonResponse({'ok': False, 'message': str(exc)})
+
+
+# ---------------------------------------------------------------------------
+# AJAX — Test Connection
+# ---------------------------------------------------------------------------
+
+class DHCPServerTestConnectionView(LoginRequiredMixin, View):
+    """AJAX POST: test PSU connectivity with live form values. Returns JSON."""
+
+    def post(self, request, pk=None):
+        from .api_client import PSUClient, PSUClientError
+
+        hostname = request.POST.get('hostname', '').strip()
+        port_str = request.POST.get('port', '443').strip()
+        use_https = request.POST.get('use_https', 'true').lower() in ('1', 'true', 'on')
+        api_key = request.POST.get('api_key', '').strip()
+        verify_ssl = request.POST.get('verify_ssl', 'true').lower() in ('1', 'true', 'on')
+        ca_cert = request.POST.get('ca_cert', '').strip()
+
+        if not hostname:
+            return JsonResponse({'ok': False, 'message': 'Hostname is required'})
+
+        if not api_key:
+            if pk:
+                try:
+                    server = DHCPServer.objects.get(pk=pk)
+                    api_key = server.api_key
+                except DHCPServer.DoesNotExist:
+                    pass
+            if not api_key:
+                return JsonResponse({'ok': False, 'message': 'API key required — enter an App Token in the field above'})
+
+        try:
+            port = int(port_str)
+        except (ValueError, TypeError):
+            port = 443
+
+        # Build a transient server-like object
+        class _TransientServer:
+            pass
+
+        server_obj = _TransientServer()
+        server_obj.name = hostname
+        server_obj.hostname = hostname
+        server_obj.port = port
+        server_obj.use_https = use_https
+        server_obj.verify_ssl = verify_ssl
+        server_obj.ca_cert = ca_cert
+        server_obj.ca_cert_expiry = None
+        server_obj.api_key = api_key
+
+        scheme = 'https' if use_https else 'http'
+        server_obj.base_url = f'{scheme}://{hostname}:{port}/api/dhcp'
+
+        try:
+            client = PSUClient(server_obj)
+        except PSUClientError as exc:
+            return JsonResponse({'ok': False, 'message': str(exc)})
+
+        # Test read access
+        try:
+            client.ping_read()
+        except PSUClientError as exc:
+            msg = str(exc)
+            sc = exc.status_code
+            if sc == 401:
+                msg = 'Authentication failed (401) — check API key'
+            elif sc == 403:
+                msg = 'Permission denied (403)'
+            return JsonResponse({'ok': False, 'message': msg})
+        except Exception as exc:
+            return JsonResponse({'ok': False, 'message': str(exc)})
+
+        # Test write access
+        access = 'Read-Only'
+        try:
+            client.ping_write()
+            access = 'Read-Write'
+        except PSUClientError as exc:
+            if exc.status_code == 403:
+                access = 'Read-Only'
+            else:
+                return JsonResponse({'ok': False, 'message': str(exc)})
+        except Exception:
+            pass
+
+        return JsonResponse({'ok': True, 'message': f'Connection: Good · Access: {access}'})
+
+
+class DHCPServerPSUUpdateView(LoginRequiredMixin, View):
+    """Enqueues a PSU script update job for a single DHCP server."""
+
+    def post(self, request, pk):
+        if not request.user.has_perm('netbox_windows_dhcp.change_dhcpserver'):
+            messages.error(request, 'You do not have permission to update PSU scripts.')
+            return redirect('plugins:netbox_windows_dhcp:dhcpserver_list')
+        server = get_object_or_404(DHCPServer, pk=pk)
+        from .background_tasks import DHCPPSUUpdateJob
+        from .models import DHCPPluginSettings
+        cfg = DHCPPluginSettings.load()
+        job = DHCPPSUUpdateJob.enqueue(
+            name=f'PSU Script Update: {server.name}',
+            user=request.user,
+            server_pk=server.pk,
+            queue_name=cfg.sync_queue,
+        )
+        messages.success(request, f'PSU script update job queued for {server.name}.')
+        return redirect(job.get_absolute_url())
+
+
+class DHCPServerBulkPSUUpdateView(LoginRequiredMixin, View):
+    """Enqueues PSU script update jobs for selected DHCP servers."""
+
+    def post(self, request):
+        if not request.user.has_perm('netbox_windows_dhcp.change_dhcpserver'):
+            messages.error(request, 'You do not have permission to update PSU scripts.')
+            return redirect('plugins:netbox_windows_dhcp:dhcpserver_list')
+        pk_list = [int(pk) for pk in request.POST.getlist('pk') if str(pk).isdigit()]
+        if not pk_list:
+            messages.warning(request, 'No servers selected.')
+            return redirect('plugins:netbox_windows_dhcp:dhcpserver_list')
+        from .background_tasks import DHCPPSUUpdateJob
+        from .models import DHCPPluginSettings
+        cfg = DHCPPluginSettings.load()
+        count = 0
+        for server in DHCPServer.objects.filter(pk__in=pk_list):
+            DHCPPSUUpdateJob.enqueue(
+                name=f'PSU Script Update: {server.name}',
+                user=request.user,
+                server_pk=server.pk,
+                queue_name=cfg.sync_queue,
+            )
+            count += 1
+        messages.success(request, f'PSU script update jobs queued for {count} server(s). Check System → Jobs for progress.')
+        return redirect('plugins:netbox_windows_dhcp:dhcpserver_list')

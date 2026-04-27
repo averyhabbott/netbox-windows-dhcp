@@ -54,23 +54,9 @@ Use this path if PSU is newly installed and you have not yet added endpoint scri
 
 Complete the [Network and HTTPS](#network-and-https) steps in the Prerequisites section above before continuing.
 
-#### 2. Add the endpoint script
+#### 2. Create roles and App Tokens
 
-Copy `dhcp_api_endpoints.ps1` to the Windows server and place it at the path below. Run this from an elevated PowerShell session on the server (adjust the source path as needed):
-
-```powershell
-Copy-Item .\dhcp_api_endpoints.ps1 'C:\ProgramData\UniversalAutomation\Repository\.universal\endpoints.ps1'
-```
-
-Then restart the PSU service to load the endpoints:
-
-```powershell
-Restart-Service -Name "PowerShellUniversal"
-```
-
-#### 3. Create roles and App Tokens
-
-Copy `setup_roles.ps1` to the Windows server or any machine running PowerShell 5.1+ with HTTPS access to the PSU server.
+Download `setup_roles.ps1` from the [GitHub releases page](https://github.com/averyhabbott/netbox-windows-dhcp/releases) to the Windows server or any machine running PowerShell 5.1+ with HTTPS access to the PSU server.
 
 Before running the script, create a bootstrap Administrator App Token in the PSU admin UI:
 
@@ -87,6 +73,8 @@ Then run the script, replacing the hostname, port, and token:
 
 The script creates the `DHCPReader` and `DHCPWriter` roles and one App Token per role, then prints the token values. **Copy them immediately** — they cannot be retrieved again after the session ends.
 
+> **Permission note:** The `DHCPWriter` role is granted `apis/*` permission, which allows the NetBox plugin to push updated endpoint scriptBlocks directly from the **Update PSU Scripts** button in the server detail page. If you are creating roles manually instead of running `setup_roles.ps1`, make sure to add this permission to the `DHCPWriter` role via **Security → Roles → Edit**.
+
 By default tokens expire in 365 days. Override with `-LifespanDays`:
 
 ```powershell
@@ -95,9 +83,9 @@ By default tokens expire in 365 days. Override with `-LifespanDays`:
 
 Prefer clicking? See [Manual setup](#manual-setup) below.
 
-#### 4. Add the token to NetBox
+#### 3. Add the token to NetBox
 
-In NetBox, edit the **DHCP Server** object and paste the appropriate token into the **App Token** field:
+In NetBox, add the DHCP Server object (**Windows DHCP → Infrastructure → Servers → Add**) and paste the appropriate token into the **App Token** field:
 
 | Plugin configuration | Token to use |
 | --- | --- |
@@ -106,52 +94,61 @@ In NetBox, edit the **DHCP Server** object and paste the appropriate token into 
 
 When in doubt, use `NetBox-DHCP-Write` — it covers all operations.
 
+#### 4. Deploy endpoints from NetBox
+
+On the DHCP Server detail page in NetBox, click **Update PSU Scripts**. This pushes all endpoint definitions from the plugin's bundled script directly to PSU via the management API — no file copying required.
+
+The job log shows each endpoint created, then a health check confirming the new version is live. Wait for the job to complete before running a sync.
+
 #### 5. Verify
 
-Test from a machine with HTTPS access to the PSU server (replace hostname and port to match your install):
+Trigger **Sync Now** from the DHCP Server detail page and check the job log, or test directly:
 
 ```powershell
 $headers = @{ Authorization = 'Bearer your-token-here' }
 $base    = 'https://dhcp01.example.com:8443/api/dhcp'
 
+Invoke-RestMethod -Uri "$base/health" -Headers $headers
 Invoke-RestMethod -Uri "$base/scopes" -Headers $headers | ConvertTo-Json -Depth 4
-Invoke-RestMethod -Uri "$base/leases?scope_id=10.0.1.0" -Headers $headers | ConvertTo-Json -Depth 4
 ```
-
-Or trigger **Sync Now** from the DHCP Server detail page in NetBox and check the job log.
 
 ---
 
-### Extending an existing install
+### Upgrading to a new plugin version
 
-Use this path if PSU is already running with a previous version of `dhcp_api_endpoints.ps1` — the one that used a single `$_epAuth` authentication splat with no role enforcement.
+When a new plugin version ships updated endpoint scriptBlocks:
+
+1. `pip install --upgrade netbox-windows-dhcp` on the NetBox host
+2. `python manage.py migrate` and restart NetBox + RQ workers
+3. On each DHCP Server detail page, click **Update PSU Scripts** — or use **Update PSU Scripts** on the server list to bulk-update all servers at once
+4. Check each job log to confirm all endpoints updated and the health check reports the new version
+
+No file copying or PSU service restart needed.
+
+---
+
+### Upgrading from pre-1.2.0 (no role enforcement)
+
+Use this path only if you are upgrading from a version of `dhcp_api_endpoints.ps1` that used a single `$_epAuth` splat with no role enforcement.
 
 > [!IMPORTANT]
-> **Existing tokens have no role assigned.** After deploying the updated script every request from a roleless token returns **401 Unauthorized**. Assign the `DHCPWriter` role to existing tokens (step 2 below) before or immediately after replacing the script.
+> **Existing tokens have no role assigned.** After deploying the updated script every request from a roleless token returns **401 Unauthorized**. Assign the `DHCPWriter` role to existing tokens (step 2 below) **before** clicking Update PSU Scripts.
 
-#### 1. Replace the endpoint script
-
-Replace `C:\ProgramData\UniversalAutomation\Repository\.universal\endpoints.ps1` with the updated version of `dhcp_api_endpoints.ps1`, then restart the PSU service:
-
-```powershell
-Restart-Service -Name "PowerShellUniversal"
-```
-
-#### 2. Assign the DHCPWriter role to existing tokens
+#### 1. Assign the DHCPWriter role to existing tokens
 
 In the PSU admin UI, go to **Security → Tokens**, edit each existing DHCP token, and set its Role to `DHCPWriter`. This restores full access without interrupting NetBox operations.
 
-#### 3. Create scoped roles and tokens (optional)
+#### 2. Create scoped roles and tokens (optional)
 
-Run `setup_roles.ps1` as described in [step 3 of the fresh install](#3-create-roles-and-app-tokens) to add the `DHCPReader` and `DHCPWriter` roles and generate new scoped tokens. The script is idempotent — if the roles already exist it skips them.
+Run `setup_roles.ps1` as described in [step 2 of the fresh install](#2-create-roles-and-app-tokens) to add the `DHCPReader` and `DHCPWriter` roles and generate new scoped tokens. The script is idempotent — if the roles already exist it skips them.
 
-#### 4. Update the token in NetBox (optional)
+#### 3. Update the token in NetBox (optional)
 
 If you want to restrict a sync-only NetBox instance to the read-only `DHCPReader` token, swap the App Token on that DHCP Server object now.
 
-#### 5. Confirm the upgrade
+#### 4. Deploy updated endpoints
 
-Same as [step 5 of the fresh install](#5-verify).
+Click **Update PSU Scripts** on each server detail page. Check the job log to confirm all endpoints updated successfully.
 
 ---
 
@@ -170,6 +167,8 @@ If you prefer not to run `setup_roles.ps1`, create the roles and tokens through 
 ## Script Architecture
 
 PSU v5 runs each endpoint in an isolated runspace, so functions defined in one endpoint are not available in another. The script handles this by storing shared helper functions in the `$H` string and prepending them to every endpoint's scriptblock via `[scriptblock]::Create($H + {...}.ToString())`. This makes each endpoint fully self-contained.
+
+The script defines a `$PSUScriptVersion` constant (e.g. `'1.0.0'`) returned by `GET /api/dhcp/health`. The NetBox plugin compares this against its own `PSU_SCRIPT_VERSION` constant during health checks and shows a warning in the server list when they differ. Both constants must be kept in sync when the script changes — the plugin version and script version are independent; the script does not necessarily change with every plugin release.
 
 Shared helpers defined in `$H`:
 
@@ -190,6 +189,8 @@ URL path parameters (`:param`) and the `$Body` variable are injected automatical
 
 | Method | URL | Description |
 | --- | --- | --- |
+| GET | `/api/dhcp/health` | Health check — returns `{"status":"ok","version":"x.y.z"}` |
+| POST | `/api/dhcp/health` | Write health check — tests write access; returns `{"status":"ok"}` |
 | GET | `/api/dhcp/scopes` | List all scopes (includes `router` and `failover_name`) |
 | GET | `/api/dhcp/scopes/:scope_id` | Get single scope by network address |
 | POST | `/api/dhcp/scopes` | Create a scope |

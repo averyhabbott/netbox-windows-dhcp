@@ -34,6 +34,7 @@ class _SSLContextAdapter(requests.adapters.HTTPAdapter):
 
     def init_poolmanager(self, num_pools, maxsize, block=False, **connection_pool_kw):
         connection_pool_kw['ssl_context'] = self._ssl_context
+        connection_pool_kw['assert_hostname'] = False
         super().init_poolmanager(num_pools, maxsize, block, **connection_pool_kw)
 
 
@@ -103,12 +104,14 @@ class PSUClient:
         self._cert_tempfile.write(ca_cert)
         self._cert_tempfile.flush()
 
-        # VERIFY_X509_PARTIAL_CHAIN (Python 3.10+) lets a non-CA leaf cert act as a
-        # trust anchor.  This enables pinning for both self-signed and CA-signed certs
-        # without requiring the full issuer chain to be stored.
+        # Pinned-cert trust model: we verify the server presents exactly this cert
+        # (CERT_REQUIRED + load_verify_locations), but skip hostname checking because
+        # self-signed PSU certs are commonly issued for 'localhost' regardless of the
+        # server's actual FQDN.  VERIFY_X509_PARTIAL_CHAIN (Python 3.10+) lets a
+        # non-CA leaf cert act as a trust anchor without a full issuer chain.
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False  # must be set before verify_mode
         ctx.verify_mode = ssl.CERT_REQUIRED
-        ctx.check_hostname = True
         ctx.verify_flags |= ssl.VERIFY_X509_PARTIAL_CHAIN
         ctx.load_verify_locations(self._cert_tempfile.name)
 
@@ -120,6 +123,33 @@ class PSUClient:
 
     def _url(self, path: str) -> str:
         return f'{self.base_url}/{path.lstrip("/")}'
+
+    @property
+    def mgmt_base_url(self) -> str:
+        """Base URL for the PSU management API (distinct from the DHCP endpoint base)."""
+        return f'{self.base_url.rsplit("/api/dhcp", 1)[0]}/api/v1'
+
+    def _mgmt_url(self, path: str) -> str:
+        return f'{self.mgmt_base_url}/{path.lstrip("/")}'
+
+    def _mgmt_request(self, method: str, path: str, **kwargs) -> Any:
+        url = self._mgmt_url(path)
+        try:
+            response = self.session.request(method, url, timeout=REQUEST_TIMEOUT, **kwargs)
+            if not response.ok:
+                raise PSUClientError(
+                    f'{method} {url} returned HTTP {response.status_code}: {response.text}',
+                    status_code=response.status_code,
+                )
+            if not response.content:
+                return None
+            return response.json()
+        except PSUClientError:
+            raise
+        except RequestException as exc:
+            raise PSUClientError(f'Network error calling {url}: {exc}') from exc
+        except ValueError as exc:
+            raise PSUClientError(f'Invalid JSON response from {url}: {exc}') from exc
 
     def _request(self, method: str, path: str, **kwargs) -> Any:
         url = self._url(path)
@@ -334,3 +364,58 @@ class PSUClient:
             }
         """
         self._request('DELETE', 'exclusions', json=payload)
+
+    # ------------------------------------------------------------------
+    # Health
+    # ------------------------------------------------------------------
+
+    def ping_read(self) -> Dict:
+        """
+        GET /api/dhcp/health — verify read connectivity and auth.
+
+        Returns the health response dict, which includes a 'version' key
+        containing the PSU script version string (e.g. '1.0.0').
+        Raises PSUClientError on any failure.
+        """
+        return self._get('health')
+
+    def ping_write(self) -> bool:
+        """
+        POST /api/dhcp/health — verify write access.
+
+        Returns True on success, raises PSUClientError on failure.
+        A 403 from the endpoint indicates read-only token (DHCPReader role).
+        """
+        self._post('health', {})
+        return True
+
+    # ------------------------------------------------------------------
+    # PSU Management API (endpoint record updates)
+    # ------------------------------------------------------------------
+
+    def get_dhcp_endpoints(self) -> List[Dict]:
+        """
+        GET /api/v1/endpoint — return all PSU endpoint records whose URL
+        begins with /api/dhcp/.
+        """
+        all_endpoints = self._mgmt_request('GET', 'endpoint')
+        if not isinstance(all_endpoints, list):
+            return []
+        return [ep for ep in all_endpoints if str(ep.get('url', '')).startswith('/api/dhcp/')]
+
+    def update_endpoint(self, endpoint_obj: Dict) -> None:
+        """PUT /api/v1/endpoint/{id} — update a single endpoint's scriptBlock."""
+        ep_id = endpoint_obj['id']
+        self._mgmt_request('PUT', f'endpoint/{ep_id}', json=endpoint_obj)
+
+    def create_endpoint(self, endpoint_obj: Dict) -> Dict:
+        """POST /api/v1/endpoint — register a new endpoint."""
+        return self._mgmt_request('POST', 'endpoint', json=endpoint_obj)
+
+    def delete_endpoint(self, ep_id: int) -> None:
+        """DELETE /api/v1/endpoint/{id} — remove a registered endpoint."""
+        self._mgmt_request('DELETE', f'endpoint/{ep_id}')
+
+    def restart_endpoints(self) -> None:
+        """POST /api/v1/endpoint/restart — reload all endpoint definitions."""
+        self._mgmt_request('POST', 'endpoint/restart', json={})

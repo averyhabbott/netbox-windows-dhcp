@@ -1,5 +1,20 @@
 {% extends 'generic/object_list.html' %}
 
+{% block bulk_buttons %}
+<div class="bulk-action-buttons">
+  <button type="submit"
+          formaction="{% url 'plugins:netbox_windows_dhcp:dhcpscope_bulk_maintenance' %}"
+          class="btn btn-warning">
+    <i class="mdi mdi-pause-circle-outline"></i> Bulk Maintenance Mode
+  </button>
+  <button type="submit"
+          formaction="{% url 'plugins:netbox_windows_dhcp:dhcpscope_bulk_delete' %}"
+          class="btn btn-danger">
+    <i class="mdi mdi-trash-can-outline"></i> Delete Selected
+  </button>
+</div>
+{% endblock bulk_buttons %}
+
 {% block content %}
 {% if not push_scope_info %}
 <div class="alert alert-warning d-flex align-items-center mb-3" role="alert">

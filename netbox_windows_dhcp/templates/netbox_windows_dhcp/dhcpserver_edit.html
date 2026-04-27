@@ -1,0 +1,270 @@
+{% extends 'generic/object_edit.html' %}
+{% load i18n %}
+
+{% block form %}
+  {{ block.super }}
+
+  {# ------------------------------------------------------------------ #}
+  {# CA Certificate widget                                               #}
+  {# ------------------------------------------------------------------ #}
+  <div class="field-group mb-5">
+    <div class="row">
+      <h2 class="col-9 offset-3">CA Certificate</h2>
+    </div>
+    <div class="row mb-2">
+      <div class="col-9 offset-3">
+
+        {# STATE: none — no cert stored #}
+        <div id="cert-state-none">
+          <button type="button" class="btn btn-outline-secondary" id="btn-fetch-cert">
+            <i class="mdi mdi-certificate-outline"></i> Fetch Certificate
+          </button>
+          <span class="text-muted ms-2 small">Fetch the server's TLS certificate to enable SSL verification.</span>
+        </div>
+
+        {# STATE: fetching — spinner while AJAX runs #}
+        <div id="cert-state-fetching" style="display:none">
+          <span class="spinner-border spinner-border-sm text-secondary me-1" role="status"></span>
+          <span class="text-muted">Fetching certificate…</span>
+        </div>
+
+        {# STATE: panel — show cert details before trusting #}
+        <div id="cert-state-panel" style="display:none">
+          <table class="table table-sm table-bordered mb-3" style="max-width:600px">
+            <tbody>
+              <tr><th style="width:140px">Subject CN</th><td id="cp-subject-cn"></td></tr>
+              <tr><th>SANs</th><td id="cp-sans"></td></tr>
+              <tr><th>Issuer CN</th><td id="cp-issuer-cn"></td></tr>
+              <tr><th>Expires</th><td id="cp-expiry"></td></tr>
+              <tr><th>SHA-256</th><td class="font-monospace small" id="cp-fingerprint"></td></tr>
+            </tbody>
+          </table>
+          <button type="button" class="btn btn-success btn-sm" id="btn-trust-cert">
+            <i class="mdi mdi-check"></i> Trust This Certificate
+          </button>
+          <button type="button" class="btn btn-outline-secondary btn-sm ms-2" id="btn-cancel-fetch">
+            Cancel
+          </button>
+        </div>
+
+        {# STATE: staged — trusted but not yet saved to DB #}
+        <div id="cert-state-staged" style="display:none">
+          <i class="mdi mdi-check-circle-outline text-success"></i>
+          <strong>Certificate:</strong>
+          CN=<span id="cs-cn" class="text-success"></span>,
+          expires <span id="cs-expiry" class="text-success"></span>
+          <span class="badge text-bg-warning ms-1">Not saved</span>
+          <button type="button" class="btn btn-outline-secondary btn-sm ms-2" id="btn-replace-cert">Replace</button>
+          <button type="button" class="btn btn-outline-warning btn-sm ms-1" id="btn-revert-cert" style="display:none">
+            Revert to saved
+          </button>
+        </div>
+
+        {# STATE: stored — cert already in DB #}
+        <div id="cert-state-stored" style="display:none">
+          <i class="mdi mdi-check-circle-outline text-success"></i>
+          <strong>Certificate:</strong>
+          {% if stored_cert_cn %}CN={{ stored_cert_cn }}, {% endif %}expires {{ stored_cert_expiry|default:"—" }}
+          <button type="button" class="btn btn-outline-secondary btn-sm ms-2" id="btn-replace-stored">Replace</button>
+        </div>
+
+        <div id="cert-error" class="text-danger small mt-2" style="display:none"></div>
+
+      </div>
+    </div>
+  </div>
+
+  {# ------------------------------------------------------------------ #}
+  {# Test Connection widget                                              #}
+  {# ------------------------------------------------------------------ #}
+  <div class="field-group mb-5">
+    <div class="row">
+      <h2 class="col-9 offset-3">Test Connection</h2>
+    </div>
+    <div class="row mb-2">
+      <div class="col-9 offset-3">
+        <button type="button" class="btn btn-outline-primary" id="btn-test-conn">
+          <i class="mdi mdi-lan-connect"></i> Test Connection
+        </button>
+        <span id="test-conn-spinner" class="ms-2 d-none">
+          <span class="spinner-border spinner-border-sm text-secondary" role="status"></span>
+          <span class="text-muted">Testing…</span>
+        </span>
+        <span id="test-conn-result" class="ms-2"></span>
+      </div>
+    </div>
+  </div>
+
+  <script>
+  (function () {
+    'use strict';
+
+    var CERT_FETCH_URL = "{{ cert_fetch_url|escapejs }}";
+    var TEST_CONN_URL  = "{{ test_connection_url|escapejs }}";
+
+    var hiddenCert   = document.getElementById('id_ca_cert')
+                    || document.querySelector('[name="ca_cert"]');
+    var hiddenExpiry = document.getElementById('id_ca_cert_expiry')
+                    || document.querySelector('[name="ca_cert_expiry"]');
+    var origCert     = hiddenCert   ? hiddenCert.value   : '';
+    var origExpiry   = hiddenExpiry ? hiddenExpiry.value  : '';
+    var fetchedCert  = null;
+    var hasStoredCert = origCert.length > 0;
+
+    /* ---- State machine ---- */
+    function showState(name) {
+      ['none', 'fetching', 'panel', 'staged', 'stored'].forEach(function (s) {
+        var el = document.getElementById('cert-state-' + s);
+        if (el) el.style.display = (s === name) ? '' : 'none';
+      });
+      var err = document.getElementById('cert-error');
+      if (err) err.style.display = 'none';
+    }
+
+    function setError(msg) {
+      var err = document.getElementById('cert-error');
+      if (err) { err.textContent = msg; err.style.display = ''; }
+    }
+
+    function csrf() {
+      var tok = document.querySelector('[name="csrfmiddlewaretoken"]');
+      return tok ? tok.value : '';
+    }
+
+    function fieldVal(name) {
+      var el = document.getElementById('id_' + name)
+             || document.querySelector('[name="' + name + '"]');
+      if (!el) return '';
+      if (el.type === 'checkbox') return el.checked ? '1' : '0';
+      return el.value || '';
+    }
+
+    /* Initial state */
+    showState(hasStoredCert ? 'stored' : 'none');
+
+    function doFetch() {
+      showState('fetching');
+      var data = new URLSearchParams({
+        csrfmiddlewaretoken: csrf(),
+        hostname:  fieldVal('hostname'),
+        port:      fieldVal('port') || '443',
+        use_https: fieldVal('use_https'),
+      });
+      fetch(CERT_FETCH_URL, {
+        method: 'POST',
+        headers: {'X-CSRFToken': csrf()},
+        body: data,
+      })
+      .then(function (r) { return r.json(); })
+      .then(function (resp) {
+        if (!resp.ok) {
+          showState(hasStoredCert ? 'stored' : 'none');
+          setError(resp.message || 'Unknown error');
+          return;
+        }
+        fetchedCert = resp.cert_info;
+        document.getElementById('cp-subject-cn').textContent   = fetchedCert.subject_cn || '—';
+        document.getElementById('cp-sans').textContent         = (fetchedCert.sans || []).join(', ') || '—';
+        document.getElementById('cp-issuer-cn').textContent    = fetchedCert.issuer_cn || '—';
+        document.getElementById('cp-expiry').textContent       = fetchedCert.expiry_display || '—';
+        document.getElementById('cp-fingerprint').textContent  = fetchedCert.fingerprint || '—';
+        showState('panel');
+      })
+      .catch(function (err) {
+        showState(hasStoredCert ? 'stored' : 'none');
+        setError('Fetch failed: ' + err);
+      });
+    }
+
+    function wire(id, fn) {
+      var el = document.getElementById(id);
+      if (el) el.addEventListener('click', fn);
+    }
+
+    wire('btn-fetch-cert',     doFetch);
+    wire('btn-replace-cert',   doFetch);
+    wire('btn-replace-stored', doFetch);
+
+    wire('btn-cancel-fetch', function () {
+      fetchedCert = null;
+      showState(hasStoredCert ? 'stored' : 'none');
+    });
+
+    wire('btn-trust-cert', function () {
+      if (!fetchedCert) return;
+      if (hiddenCert)   hiddenCert.value   = fetchedCert.pem;
+      if (hiddenExpiry) hiddenExpiry.value = fetchedCert.expiry_iso;
+      document.getElementById('cs-cn').textContent     = fetchedCert.subject_cn || '—';
+      document.getElementById('cs-expiry').textContent = fetchedCert.expiry_display || '—';
+      var revertBtn = document.getElementById('btn-revert-cert');
+      if (revertBtn) revertBtn.style.display = hasStoredCert ? '' : 'none';
+      showState('staged');
+      fetchedCert = null;
+    });
+
+    wire('btn-revert-cert', function () {
+      if (hiddenCert)   hiddenCert.value   = origCert;
+      if (hiddenExpiry) hiddenExpiry.value = origExpiry;
+      showState(hasStoredCert ? 'stored' : 'none');
+    });
+
+    /* ---- Test Connection ---- */
+    var btnTest    = document.getElementById('btn-test-conn');
+    var resultEl   = document.getElementById('test-conn-result');
+    var spinnerEl  = document.getElementById('test-conn-spinner');
+
+    function escHtml(s) {
+      var d = document.createElement('div');
+      d.appendChild(document.createTextNode(String(s)));
+      return d.innerHTML;
+    }
+
+    if (btnTest) {
+      btnTest.addEventListener('click', function () {
+        resultEl.innerHTML = '';
+        spinnerEl.classList.remove('d-none');
+        btnTest.disabled = true;
+
+        var data = new URLSearchParams({
+          csrfmiddlewaretoken: csrf(),
+          hostname:   fieldVal('hostname'),
+          port:       fieldVal('port') || '443',
+          use_https:  fieldVal('use_https'),
+          api_key:    fieldVal('api_key'),
+          verify_ssl: fieldVal('verify_ssl'),
+          ca_cert:    hiddenCert ? hiddenCert.value : '',
+        });
+
+        fetch(TEST_CONN_URL, {
+          method: 'POST',
+          headers: {'X-CSRFToken': csrf()},
+          body: data,
+        })
+        .then(function (r) { return r.json(); })
+        .then(function (resp) {
+          spinnerEl.classList.add('d-none');
+          btnTest.disabled = false;
+          if (resp.ok) {
+            resultEl.innerHTML =
+              '<span class="text-success"><i class="mdi mdi-check-circle-outline"></i> ' +
+              escHtml(resp.message) + '</span>';
+          } else {
+            resultEl.innerHTML =
+              '<span class="text-danger"><i class="mdi mdi-alert-circle-outline"></i> ' +
+              escHtml(resp.message) + '</span>';
+          }
+        })
+        .catch(function (err) {
+          spinnerEl.classList.add('d-none');
+          btnTest.disabled = false;
+          resultEl.innerHTML =
+            '<span class="text-danger"><i class="mdi mdi-alert-circle-outline"></i> ' +
+            escHtml(String(err)) + '</span>';
+        });
+      });
+    }
+
+  }());
+  </script>
+
+{% endblock form %}
