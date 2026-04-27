@@ -57,6 +57,16 @@ class DHCPPluginSettings(models.Model):
             'pushed from NetBox to the DHCP server on save.'
         ),
     )
+    sync_active_scopes_only = models.BooleanField(
+        default=False,
+        verbose_name='Sync Active Scopes Only',
+        help_text=(
+            'When enabled, disabled/inactive scopes on the Windows DHCP server are ignored '
+            'during sync. Useful when migrating scopes between servers — disable the scope '
+            'on the old server and activate it on the new one to control which server NetBox '
+            'treats as authoritative.'
+        ),
+    )
     sync_interval = models.PositiveIntegerField(
         default=60,
         verbose_name='Sync Interval (minutes)',
@@ -232,6 +242,9 @@ class DHCPServer(NetBoxModel):
 
     def get_absolute_url(self):
         return reverse('plugins:netbox_windows_dhcp:dhcpserver', args=[self.pk])
+
+    def serialize_object(self, exclude=None):
+        return super().serialize_object(exclude=[*(exclude or []), 'last_sync_at', 'last_health_check'])
 
     @property
     def base_url(self):
@@ -554,6 +567,9 @@ class DHCPScope(NetBoxModel):
 
     def get_absolute_url(self):
         return reverse('plugins:netbox_windows_dhcp:dhcpscope', args=[self.pk])
+
+    def serialize_object(self, exclude=None):
+        return super().serialize_object(exclude=[*(exclude or []), 'last_sync_at'])
 
     @property
     def lease_lifetime_display(self) -> str:

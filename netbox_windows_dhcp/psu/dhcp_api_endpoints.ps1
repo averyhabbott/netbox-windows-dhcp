@@ -63,7 +63,7 @@ if ($PSVersionTable.PSEdition -eq 'Core') {
     Import-Module DhcpServer -ErrorAction Stop
 }
 
-$PSU_SCRIPT_VERSION = '1.0.1'
+$PSU_SCRIPT_VERSION = '1.0.2'
 
 function ConvertTo-ScopeObject {
     param([Microsoft.Management.Infrastructure.CimInstance]$Scope)
@@ -222,6 +222,9 @@ New-PSUEndpoint -Url '/api/dhcp/health' -Method POST @_epWrite -Endpoint ([scrip
 New-PSUEndpoint -Url '/api/dhcp/scopes' -Method GET @_epRead -Endpoint ([scriptblock]::Create($H + {
     try {
         $scopes = Get-DhcpServerv4Scope -ErrorAction Stop
+        if ($active_only -eq 'true') {
+            $scopes = $scopes | Where-Object { $_.State -eq 'Active' }
+        }
 
         # Build a map: scope_id -> failover_name so we can attach it without
         # an extra cmdlet call per scope.

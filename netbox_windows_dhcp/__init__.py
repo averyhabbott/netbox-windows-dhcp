@@ -5,6 +5,19 @@ from netbox.plugins import PluginConfig
 logger = logging.getLogger('netbox_windows_dhcp')
 
 
+def _create_service_user(sender, **kwargs):
+    """Create the DHCP-Sync-Service account if it doesn't exist. Idempotent."""
+    try:
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+        User.objects.get_or_create(
+            username='DHCP-Sync-Service',
+            defaults={'is_active': False},
+        )
+    except Exception as exc:
+        logger.warning(f'Could not create DHCP-Sync-Service user: {exc}')
+
+
 def _ensure_custom_fields(sender, **kwargs):
     """
     Create the dhcp_client_id custom field on IPAddress if it doesn't exist.
@@ -44,7 +57,7 @@ class NetBoxWindowsDHCPConfig(PluginConfig):
     name = 'netbox_windows_dhcp'
     verbose_name = 'Windows DHCP'
     description = 'Full integration with Windows DHCP Server via PowerShell Universal'
-    version = '1.3.1'
+    version = '1.3.2'
     author = 'Avery Abbott'
     author_email = 'averyhabbott@yahoo.com'
     base_url = 'windows-dhcp'
@@ -55,9 +68,10 @@ class NetBoxWindowsDHCPConfig(PluginConfig):
     def ready(self):
         super().ready()
         from django.db.models.signals import post_migrate
+        post_migrate.connect(_create_service_user, sender=self)
         post_migrate.connect(_ensure_custom_fields, sender=self)
         from . import signals  # noqa: F401
-        from . import background_tasks  # noqa: F401 — registers DHCPSyncJob with system_job scheduler
+        from . import background_tasks  # noqa: F401
 
 
 config = NetBoxWindowsDHCPConfig

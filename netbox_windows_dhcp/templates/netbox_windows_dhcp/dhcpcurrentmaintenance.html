@@ -34,40 +34,65 @@
 </div>
 
 {% if items %}
-<div class="card">
-  <div class="card-body p-0">
-    <table class="table table-hover mb-0">
-      <thead>
-        <tr>
-          <th>Type</th>
-          <th>Name</th>
-          <th>Notes</th>
-          <th>Enabled By</th>
-          <th>Enabled At</th>
-          <th>Health</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for item in items %}
-        <tr>
-          <td><span class="badge {{ item.type_class }}">{{ item.type }}</span></td>
-          <td><a href="{{ item.url }}">{{ item.object }}</a></td>
-          <td>{% if item.notes %}<em class="small">{{ item.notes }}</em>{% else %}<span class="text-muted">—</span>{% endif %}</td>
-          <td>{% if item.enabled_by %}{{ item.enabled_by }}{% else %}<span class="text-muted">—</span>{% endif %}</td>
-          <td>{% if item.enabled_at %}{{ item.enabled_at|date:"N j, Y H:i" }}{% else %}<span class="text-muted">—</span>{% endif %}</td>
-          <td>
-            {% if item.health_status %}
-            <span class="badge {{ item.health_class }}">{{ item.health_status|title }}</span>
-            {% else %}
-            <span class="text-muted">—</span>
-            {% endif %}
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
+<form method="post" action="{% url 'plugins:netbox_windows_dhcp:current_maintenance_bulk_disable' %}">
+  {% csrf_token %}
+
+  <div class="mb-2 d-flex gap-2 align-items-center">
+    <button type="submit" class="btn btn-sm btn-success">
+      <i class="mdi mdi-play-circle-outline"></i> Resume Selected
+    </button>
   </div>
-</div>
+
+  <div class="card">
+    <div class="card-body p-0">
+      <table class="table table-hover mb-0">
+        <thead>
+          <tr>
+            <th style="width:30px;"><input type="checkbox" id="select-all"></th>
+            <th>Type</th>
+            <th>Name</th>
+            <th>Notes</th>
+            <th>Enabled By</th>
+            <th>Enabled At</th>
+            <th>Health</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for item in items %}
+          <tr>
+            <td><input type="checkbox" name="selected" value="{{ item.type|lower }}:{{ item.object.pk }}"></td>
+            <td><span class="badge {{ item.type_class }}">{{ item.type }}</span></td>
+            <td><a href="{{ item.url }}">{{ item.object }}</a></td>
+            <td>{% if item.notes %}<em class="small">{{ item.notes }}</em>{% else %}<span class="text-muted">—</span>{% endif %}</td>
+            <td>{% if item.enabled_by %}{{ item.enabled_by }}{% else %}<span class="text-muted">—</span>{% endif %}</td>
+            <td>{% if item.enabled_at %}{{ item.enabled_at|date:"N j, Y H:i" }}{% else %}<span class="text-muted">—</span>{% endif %}</td>
+            <td>
+              {% if item.health_status %}
+              <span class="badge {{ item.health_class }}">{{ item.health_status|title }}</span>
+              {% else %}
+              <span class="text-muted">—</span>
+              {% endif %}
+            </td>
+            <td>
+              <button type="submit" name="selected" value="{{ item.type|lower }}:{{ item.object.pk }}"
+                      class="btn btn-sm btn-success" title="Resume">
+                <i class="mdi mdi-play-circle-outline"></i>
+              </button>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</form>
+
+<script>
+document.getElementById('select-all').addEventListener('change', function() {
+  document.querySelectorAll('input[name=selected]').forEach(cb => cb.checked = this.checked);
+});
+</script>
 {% else %}
 <div class="alert alert-success">
   <i class="mdi mdi-check-circle-outline"></i>

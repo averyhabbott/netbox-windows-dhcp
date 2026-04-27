@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.2] - 2026-04-27
+
+### Added
+
+- **Sync Active Scopes Only** — New plugin setting that instructs PSU to filter out inactive/disabled DHCP scopes before returning them to NetBox. Useful during server migrations when the replacement server has scopes in an inactive state that should not yet be managed by NetBox. PSU script updated to support `?active_only=true` query parameter on `GET /api/dhcp/scopes`. PSU script version bumped to `1.0.2`.
+- **Resume from Current Maintenance** — The **Current Maintenance** screen now has per-row **Resume** buttons and a **Resume Selected** bulk action. Maintenance can be disabled for any mix of servers, failovers, and scopes directly from the dashboard without navigating to each object.
+
+### Fixed
+
+- **Duplicate scheduled sync jobs** — Removed `@system_job` decorator from `DHCPSyncJob`. The decorator caused the worker to enqueue a new null-user job chain on every restart, accumulating zombie entries in the jobs list. The sync chain is now entirely self-perpetuating: successor jobs are enqueued at the top of `run()` before any sync work, anchored to when the job started, with `job.interval` immediately nulled to prevent `handle()`'s built-in auto-reschedule from also firing.
+- **Spurious changelog entries on every sync** — `last_sync_at` (server and scope) and `last_sync_error` (server) are now written via `QuerySet.update()` instead of `.save()`, bypassing Django's `post_save` signal entirely. Previously, every sync run generated an "Updated — No Changes" changelog entry for every scope and server touched, even when nothing actually changed. `last_health_check` on `DHCPServer` is additionally excluded from changelog diffs via `serialize_object()`.
+- **Sync job user attribution** — Scheduled sync jobs in the perpetual chain now run as `DHCP-Sync-Service`. The first job in the chain (enqueued when you save the schedule) retains the triggering user's name; all successors are attributed to the service account, correctly reflecting that they are automated rather than human-initiated.
+- **`DHCP-Sync-Service` account auto-created** — The plugin now creates an inactive `DHCP-Sync-Service` NetBox user account via the `post_migrate` signal. This account is used to attribute all sync-driven changelog entries, making automated changes clearly distinguishable from human edits in the audit trail.
+
+---
+
 ## [1.3.1] - 2026-04-27
 
 ### Fixed

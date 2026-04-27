@@ -947,6 +947,41 @@ class DHCPCurrentMaintenanceView(LoginRequiredMixin, View):
         })
 
 
+class DHCPCurrentMaintenanceBulkDisableView(LoginRequiredMixin, View):
+    """Disable maintenance on any mix of servers, failovers, and scopes in one POST."""
+
+    def post(self, request):
+        from .models import DHCPScope
+        selected = request.POST.getlist('selected')
+        if not selected:
+            messages.warning(request, 'No items selected.')
+            return redirect('plugins:netbox_windows_dhcp:current_maintenance')
+
+        type_perm_map = {
+            'server':   ('netbox_windows_dhcp.change_dhcpserver',   DHCPServer),
+            'failover': ('netbox_windows_dhcp.change_dhcpfailover', DHCPFailover),
+            'scope':    ('netbox_windows_dhcp.change_dhcpscope',    DHCPScope),
+        }
+
+        disabled = 0
+        for item_id in selected:
+            try:
+                type_name, pk = item_id.split(':', 1)
+                perm, model_cls = type_perm_map[type_name]
+            except (ValueError, KeyError):
+                continue
+            if not request.user.has_perm(perm):
+                messages.error(request, f'You do not have permission to modify {type_name} maintenance settings.')
+                continue
+            obj = get_object_or_404(model_cls, pk=pk)
+            _apply_maintenance(obj, enabled=False, notes='', user=request.user)
+            disabled += 1
+
+        if disabled:
+            messages.success(request, f'Maintenance disabled for {disabled} item(s).')
+        return redirect('plugins:netbox_windows_dhcp:current_maintenance')
+
+
 # ---------------------------------------------------------------------------
 # Settings view helpers
 # ---------------------------------------------------------------------------

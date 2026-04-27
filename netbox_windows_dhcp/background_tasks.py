@@ -22,29 +22,40 @@ import uuid
 from contextlib import contextmanager
 from typing import Optional
 
-from core.choices import JobIntervalChoices
-from netbox.jobs import JobRunner, system_job
+from netbox.jobs import JobRunner
 
 logger = logging.getLogger('netbox_windows_dhcp')
 
 
 @contextmanager
-def _change_logging(user):
+def _change_logging():
     """
-    Set current_request so that NetBox's post_save signal handler creates ObjectChange records.
+    Set current_request so that NetBox's post_save signal handler creates ObjectChange records
+    attributed to the DHCP-Sync-Service account.
 
-    NetBox's handle_changed_object (core/signals.py) returns immediately if current_request
-    is None, which is always the case in background jobs because JobRunner.handle() never
-    sets up the request context that middleware would normally provide.
+    Always uses the service account regardless of who triggered the job, so that sync-driven
+    changes are clearly distinguished from human edits in the audit trail. NetBox's
+    handle_changed_object (core/signals.py) returns immediately if current_request is None,
+    which is always the case in background jobs — this context manager provides the fake
+    request that enables change logging.
     """
+    from django.contrib.auth import get_user_model
     from netbox.context import current_request
+
+    User = get_user_model()
+    try:
+        service_user = User.objects.get(username='DHCP-Sync-Service')
+    except User.DoesNotExist:
+        # Service account not yet created (e.g. before first migrate). Skip rather than crash.
+        yield
+        return
 
     class _FakeRequest:
         def __init__(self, user):
             self.user = user
             self.id = uuid.uuid4()
 
-    token = current_request.set(_FakeRequest(user))
+    token = current_request.set(_FakeRequest(service_user))
     try:
         yield
     finally:
@@ -571,7 +582,8 @@ def _push_scope(job_logger, client, scope, remote=None, scope_id: Optional[str] 
 
 
 def _sync_server(job_logger, server, sync_ip_addresses: bool, push_reservations: bool,
-                 push_scope_info: bool, protect_tag: str = '', update_client_id: bool = False,
+                 push_scope_info: bool, sync_active_scopes_only: bool = False,
+                 protect_tag: str = '', update_client_id: bool = False,
                  lease_status: str = 'dhcp', reservation_status: str = 'reserved',
                  fallback_failover_ids=None, protected_prefix_networks=frozenset()):
     """
@@ -612,7 +624,7 @@ def _sync_server(job_logger, server, sync_ip_addresses: bool, push_reservations:
     client = PSUClient(server)
 
     try:
-        remote_scopes = client.list_scopes()
+        remote_scopes = client.list_scopes(active_only=sync_active_scopes_only)
     except PSUClientError as exc:
         job_logger.error(f'Failed to fetch scopes from {server.name}: {exc}')
         return
@@ -746,8 +758,7 @@ def _sync_server(job_logger, server, sync_ip_addresses: bool, push_reservations:
             _pull_scope_attributes(job_logger, scope, remote)
             _pull_exclusions(job_logger, client, scope, scope_id)
 
-        scope.last_sync_at = timezone.now()
-        scope.save(update_fields=['last_sync_at'])
+        DHCPScope.objects.filter(pk=scope.pk).update(last_sync_at=timezone.now())
 
     # Handle local scopes that have no matching remote scope on this server.
     # Only consider scopes linked to this server via their failover relationship.
@@ -782,16 +793,16 @@ def _sync_server(job_logger, server, sync_ip_addresses: bool, push_reservations:
             except Exception as exc:
                 job_logger.warning(f'Failed to delete scope "{scope.name}" ({network}): {exc}')
 
-    server.last_sync_at = timezone.now()
-    server.last_sync_error = ''
-    server.save(update_fields=['last_sync_at', 'last_sync_error'])
+    DHCPServer.objects.filter(pk=server.pk).update(
+        last_sync_at=timezone.now(),
+        last_sync_error='',
+    )
 
 
 # ---------------------------------------------------------------------------
 # Job classes
 # ---------------------------------------------------------------------------
 
-@system_job(interval=JobIntervalChoices.INTERVAL_HOURLY)
 class DHCPSyncJob(JobRunner):
     """Synchronise all DHCP servers with NetBox."""
 
@@ -809,153 +820,156 @@ class DHCPSyncJob(JobRunner):
 
         start_time = timezone.now()
 
+        # Enqueue the successor immediately, anchored to when this run started,
+        # before any sync work that could throw. Null out job.interval first so
+        # handle()'s built-in finally never also fires.
+        _cfg = _load_settings()
+        self.job.interval = None
+        self.job.save(update_fields=['interval'])
+        from django.contrib.auth import get_user_model
+        _User = get_user_model()
         try:
-            from .api_client import PSUClient, PSUClientError
-            from .constants import PSU_SCRIPT_VERSION
-            from .models import DHCPFailover, DHCPServer
+            _service_user = _User.objects.get(username='DHCP-Sync-Service')
+        except _User.DoesNotExist:
+            _service_user = self.job.user
+        DHCPSyncJob.enqueue(
+            user=_service_user,
+            schedule_at=start_time + timedelta(minutes=_cfg.sync_interval),
+            interval=_cfg.sync_interval,
+            queue_name=_cfg.sync_queue,
+        )
 
-            servers = list(DHCPServer.objects.all())
-            if not servers:
-                self.logger.info('No DHCP servers configured — nothing to sync.')
-                return
+        from .api_client import PSUClient, PSUClientError
+        from .constants import PSU_SCRIPT_VERSION
+        from .models import DHCPFailover, DHCPServer
 
-            cfg = _load_settings()
-            sync_ip_addresses = cfg.sync_ip_addresses
-            push_reservations = cfg.push_reservations
-            push_scope_info = cfg.push_scope_info
-            protect_tag = cfg.sync_protect_tag.slug if cfg.sync_protect_tag_id else ''
-            update_client_id = cfg.sync_protect_update_client_id
-            lease_status = cfg.lease_status
-            reservation_status = cfg.reservation_status
+        servers = list(DHCPServer.objects.all())
+        if not servers:
+            self.logger.info('No DHCP servers configured — nothing to sync.')
+            return
 
-            # Build protected prefix networks set for inheritance checking.
-            protected_prefix_networks = set()
-            if cfg.sync_protect_tag_id:
-                import ipaddress as _ipmod
-                from ipam.models import Prefix as _Prefix
-                for p in _Prefix.objects.filter(tags__slug=protect_tag):
-                    try:
-                        protected_prefix_networks.add(
-                            _ipmod.ip_network(str(p.prefix), strict=False)
-                        )
-                    except ValueError:
-                        pass
-                if protected_prefix_networks:
-                    self.logger.info(
-                        f'Loaded {len(protected_prefix_networks)} protected prefix(es) '
-                        f'via tag {protect_tag!r}'
+        cfg = _load_settings()
+        sync_ip_addresses = cfg.sync_ip_addresses
+        push_reservations = cfg.push_reservations
+        push_scope_info = cfg.push_scope_info
+        sync_active_scopes_only = cfg.sync_active_scopes_only
+        protect_tag = cfg.sync_protect_tag.slug if cfg.sync_protect_tag_id else ''
+        update_client_id = cfg.sync_protect_update_client_id
+        lease_status = cfg.lease_status
+        reservation_status = cfg.reservation_status
+
+        # Build protected prefix networks set for inheritance checking.
+        protected_prefix_networks = set()
+        if cfg.sync_protect_tag_id:
+            import ipaddress as _ipmod
+            from ipam.models import Prefix as _Prefix
+            for p in _Prefix.objects.filter(tags__slug=protect_tag):
+                try:
+                    protected_prefix_networks.add(
+                        _ipmod.ip_network(str(p.prefix), strict=False)
                     )
+                except ValueError:
+                    pass
+            if protected_prefix_networks:
+                self.logger.info(
+                    f'Loaded {len(protected_prefix_networks)} protected prefix(es) '
+                    f'via tag {protect_tag!r}'
+                )
 
-            self.logger.info(
-                f'Starting DHCP sync: sync_ip_addresses={sync_ip_addresses} '
-                f'push_reservations={push_reservations} push_scope_info={push_scope_info} '
-                f'protect_tag={protect_tag!r} update_client_id={update_client_id} '
-                f'lease_status={lease_status!r} reservation_status={reservation_status!r}'
+        self.logger.info(
+            f'Starting DHCP sync: sync_ip_addresses={sync_ip_addresses} '
+            f'push_reservations={push_reservations} push_scope_info={push_scope_info} '
+            f'sync_active_scopes_only={sync_active_scopes_only} '
+            f'protect_tag={protect_tag!r} update_client_id={update_client_id} '
+            f'lease_status={lease_status!r} reservation_status={reservation_status!r}'
+        )
+
+        # ── Health check phase ─────────────────────────────────────────
+        self.logger.info('=== Health Check Phase ===')
+        now = timezone.now()
+        for server in servers:
+            if server.maintenance_mode:
+                self.logger.info(f'Server {server.name}: health check skipped (maintenance mode)')
+                continue
+            try:
+                result = PSUClient(server).ping_read()
+                version = result.get('version', '')
+                server.health_status = DHCPServer.HEALTH_HEALTHY
+                server.last_health_check = now
+                server.health_error = ''
+                server.psu_script_version = version
+                server.save(update_fields=[
+                    'health_status', 'last_health_check', 'health_error', 'psu_script_version'
+                ])
+                if version and version != PSU_SCRIPT_VERSION:
+                    self.logger.warning(
+                        f'Server {server.name}: PSU script version mismatch '
+                        f'(expected {PSU_SCRIPT_VERSION}, got {version})'
+                    )
+                else:
+                    self.logger.info(f'Server {server.name}: healthy (PSU script v{version or "unknown"})')
+            except PSUClientError as exc:
+                server.health_status = DHCPServer.HEALTH_UNREACHABLE
+                server.last_health_check = now
+                server.health_error = str(exc)
+                server.save(update_fields=['health_status', 'last_health_check', 'health_error'])
+                self.logger.warning(f'Server {server.name}: unreachable — {exc}')
+
+        # Reload so health_status is fresh for fallback map logic.
+        server_map = {s.pk: s for s in DHCPServer.objects.all()}
+
+        # ── Build secondary fallback map ───────────────────────────────
+        # failover_pk → secondary server that should handle it as fallback.
+        fallback_map = {}
+        for failover in DHCPFailover.objects.select_related('primary_server', 'secondary_server'):
+            primary = server_map.get(failover.primary_server_id)
+            secondary = server_map.get(failover.secondary_server_id)
+            if not primary or not secondary:
+                continue
+            primary_down = (
+                primary.maintenance_mode
+                or primary.health_status == DHCPServer.HEALTH_UNREACHABLE
             )
+            secondary_ok = (
+                not secondary.maintenance_mode
+                and secondary.health_status == DHCPServer.HEALTH_HEALTHY
+            )
+            if primary_down and secondary_ok:
+                fallback_map[failover.pk] = secondary
+                self.logger.info(
+                    f'Failover "{failover.name}": primary {primary.name} is down — '
+                    f'routing through secondary {secondary.name}'
+                )
 
-            # ── Health check phase ─────────────────────────────────────────
-            self.logger.info('=== Health Check Phase ===')
-            now = timezone.now()
-            for server in servers:
+        # ── Sync phase ─────────────────────────────────────────────────
+        self.logger.info('=== Sync Phase ===')
+
+        # Determine which fallback failovers each server should handle.
+        # key: server_pk → set of fallback failover PKs
+        server_fallbacks: dict = {s.pk: set() for s in server_map.values()}
+        for failover_pk, secondary in fallback_map.items():
+            server_fallbacks[secondary.pk].add(failover_pk)
+
+        with _change_logging():
+            for server in server_map.values():
                 if server.maintenance_mode:
-                    self.logger.info(f'Server {server.name}: health check skipped (maintenance mode)')
+                    self.logger.info(f'Skipping server {server.name}: maintenance mode enabled')
+                    continue
+                if server.health_status == DHCPServer.HEALTH_UNREACHABLE:
+                    self.logger.info(f'Skipping server {server.name}: unreachable')
                     continue
                 try:
-                    result = PSUClient(server).ping_read()
-                    version = result.get('version', '')
-                    server.health_status = DHCPServer.HEALTH_HEALTHY
-                    server.last_health_check = now
-                    server.health_error = ''
-                    server.psu_script_version = version
-                    server.save(update_fields=[
-                        'health_status', 'last_health_check', 'health_error', 'psu_script_version'
-                    ])
-                    if version and version != PSU_SCRIPT_VERSION:
-                        self.logger.warning(
-                            f'Server {server.name}: PSU script version mismatch '
-                            f'(expected {PSU_SCRIPT_VERSION}, got {version})'
-                        )
-                    else:
-                        self.logger.info(f'Server {server.name}: healthy (PSU script v{version or "unknown"})')
-                except PSUClientError as exc:
-                    server.health_status = DHCPServer.HEALTH_UNREACHABLE
-                    server.last_health_check = now
-                    server.health_error = str(exc)
-                    server.save(update_fields=['health_status', 'last_health_check', 'health_error'])
-                    self.logger.warning(f'Server {server.name}: unreachable — {exc}')
-
-            # Reload so health_status is fresh for fallback map logic.
-            server_map = {s.pk: s for s in DHCPServer.objects.all()}
-
-            # ── Build secondary fallback map ───────────────────────────────
-            # failover_pk → secondary server that should handle it as fallback.
-            fallback_map = {}
-            for failover in DHCPFailover.objects.select_related('primary_server', 'secondary_server'):
-                primary = server_map.get(failover.primary_server_id)
-                secondary = server_map.get(failover.secondary_server_id)
-                if not primary or not secondary:
-                    continue
-                primary_down = (
-                    primary.maintenance_mode
-                    or primary.health_status == DHCPServer.HEALTH_UNREACHABLE
-                )
-                secondary_ok = (
-                    not secondary.maintenance_mode
-                    and secondary.health_status == DHCPServer.HEALTH_HEALTHY
-                )
-                if primary_down and secondary_ok:
-                    fallback_map[failover.pk] = secondary
-                    self.logger.info(
-                        f'Failover "{failover.name}": primary {primary.name} is down — '
-                        f'routing through secondary {secondary.name}'
+                    _sync_server(
+                        self.logger, server, sync_ip_addresses, push_reservations, push_scope_info,
+                        sync_active_scopes_only=sync_active_scopes_only,
+                        protect_tag=protect_tag, update_client_id=update_client_id,
+                        lease_status=lease_status, reservation_status=reservation_status,
+                        fallback_failover_ids=server_fallbacks[server.pk],
+                        protected_prefix_networks=protected_prefix_networks,
                     )
-
-            # ── Sync phase ─────────────────────────────────────────────────
-            self.logger.info('=== Sync Phase ===')
-
-            # Determine which fallback failovers each server should handle.
-            # key: server_pk → set of fallback failover PKs
-            server_fallbacks: dict = {s.pk: set() for s in server_map.values()}
-            for failover_pk, secondary in fallback_map.items():
-                server_fallbacks[secondary.pk].add(failover_pk)
-
-            with _change_logging(self.job.user):
-                for server in server_map.values():
-                    if server.maintenance_mode:
-                        self.logger.info(f'Skipping server {server.name}: maintenance mode enabled')
-                        continue
-                    if server.health_status == DHCPServer.HEALTH_UNREACHABLE:
-                        self.logger.info(f'Skipping server {server.name}: unreachable')
-                        continue
-                    try:
-                        _sync_server(
-                            self.logger, server, sync_ip_addresses, push_reservations, push_scope_info,
-                            protect_tag=protect_tag, update_client_id=update_client_id,
-                            lease_status=lease_status, reservation_status=reservation_status,
-                            fallback_failover_ids=server_fallbacks[server.pk],
-                            protected_prefix_networks=protected_prefix_networks,
-                        )
-                    except Exception as exc:
-                        self.logger.error(f'Error syncing server {server.name}: {exc}')
-                        server.last_sync_error = str(exc)
-                        server.save(update_fields=['last_sync_error'])
-
-        finally:
-            # Re-read settings so the interval reflects any changes made since this run started.
-            cfg = _load_settings()
-            interval = cfg.sync_interval
-
-            # Suppress NetBox's default auto-reschedule (which anchors to completion time).
-            # We manually enqueue the next run anchored to start_time to prevent drift.
-            self.job.interval = None
-            self.job.save(update_fields=['interval'])
-
-            DHCPSyncJob.enqueue(
-                user=self.job.user,
-                schedule_at=start_time + timedelta(minutes=interval),
-                interval=interval,
-                queue_name=cfg.sync_queue,
-            )
+                except Exception as exc:
+                    self.logger.error(f'Error syncing server {server.name}: {exc}')
+                    DHCPServer.objects.filter(pk=server.pk).update(last_sync_error=str(exc))
 
 
 class DHCPServerSyncJob(JobRunner):
@@ -1024,10 +1038,11 @@ class DHCPServerSyncJob(JobRunner):
                     )
                 except ValueError:
                     pass
-        with _change_logging(self.job.user):
+        with _change_logging():
             _sync_server(
                 self.logger, server,
                 cfg.sync_ip_addresses, cfg.push_reservations, cfg.push_scope_info,
+                sync_active_scopes_only=cfg.sync_active_scopes_only,
                 protect_tag=protect_tag,
                 update_client_id=cfg.sync_protect_update_client_id,
                 lease_status=cfg.lease_status,
@@ -1058,7 +1073,7 @@ class DHCPImportJob(JobRunner):
 
         from .import_logic import run_import
         self.logger.info(f'Starting import from {server.name} ({server.hostname})')
-        with _change_logging(self.job.user):
+        with _change_logging():
             results = run_import(server)
 
         category_labels = {

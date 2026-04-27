@@ -129,6 +129,7 @@ Go to **Windows DHCP → Admin → Settings** to configure:
 | Sync IP Addresses from Leases & Reservations | When checked, pull leases and reservations and create/update/delete NetBox IP Address records. When unchecked, sync scope config only. |
 | Push Reservations to DHCP Server | Push NetBox IPs with the configured reservation status to the DHCP server as reservations |
 | Push Scope Info to DHCP Server | Push scope config changes from NetBox to the DHCP server |
+| Sync Active Scopes Only | When checked, only scopes with **State: Active** on the DHCP server are pulled during sync. Inactive/disabled scopes are ignored. Useful during server migrations when the replacement server has scopes in an inactive state that should not yet be managed by NetBox. |
 | Create Missing Prefixes on Import | When checked (default), importing a scope whose CIDR does not exist in NetBox automatically creates the Prefix. Uncheck if Prefixes are managed by another source. |
 | Sync Interval (minutes) | How often the background sync runs (5–1440) |
 | Sync Job Queue | Worker queue priority (`High` / `Default` / `Low`) used for all sync and import background jobs. Default: `Default`. |
@@ -257,7 +258,7 @@ New IP Addresses are created using the prefix length of the associated scope's N
 
 The `dhcp_client_id` custom field (auto-registered on IP Address) stores the client MAC address in Windows DHCP hyphen-separated format (`00-11-22-33-44-55`).
 
-All IP Address creates and updates are recorded in the NetBox changelog, attributed to the user who queued the sync job. DHCP lease metadata (lease hostname, active status, expiration) is stored in a separate non-changelog side-table (`DHCPLeaseInfo`) and displayed on the IP Address detail page — these updates do not generate changelog entries.
+All IP Address creates and updates are recorded in the NetBox changelog, attributed to the `DHCP-Sync-Service` account (auto-created on first `migrate`). This makes sync-driven changes clearly distinguishable from human edits in the audit trail. DHCP lease metadata (lease hostname, active status, expiration) is stored in a separate non-changelog side-table (`DHCPLeaseInfo`) and displayed on the IP Address detail page — these updates do not generate changelog entries.
 
 **Cleanup (stale record removal):**
 
@@ -324,7 +325,7 @@ Maintenance mode stores when it was enabled and by which user. A **Notes** field
 
 ### Current Maintenance view
 
-**Windows DHCP → Admin → Current Maintenance** shows a combined table of every object currently in maintenance mode across all three types — sorted by enabled time, filterable by type. Use this as a dashboard to see what is paused before triggering a sync.
+**Windows DHCP → Admin → Current Maintenance** shows a combined table of every object currently in maintenance mode across all three types — sorted by enabled time, filterable by type. Use this as a dashboard to see what is paused before triggering a sync. Each row has a **Resume** button to disable maintenance inline; select multiple rows and click **Resume Selected** to bulk-disable across object types in one action.
 
 ## Sync-Protected IPs
 
@@ -374,7 +375,7 @@ The plugin expects PowerShell Universal **v5.x** (tested on 5.6.11+) on each DHC
 
 | Method | Path | Description |
 | --- | --- | --- |
-| GET | `/api/dhcp/scopes` | List all scopes (includes router and failover name) |
+| GET | `/api/dhcp/scopes[?active_only=true]` | List all scopes (includes router and failover name); pass `active_only=true` to exclude inactive/disabled scopes |
 | GET | `/api/dhcp/scopes/:scope_id` | Get a single scope |
 | POST | `/api/dhcp/scopes` | Create a scope |
 | PUT | `/api/dhcp/scopes/:scope_id` | Update a scope |

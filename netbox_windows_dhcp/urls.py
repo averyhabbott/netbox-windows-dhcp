@@ -105,6 +105,7 @@ urlpatterns = [
     # Current Maintenance (combined view)
     # -----------------------------------------------------------------------
     path('maintenance/', views.DHCPCurrentMaintenanceView.as_view(), name='current_maintenance'),
+    path('maintenance/disable/', views.DHCPCurrentMaintenanceBulkDisableView.as_view(), name='current_maintenance_bulk_disable'),
 
     # -----------------------------------------------------------------------
     # Settings

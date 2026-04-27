@@ -197,9 +197,10 @@ class PSUClient:
     # Scopes
     # ------------------------------------------------------------------
 
-    def list_scopes(self) -> List[Dict]:
+    def list_scopes(self, active_only: bool = False) -> List[Dict]:
         """Return all DHCP scopes on this server."""
-        return self._get_list('scopes')
+        params = {'active_only': 'true'} if active_only else None
+        return self._get_list('scopes', params=params)
 
     def get_scope(self, scope_id: str) -> Dict:
         return self._get(f'scopes/{scope_id}')

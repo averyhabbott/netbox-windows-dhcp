@@ -530,6 +530,7 @@ class PluginSettingsForm(forms.ModelForm):
             'sync_ip_addresses',
             'push_reservations',
             'push_scope_info',
+            'sync_active_scopes_only',
             'create_missing_prefixes',
             'sync_interval',
             'sync_queue',

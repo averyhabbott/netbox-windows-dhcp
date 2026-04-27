@@ -191,7 +191,7 @@ URL path parameters (`:param`) and the `$Body` variable are injected automatical
 | --- | --- | --- |
 | GET | `/api/dhcp/health` | Health check — returns `{"status":"ok","version":"x.y.z"}` |
 | POST | `/api/dhcp/health` | Write health check — tests write access; returns `{"status":"ok"}` |
-| GET | `/api/dhcp/scopes` | List all scopes (includes `router` and `failover_name`) |
+| GET | `/api/dhcp/scopes[?active_only=true]` | List all scopes (includes `router` and `failover_name`); pass `active_only=true` to exclude inactive/disabled scopes |
 | GET | `/api/dhcp/scopes/:scope_id` | Get single scope by network address |
 | POST | `/api/dhcp/scopes` | Create a scope |
 | PUT | `/api/dhcp/scopes/:scope_id` | Update a scope |
