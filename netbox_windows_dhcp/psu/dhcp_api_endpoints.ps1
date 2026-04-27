@@ -57,9 +57,13 @@ $_epWrite = if ($RequireAuthentication) {
 # ===========================================================================
 
 $H = @'
-Import-Module DhcpServer -SkipEditionCheck -ErrorAction Stop
+if ($PSVersionTable.PSEdition -eq 'Core') {
+    Import-Module DhcpServer -SkipEditionCheck -ErrorAction Stop
+} else {
+    Import-Module DhcpServer -ErrorAction Stop
+}
 
-$PSU_SCRIPT_VERSION = '1.0.0'
+$PSU_SCRIPT_VERSION = '1.0.1'
 
 function ConvertTo-ScopeObject {
     param([Microsoft.Management.Infrastructure.CimInstance]$Scope)

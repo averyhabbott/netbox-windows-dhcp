@@ -303,7 +303,7 @@ The sync will never delete or overwrite the status or `dns_name` of a `reserved`
 
 ### Sync Now
 
-The **Sync Now** button on a server detail page enqueues a background sync job and redirects to the job status page. The full sync log is visible there. A **Sync All Servers** action is also available from the server list page.
+The **Sync Now** button on a server detail page enqueues a background sync job and redirects to the job status page. The full sync log is visible there.
 
 **Sync Now is blocked when maintenance mode is enabled** on a server — disable maintenance mode first. Sync continues normally for other servers.
 

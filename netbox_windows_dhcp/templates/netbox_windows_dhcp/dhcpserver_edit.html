@@ -5,6 +5,25 @@
   {{ block.super }}
 
   {# ------------------------------------------------------------------ #}
+  {# API key override notice                                             #}
+  {# ------------------------------------------------------------------ #}
+  {% if has_api_key_override %}
+  <script>
+  (function () {
+    var el = document.getElementById('id_api_key') || document.querySelector('[name="api_key"]');
+    if (el) {
+      el.disabled = true;
+      el.placeholder = '(overridden by PLUGINS_CONFIG)';
+      var note = document.createElement('div');
+      note.className = 'form-text text-warning mt-1';
+      note.innerHTML = '<i class="mdi mdi-information-outline"></i> The API key for this server is overridden by <code>PLUGINS_CONFIG[\'netbox_windows_dhcp\'][\'server_overrides\']</code> in <code>configuration.py</code>.';
+      el.closest('.mb-3') ? el.closest('.mb-3').appendChild(note) : el.parentNode.appendChild(note);
+    }
+  }());
+  </script>
+  {% endif %}
+
+  {# ------------------------------------------------------------------ #}
   {# CA Certificate widget                                               #}
   {# ------------------------------------------------------------------ #}
   <div class="field-group mb-5">

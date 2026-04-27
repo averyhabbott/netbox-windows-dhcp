@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.1] - 2026-04-27
+
+### Fixed
+
+- `Import-Module DhcpServer -SkipEditionCheck` now only runs on PowerShell 7+ (Core edition). The `-SkipEditionCheck` parameter does not exist in Windows PowerShell 5.1 (Desktop edition) and caused a parameter error during the health check after **Update PSU Scripts** on servers running PS 5.1. Both editions now load `DhcpServer` correctly. Remote scripts version bumped to `1.0.1`.
+
+### Changed
+
+- Authentication is now always enforced on all PSU endpoints. Since `dhcp_api_endpoints.ps1` is bundled in the Python package (as of 1.3.0) and deployed via **Update PSU Scripts**, it can no longer be edited in place to disable authentication. An App Token is required on every server.
+- Removed "Leave blank if auth is not required" hint from the App Token field on the server edit form.
+
+---
+
 ## [1.3.0] - 2026-04-26
 
 ### Added
@@ -98,4 +111,4 @@ Initial release.
 - Sync-protected tag to prevent sync from modifying specific IP Addresses
 - DHCP lease info panel injected into NetBox IP Address detail view
 - DHCP scopes panel injected into NetBox Prefix detail view
-- PowerShell Universal v5 API script (`psu/dhcp_api_endpoints.ps1`)
+- PowerShell Universal v5 API script (`dhcp_api_endpoints.ps1`)

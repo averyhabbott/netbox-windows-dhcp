@@ -145,6 +145,7 @@ class DHCPServerCreateView(generic.ObjectEditView):
             'test_connection_url': reverse('plugins:netbox_windows_dhcp:dhcpserver_test_connection_new'),
             'stored_cert_cn': '',
             'stored_cert_expiry': '',
+            'has_api_key_override': False,
         }
 
 
@@ -154,6 +155,7 @@ class DHCPServerEditView(generic.ObjectEditView):
     template_name = 'netbox_windows_dhcp/dhcpserver_edit.html'
 
     def get_extra_context(self, request, instance):
+        from django.conf import settings as django_settings
         from django.urls import reverse
         stored_cn = ''
         stored_expiry = ''
@@ -161,6 +163,14 @@ class DHCPServerEditView(generic.ObjectEditView):
             stored_cn = _cert_cn_from_pem(instance.ca_cert)
             if instance.ca_cert_expiry:
                 stored_expiry = instance.ca_cert_expiry.strftime('%B %-d, %Y')
+        has_api_key_override = bool(
+            instance.hostname and
+            getattr(django_settings, 'PLUGINS_CONFIG', {})
+            .get('netbox_windows_dhcp', {})
+            .get('server_overrides', {})
+            .get(instance.hostname, {})
+            .get('api_key')
+        )
         return {
             'cert_fetch_url': reverse('plugins:netbox_windows_dhcp:dhcpserver_cert_fetch'),
             'test_connection_url': reverse(
@@ -169,6 +179,7 @@ class DHCPServerEditView(generic.ObjectEditView):
             ),
             'stored_cert_cn': stored_cn,
             'stored_cert_expiry': stored_expiry,
+            'has_api_key_override': has_api_key_override,
         }
 
 

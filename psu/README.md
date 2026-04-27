@@ -162,7 +162,7 @@ If you prefer not to run `setup_roles.ps1`, create the roles and tokens through 
 2. Go to **Security → Tokens → + Create Application Token** for each role. Check **System Identity**, enter a name, set the **Role** field, and copy each token value — shown only once.
 3. In NetBox, paste the token into the **App Token** field on the DHCP Server object.
 
-**Disabling authentication:** Set `$RequireAuthentication = $false` at the top of `dhcp_api_endpoints.ps1`. Not recommended — any host that can reach the PSU port can read all DHCP data and make changes without credentials.
+**Disabling authentication:** Authentication is enforced in the bundled endpoint script (each endpoint uses `-Authentication` and `-Role`). Disabling it is not supported — any host that can reach the PSU port would be able to read all DHCP data and make changes without credentials.
 
 ## Script Architecture
 
