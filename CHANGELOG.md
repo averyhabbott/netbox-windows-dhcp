@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.3] - 2026-04-28
+
+### Fixed
+
+- **`NameError` on every successful sync** — `_sync_server()` referenced `DHCPServer` for the `QuerySet.update()` calls added in 1.3.2 without importing it. Every server that completed a full sync raised `NameError: name 'DHCPServer' is not defined`, caught as a false "Error syncing server X" entry in the job log. `last_sync_at` and `last_sync_error` were never updated. Fixed by adding `DHCPServer` to the existing import inside `_sync_server()`.
+- **Duplicate/multiplying scheduled sync job chains** — Any scheduled `DHCPSyncJob` left in the queue when a new chain started (e.g., after changing the sync interval from a large value, or after certain worker restarts) would perpetuate independently, multiplying the number of parallel chains on each restart. Fixed on two fronts: (1) `DHCPSyncJob.run()` now acquires the `job-schedules` advisory lock and cancels all other pending/scheduled sync jobs before enqueueing its successor, converging any number of chains to one on the next run; (2) `_apply_interval_to_job()` now deletes all extra pending/scheduled jobs (keeping only the earliest) when plugin settings are saved, preventing orphaned future jobs from being left in the queue after an interval change.
+
+---
+
 ## [1.3.2] - 2026-04-27
 
 ### Added

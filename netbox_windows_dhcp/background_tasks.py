@@ -593,7 +593,7 @@ def _sync_server(job_logger, server, sync_ip_addresses: bool, push_reservations:
     from django.utils import timezone
 
     from .api_client import PSUClient, PSUClientError
-    from .models import DHCPFailover, DHCPScope
+    from .models import DHCPFailover, DHCPScope, DHCPServer
 
     if server.maintenance_mode:
         job_logger.info(f'Skipping server {server.name}: maintenance mode enabled')
@@ -832,12 +832,22 @@ class DHCPSyncJob(JobRunner):
             _service_user = _User.objects.get(username='DHCP-Sync-Service')
         except _User.DoesNotExist:
             _service_user = self.job.user
-        DHCPSyncJob.enqueue(
-            user=_service_user,
-            schedule_at=start_time + timedelta(minutes=_cfg.sync_interval),
-            interval=_cfg.sync_interval,
-            queue_name=_cfg.sync_queue,
-        )
+        from core.choices import JobStatusChoices
+        from core.models import Job
+        from django_pglocks import advisory_lock
+        from netbox.constants import ADVISORY_LOCK_KEYS
+
+        with advisory_lock(ADVISORY_LOCK_KEYS['job-schedules']):
+            Job.objects.filter(
+                name=DHCPSyncJob.name,
+                status__in=[JobStatusChoices.STATUS_PENDING, JobStatusChoices.STATUS_SCHEDULED],
+            ).exclude(pk=self.job.pk).delete()
+            DHCPSyncJob.enqueue(
+                user=_service_user,
+                schedule_at=start_time + timedelta(minutes=_cfg.sync_interval),
+                interval=_cfg.sync_interval,
+                queue_name=_cfg.sync_queue,
+            )
 
         from .api_client import PSUClient, PSUClientError
         from .constants import PSU_SCRIPT_VERSION

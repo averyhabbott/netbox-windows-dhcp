@@ -1003,27 +1003,31 @@ def _get_next_sync_job():
 def _apply_interval_to_job(new_interval):
     """
     Update the interval (and reschedule datetime) on any existing scheduled/pending
-    DHCPSyncJob. Does nothing if no job exists.
+    DHCPSyncJob. Deletes all but the earliest job to collapse duplicate chains.
+    Does nothing if no job exists.
     """
     from core.models import Job
     from django.utils import timezone
     from datetime import timedelta
     from django.db.models import F
 
-    job = (
+    jobs = list(
         Job.objects.filter(name=SYNC_JOB_NAME, status__in=['scheduled', 'pending'])
         .order_by(F('scheduled').asc(nulls_last=True))
-        .first()
     )
-    if not job:
+    if not jobs:
         return
 
-    job.interval = new_interval
+    keep, *extras = jobs
+    if extras:
+        Job.objects.filter(pk__in=[j.pk for j in extras]).delete()
+
+    keep.interval = new_interval
     update_fields = ['interval']
-    if job.status == 'scheduled':
-        job.scheduled = timezone.now() + timedelta(minutes=new_interval)
+    if keep.status == 'scheduled':
+        keep.scheduled = timezone.now() + timedelta(minutes=new_interval)
         update_fields.append('scheduled')
-    job.save(update_fields=update_fields)
+    keep.save(update_fields=update_fields)
 
 
 # ---------------------------------------------------------------------------

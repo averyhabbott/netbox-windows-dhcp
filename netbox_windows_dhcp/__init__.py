@@ -57,7 +57,7 @@ class NetBoxWindowsDHCPConfig(PluginConfig):
     name = 'netbox_windows_dhcp'
     verbose_name = 'Windows DHCP'
     description = 'Full integration with Windows DHCP Server via PowerShell Universal'
-    version = '1.3.2'
+    version = '1.3.3'
     author = 'Avery Abbott'
     author_email = 'averyhabbott@yahoo.com'
     base_url = 'windows-dhcp'
