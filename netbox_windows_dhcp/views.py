@@ -1236,6 +1236,15 @@ class DHCPServerTestConnectionView(LoginRequiredMixin, View):
                 except DHCPServer.DoesNotExist:
                     pass
             if not api_key:
+                from django.conf import settings as django_settings
+                api_key = (
+                    getattr(django_settings, 'PLUGINS_CONFIG', {})
+                    .get('netbox_windows_dhcp', {})
+                    .get('server_overrides', {})
+                    .get(hostname, {})
+                    .get('api_key', '')
+                )
+            if not api_key:
                 return JsonResponse({'ok': False, 'message': 'API key required — enter an App Token in the field above'})
 
         try:
