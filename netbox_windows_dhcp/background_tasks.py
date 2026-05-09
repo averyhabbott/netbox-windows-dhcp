@@ -27,6 +27,25 @@ from netbox.jobs import JobRunner
 logger = logging.getLogger('netbox_windows_dhcp')
 
 
+class _WarnOnlyPropagator(logging.Handler):
+    """
+    Forwards only WARNING+ records from a per-job logger to the root logger.
+    Used to keep verbose per-scope INFO/DEBUG out of netbox.log while preserving
+    the in-UI job log (captured by NetBox's JobLogHandler at the source logger).
+    """
+
+    def emit(self, record):
+        if record.levelno >= logging.WARNING:
+            logging.getLogger().handle(record)
+
+
+def _quiet_file_log(job_logger):
+    """Disable propagation and add the WARNING+ forwarder, idempotently."""
+    job_logger.propagate = False
+    if not any(isinstance(h, _WarnOnlyPropagator) for h in job_logger.handlers):
+        job_logger.addHandler(_WarnOnlyPropagator())
+
+
 @contextmanager
 def _change_logging():
     """
@@ -813,17 +832,28 @@ class DHCPSyncJob(JobRunner):
             'via PowerShell Universal and updates NetBox IP Address objects.'
         )
 
+    def __init__(self, job):
+        super().__init__(job)
+        _quiet_file_log(self.logger)
+
     def run(self, *args, **kwargs):
+        import time
         from datetime import timedelta
 
+        from django.db import connection as _db_connection
         from django.utils import timezone
 
         start_time = timezone.now()
+        _job_start = time.monotonic()
+        run_errors: list = []
 
         # Enqueue the successor immediately, anchored to when this run started,
         # before any sync work that could throw. Null out job.interval first so
         # handle()'s built-in finally never also fires.
         _cfg = _load_settings()
+        # Align Django's per-connection CONN_MAX_AGE with the configured job
+        # timeout so the connection isn't recycled mid-job by close_old_connections().
+        _db_connection.settings_dict['CONN_MAX_AGE'] = _cfg.sync_job_timeout
         self.job.interval = None
         self.job.save(update_fields=['interval'])
         from django.contrib.auth import get_user_model
@@ -847,6 +877,7 @@ class DHCPSyncJob(JobRunner):
                 schedule_at=start_time + timedelta(minutes=_cfg.sync_interval),
                 interval=_cfg.sync_interval,
                 queue_name=_cfg.sync_queue,
+                job_timeout=_cfg.sync_job_timeout,
             )
 
         from .api_client import PSUClient, PSUClientError
@@ -924,6 +955,7 @@ class DHCPSyncJob(JobRunner):
                 server.health_error = str(exc)
                 server.save(update_fields=['health_status', 'last_health_check', 'health_error'])
                 self.logger.warning(f'Server {server.name}: unreachable — {exc}')
+                run_errors.append(f'{server.name} unreachable: {exc}')
 
         # Reload so health_status is fresh for fallback map logic.
         server_map = {s.pk: s for s in DHCPServer.objects.all()}
@@ -960,6 +992,8 @@ class DHCPSyncJob(JobRunner):
         for failover_pk, secondary in fallback_map.items():
             server_fallbacks[secondary.pk].add(failover_pk)
 
+        import signal
+
         with _change_logging():
             for server in server_map.values():
                 if server.maintenance_mode:
@@ -968,6 +1002,12 @@ class DHCPSyncJob(JobRunner):
                 if server.health_status == DHCPServer.HEALTH_UNREACHABLE:
                     self.logger.info(f'Skipping server {server.name}: unreachable')
                     continue
+                _remaining = signal.getitimer(signal.ITIMER_REAL)[0]
+                self.logger.info(
+                    f'Starting {server.name} — job elapsed: '
+                    f'{time.monotonic() - _job_start:.1f}s, '
+                    f'SIGALRM remaining: {_remaining:.1f}s'
+                )
                 try:
                     _sync_server(
                         self.logger, server, sync_ip_addresses, push_reservations, push_scope_info,
@@ -979,7 +1019,20 @@ class DHCPSyncJob(JobRunner):
                     )
                 except Exception as exc:
                     self.logger.error(f'Error syncing server {server.name}: {exc}')
-                    DHCPServer.objects.filter(pk=server.pk).update(last_sync_error=str(exc))
+                    try:
+                        DHCPServer.objects.filter(pk=server.pk).update(last_sync_error=str(exc))
+                    except Exception as db_exc:
+                        self.logger.error(
+                            f'Could not record sync error for {server.name} '
+                            f'({type(db_exc).__name__}): {db_exc}'
+                        )
+                    run_errors.append(f'{server.name} sync error: {exc}')
+
+        if run_errors:
+            from core.exceptions import JobFailed
+            self.job.error = '; '.join(run_errors)
+            self.job.save(update_fields=['error'])
+            raise JobFailed()
 
 
 class DHCPServerSyncJob(JobRunner):
@@ -989,17 +1042,27 @@ class DHCPServerSyncJob(JobRunner):
         name = 'Windows DHCP Server Sync'
         description = 'On-demand sync for a single Windows DHCP server.'
 
+    def __init__(self, job):
+        super().__init__(job)
+        _quiet_file_log(self.logger)
+
     def run(self, *args, **kwargs):
         server_pk = kwargs.get('server_pk')
         if not server_pk:
             self.logger.error('No server_pk provided to job.')
             return
 
+        from django.db import connection as _db_connection
         from django.utils import timezone
 
         from .api_client import PSUClient, PSUClientError
         from .constants import PSU_SCRIPT_VERSION
         from .models import DHCPServer
+
+        cfg = _load_settings()
+        # Align CONN_MAX_AGE with the configured job timeout so the connection
+        # isn't recycled mid-job by close_old_connections().
+        _db_connection.settings_dict['CONN_MAX_AGE'] = cfg.sync_job_timeout
 
         try:
             server = DHCPServer.objects.get(pk=server_pk)
@@ -1033,9 +1096,11 @@ class DHCPServerSyncJob(JobRunner):
             server.health_error = str(exc)
             server.save(update_fields=['health_status', 'last_health_check', 'health_error'])
             self.logger.error(f'Server unreachable — {exc}')
-            return
+            from core.exceptions import JobFailed
+            self.job.error = f'{server.name} unreachable: {exc}'
+            self.job.save(update_fields=['error'])
+            raise JobFailed()
 
-        cfg = _load_settings()
         protect_tag = cfg.sync_protect_tag.slug if cfg.sync_protect_tag_id else ''
         protected_prefix_networks = set()
         if cfg.sync_protect_tag_id:

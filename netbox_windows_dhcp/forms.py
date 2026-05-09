@@ -501,6 +501,16 @@ class PluginSettingsForm(forms.ModelForm):
         label='Sync Interval (minutes)',
         help_text='How often the background sync job runs (5–1440 minutes).',
     )
+    sync_job_timeout = forms.IntegerField(
+        min_value=60,
+        label='Sync Job Timeout (seconds)',
+        help_text=(
+            'Maximum wall-clock seconds a sync job may run before RQ kills it. '
+            'Default 300 matches RQ_DEFAULT_TIMEOUT. Increase for servers with '
+            'large scope counts. CONN_MAX_AGE is automatically aligned to this '
+            'value at job start.'
+        ),
+    )
     sync_protect_tag = DynamicModelChoiceField(
         queryset=Tag.objects.all(),
         required=False,
@@ -534,6 +544,7 @@ class PluginSettingsForm(forms.ModelForm):
             'create_missing_prefixes',
             'sync_interval',
             'sync_queue',
+            'sync_job_timeout',
             'api_enabled',
         )
 

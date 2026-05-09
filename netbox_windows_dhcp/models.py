@@ -88,6 +88,16 @@ class DHCPPluginSettings(models.Model):
         verbose_name='Sync Job Queue',
         help_text='Worker queue priority used for all DHCP sync and import jobs.',
     )
+    sync_job_timeout = models.PositiveIntegerField(
+        default=300,
+        verbose_name='Sync Job Timeout (seconds)',
+        help_text=(
+            'Maximum wall-clock seconds a sync job may run before RQ kills it. '
+            'Default 300 matches RQ_DEFAULT_TIMEOUT. Increase for servers with '
+            'large scope counts. CONN_MAX_AGE is automatically aligned to this '
+            'value at job start.'
+        ),
+    )
     sync_protect_tag = models.ForeignKey(
         'extras.Tag',
         on_delete=models.SET_NULL,

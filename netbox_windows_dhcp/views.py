@@ -220,6 +220,7 @@ class DHCPServerSyncView(LoginRequiredMixin, View):
             user=request.user,
             server_pk=server.pk,
             queue_name=cfg.sync_queue,
+            job_timeout=cfg.sync_job_timeout,
         )
         messages.success(request, f'Sync job queued for {server.name}.')
         return redirect(job.get_absolute_url())
@@ -243,6 +244,7 @@ class DHCPGlobalSyncView(LoginRequiredMixin, View):
                 user=request.user,
                 server_pk=server.pk,
                 queue_name=cfg.sync_queue,
+                job_timeout=cfg.sync_job_timeout,
             )
             count += 1
         messages.success(request, f'Queued sync job for {count} server(s). Check System → Jobs for progress.')
@@ -1124,6 +1126,7 @@ class ScheduleSyncView(LoginRequiredMixin, View):
                 user=request.user,
                 interval=cfg.sync_interval,
                 queue_name=cfg.sync_queue,
+                job_timeout=cfg.sync_job_timeout,
             )
             messages.success(
                 request,
@@ -1154,6 +1157,7 @@ class ScheduleSyncView(LoginRequiredMixin, View):
                 schedule_at=scheduled_at,
                 interval=cfg.sync_interval,
                 queue_name=cfg.sync_queue,
+                job_timeout=cfg.sync_job_timeout,
             )
             messages.success(
                 request,
