@@ -147,7 +147,7 @@ def _import_scope(client, rs: Dict, results: Dict, server=None):
 
     if not scope_id:
         results['scopes']['errors'].append('Scope record missing scope_id — skipped.')
-        return
+        return None
 
     # Build CIDR prefix string
     try:
@@ -157,7 +157,7 @@ def _import_scope(client, rs: Dict, results: Dict, server=None):
             f'{scope_id}: cannot compute CIDR '
             f'(scope_id={scope_id!r}, subnet_mask={subnet_mask!r}): {exc}'
         )
-        return
+        return None
 
     # Find or create the NetBox Prefix
     from .models import DHCPPluginSettings
@@ -174,7 +174,7 @@ def _import_scope(client, rs: Dict, results: Dict, server=None):
                 f'{scope_id}: prefix {cidr} does not exist in NetBox and '
                 f'"Create Missing Prefixes on Import" is disabled — skipped.'
             )
-            return
+            return None
 
     # Skip if a scope with this name + prefix already exists, but still import
     # exclusion ranges in case they were added after the scope was first imported.
@@ -190,7 +190,7 @@ def _import_scope(client, rs: Dict, results: Dict, server=None):
             results['exclusion_ranges']['errors'].append(
                 f'Scope {name}: could not fetch exclusion ranges: {exc}'
             )
-        return
+        return existing
 
     # Optionally link a failover if the API tells us the failover name
     failover = None
@@ -230,6 +230,8 @@ def _import_scope(client, rs: Dict, results: Dict, server=None):
         results['exclusion_ranges']['errors'].append(
             f'Scope {name}: could not fetch exclusion ranges: {exc}'
         )
+
+    return scope
 
 
 # ---------------------------------------------------------------------- #

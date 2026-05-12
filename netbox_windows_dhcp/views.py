@@ -1002,36 +1002,6 @@ def _get_next_sync_job():
     )
 
 
-def _apply_interval_to_job(new_interval):
-    """
-    Update the interval (and reschedule datetime) on any existing scheduled/pending
-    DHCPSyncJob. Deletes all but the earliest job to collapse duplicate chains.
-    Does nothing if no job exists.
-    """
-    from core.models import Job
-    from django.utils import timezone
-    from datetime import timedelta
-    from django.db.models import F
-
-    jobs = list(
-        Job.objects.filter(name=SYNC_JOB_NAME, status__in=['scheduled', 'pending'])
-        .order_by(F('scheduled').asc(nulls_last=True))
-    )
-    if not jobs:
-        return
-
-    keep, *extras = jobs
-    if extras:
-        Job.objects.filter(pk__in=[j.pk for j in extras]).delete()
-
-    keep.interval = new_interval
-    update_fields = ['interval']
-    if keep.status == 'scheduled':
-        keep.scheduled = timezone.now() + timedelta(minutes=new_interval)
-        update_fields.append('scheduled')
-    keep.save(update_fields=update_fields)
-
-
 # ---------------------------------------------------------------------------
 # Settings view
 # ---------------------------------------------------------------------------
@@ -1082,7 +1052,8 @@ class SettingsView(LoginRequiredMixin, View):
         form = PluginSettingsForm(request.POST, instance=DHCPPluginSettings.load())
         if form.is_valid():
             form.save()
-            _apply_interval_to_job(form.cleaned_data['sync_interval'])
+            # The post_save signal on DHCPPluginSettings reschedules the
+            # recurring DHCPSyncJob via enqueue_once() — no manual call needed.
             messages.success(request, 'Settings saved.')
             return redirect('plugins:netbox_windows_dhcp:settings')
 
@@ -1108,7 +1079,6 @@ class ScheduleSyncView(LoginRequiredMixin, View):
             messages.error(request, 'Superuser access required.')
             return redirect('plugins:netbox_windows_dhcp:settings')
 
-        from core.models import Job
         from django.utils import timezone
 
         from .background_tasks import DHCPSyncJob
@@ -1117,54 +1087,48 @@ class ScheduleSyncView(LoginRequiredMixin, View):
         cfg = DHCPPluginSettings.load()
         action = request.POST.get('action', 'schedule')
 
-        # Cancel any existing scheduled job (safe to delete — it hasn't entered the
-        # RQ queue yet; pending jobs are already queued so we leave those alone).
-        Job.objects.filter(name=SYNC_JOB_NAME, status='scheduled').delete()
-
         if action == 'run_now':
-            job = DHCPSyncJob.enqueue(
-                user=request.user,
-                interval=cfg.sync_interval,
-                queue_name=cfg.sync_queue,
-                job_timeout=cfg.sync_job_timeout,
-            )
+            # One-off immediate run alongside the recurring chain. Pass
+            # interval=None so this single run doesn't auto-reschedule a
+            # successor — the recurring chain already owns that.
+            job = DHCPSyncJob.enqueue(user=request.user, interval=None)
             messages.success(
                 request,
-                f'Sync enqueued — it will run shortly and reschedule every '
-                f'{cfg.sync_interval} minute(s) after completion.',
+                'Sync enqueued — it will run shortly. The recurring schedule is unaffected.',
             )
             return redirect(job.get_absolute_url())
 
-        else:  # schedule
-            from django.utils.dateparse import parse_datetime
+        # action == 'schedule' — replace the recurring chain's next entry with
+        # one starting at the user-supplied time. enqueue_once handles the
+        # delete-and-replace atomically (advisory-locked) and cleans up the
+        # Redis entry of the old scheduled job.
+        from django.utils.dateparse import parse_datetime
 
-            raw = request.POST.get('start_at', '').strip()
-            scheduled_at = parse_datetime(raw)
-            if not scheduled_at:
-                messages.error(request, 'Please enter a valid start date/time.')
-                return redirect('plugins:netbox_windows_dhcp:settings')
-
-            # datetime-local inputs are naive (no tz); treat as server local time
-            if timezone.is_naive(scheduled_at):
-                scheduled_at = timezone.make_aware(scheduled_at)
-
-            if scheduled_at <= timezone.now():
-                messages.error(request, 'Start time must be in the future.')
-                return redirect('plugins:netbox_windows_dhcp:settings')
-
-            DHCPSyncJob.enqueue(
-                user=request.user,
-                schedule_at=scheduled_at,
-                interval=cfg.sync_interval,
-                queue_name=cfg.sync_queue,
-                job_timeout=cfg.sync_job_timeout,
-            )
-            messages.success(
-                request,
-                f'Sync scheduled to start at {scheduled_at.strftime("%b %-d, %Y %-I:%M %p")}, '
-                f'then every {cfg.sync_interval} minute(s) thereafter.',
-            )
+        raw = request.POST.get('start_at', '').strip()
+        scheduled_at = parse_datetime(raw)
+        if not scheduled_at:
+            messages.error(request, 'Please enter a valid start date/time.')
             return redirect('plugins:netbox_windows_dhcp:settings')
+
+        # datetime-local inputs are naive (no tz); treat as server local time
+        if timezone.is_naive(scheduled_at):
+            scheduled_at = timezone.make_aware(scheduled_at)
+
+        if scheduled_at <= timezone.now():
+            messages.error(request, 'Start time must be in the future.')
+            return redirect('plugins:netbox_windows_dhcp:settings')
+
+        DHCPSyncJob.enqueue_once(
+            schedule_at=scheduled_at,
+            interval=cfg.sync_interval,
+            user=request.user,
+        )
+        messages.success(
+            request,
+            f'Sync scheduled to start at {scheduled_at.strftime("%b %-d, %Y %-I:%M %p")}, '
+            f'then every {cfg.sync_interval} minute(s) thereafter.',
+        )
+        return redirect('plugins:netbox_windows_dhcp:settings')
 
 
 # ---------------------------------------------------------------------------

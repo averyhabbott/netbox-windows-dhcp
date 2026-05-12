@@ -32,6 +32,24 @@ def dhcpscope_post_save(sender, instance, created, **kwargs):
         logger.warning(f'Failed to enqueue scope push after save of {instance}: {exc}')
 
 
+@receiver(post_save, sender='netbox_windows_dhcp.DHCPPluginSettings')
+def dhcppluginsettings_post_save(sender, instance, created, **kwargs):
+    """
+    Reschedule the recurring DHCPSyncJob with the latest interval whenever
+    plugin settings are saved. enqueue_once() handles all idempotency: it
+    uses an advisory lock and, if a scheduled/pending job already has the
+    requested interval, returns it unchanged. Only when the interval
+    actually changes does it delete the existing chain entry (via per-
+    instance Job.delete(), which also cancels the Redis entry) and enqueue
+    a fresh successor.
+    """
+    try:
+        from .background_tasks import DHCPSyncJob
+        DHCPSyncJob.enqueue_once(interval=instance.sync_interval)
+    except Exception as exc:
+        logger.warning(f'Failed to reschedule DHCPSyncJob after settings save: {exc}')
+
+
 @receiver(post_clean)
 def validate_dhcp_ip_status(sender, instance, **kwargs):
     """

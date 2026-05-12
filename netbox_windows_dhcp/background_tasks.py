@@ -22,7 +22,7 @@ import uuid
 from contextlib import contextmanager
 from typing import Optional
 
-from netbox.jobs import JobRunner
+from netbox.jobs import JobRunner, system_job
 
 logger = logging.getLogger('netbox_windows_dhcp')
 
@@ -676,8 +676,28 @@ def _sync_server(job_logger, server, sync_ip_addresses: bool, push_reservations:
     for scope_id, remote in remote_scope_map.items():
         scope = local_scope_map.get(scope_id)
         if scope is None:
-            job_logger.info(f'Remote scope {scope_id} has no matching DHCPScope in NetBox — skipping')
-            continue
+            if push_scope_info:
+                # NetBox is source of truth — unknown remote scopes are ignored.
+                job_logger.info(
+                    f'Remote scope {scope_id} has no matching DHCPScope in NetBox — skipping'
+                )
+                continue
+            # PSU is source of truth — auto-create the scope in NetBox so it
+            # participates in normal sync from this point on.
+            from .import_logic import _import_scope
+            _import_results = {
+                'scopes':           {'created': [], 'skipped': [], 'errors': []},
+                'option_values':    {'created': [], 'skipped': [], 'errors': []},
+                'exclusion_ranges': {'created': [], 'skipped': [], 'errors': []},
+            }
+            scope = _import_scope(client, remote, _import_results, server=server)
+            for created in _import_results['scopes']['created']:
+                job_logger.info(f'Auto-created scope from {server.name}: {created}')
+            for err in _import_results['scopes']['errors']:
+                job_logger.error(f'Auto-create failed for scope on {server.name}: {err}')
+            if scope is None:
+                continue
+            local_scope_map[scope_id] = scope
 
         # Scope maintenance mode check (before eligibility, so the message is clear).
         if scope.maintenance_mode:
@@ -822,6 +842,7 @@ def _sync_server(job_logger, server, sync_ip_addresses: bool, push_reservations:
 # Job classes
 # ---------------------------------------------------------------------------
 
+@system_job(interval=60)
 class DHCPSyncJob(JobRunner):
     """Synchronise all DHCP servers with NetBox."""
 
@@ -836,60 +857,50 @@ class DHCPSyncJob(JobRunner):
         super().__init__(job)
         _quiet_file_log(self.logger)
 
+    @classmethod
+    def enqueue(cls, *args, **kwargs):
+        """
+        Wrap JobRunner.enqueue so every enqueue path — @system_job startup,
+        settings-change signal, view button, and the auto-reschedule inside
+        JobRunner.handle()'s finally block — pulls queue, timeout, and
+        interval from the plugin settings singleton without each caller
+        having to pass them explicitly. setdefault preserves explicit overrides.
+        """
+        try:
+            cfg = _load_settings()
+            kwargs.setdefault('queue_name', cfg.sync_queue)
+            kwargs.setdefault('job_timeout', cfg.sync_job_timeout)
+            kwargs.setdefault('interval', cfg.sync_interval)
+        except Exception:
+            # Settings may not be loadable during initial migrations — fall through
+            # with whatever the caller provided.
+            pass
+        return super().enqueue(*args, **kwargs)
+
     def run(self, *args, **kwargs):
         import time
-        from datetime import timedelta
 
         from django.db import connection as _db_connection
-        from django.utils import timezone
 
-        start_time = timezone.now()
         _job_start = time.monotonic()
         run_errors: list = []
 
-        # Enqueue the successor immediately, anchored to when this run started,
-        # before any sync work that could throw. Null out job.interval first so
-        # handle()'s built-in finally never also fires.
         _cfg = _load_settings()
         # Align Django's per-connection CONN_MAX_AGE with the configured job
         # timeout so the connection isn't recycled mid-job by close_old_connections().
         _db_connection.settings_dict['CONN_MAX_AGE'] = _cfg.sync_job_timeout
-        self.job.interval = None
-        self.job.save(update_fields=['interval'])
-        from django.contrib.auth import get_user_model
-        _User = get_user_model()
-        try:
-            _service_user = _User.objects.get(username='DHCP-Sync-Service')
-        except _User.DoesNotExist:
-            _service_user = self.job.user
-        from core.choices import JobStatusChoices
-        from core.models import Job
-        from django_pglocks import advisory_lock
-        from netbox.constants import ADVISORY_LOCK_KEYS
-
-        with advisory_lock(ADVISORY_LOCK_KEYS['job-schedules']):
-            Job.objects.filter(
-                name=DHCPSyncJob.name,
-                status__in=[JobStatusChoices.STATUS_PENDING, JobStatusChoices.STATUS_SCHEDULED],
-            ).exclude(pk=self.job.pk).delete()
-            DHCPSyncJob.enqueue(
-                user=_service_user,
-                schedule_at=start_time + timedelta(minutes=_cfg.sync_interval),
-                interval=_cfg.sync_interval,
-                queue_name=_cfg.sync_queue,
-                job_timeout=_cfg.sync_job_timeout,
-            )
 
         from .api_client import PSUClient, PSUClientError
         from .constants import PSU_SCRIPT_VERSION
         from .models import DHCPFailover, DHCPServer
+        from django.utils import timezone
 
         servers = list(DHCPServer.objects.all())
         if not servers:
             self.logger.info('No DHCP servers configured — nothing to sync.')
             return
 
-        cfg = _load_settings()
+        cfg = _cfg
         sync_ip_addresses = cfg.sync_ip_addresses
         push_reservations = cfg.push_reservations
         push_scope_info = cfg.push_scope_info

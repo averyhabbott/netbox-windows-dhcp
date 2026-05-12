@@ -53,8 +53,13 @@ class DHCPPluginSettings(models.Model):
         default=False,
         verbose_name='Push Scope Info to DHCP Server',
         help_text=(
-            'When enabled, scope configuration (name, range, options) is '
-            'pushed from NetBox to the DHCP server on save.'
+            'When enabled, NetBox is the source of truth: scope configuration '
+            '(name, range, options) is pushed to the DHCP server on save, and '
+            'unknown remote scopes are ignored. When disabled, the DHCP server '
+            'is the source of truth: scope attributes are pulled from the server '
+            'on every sync, scopes present on the server but not in NetBox are '
+            'auto-created, and scopes removed from the server are deleted from '
+            'NetBox.'
         ),
     )
     sync_active_scopes_only = models.BooleanField(
