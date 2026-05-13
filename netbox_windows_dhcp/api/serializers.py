@@ -102,11 +102,21 @@ class DHCPOptionValueSerializer(NetBoxModelSerializer):
         brief_fields = ('id', 'url', 'display', 'friendly_name', 'value')
 
 
+class _ScopeBriefSerializer(NetBoxModelSerializer):
+    url = serializers.HyperlinkedIdentityField(
+        view_name='plugins-api:netbox_windows_dhcp-api:dhcpscope-detail'
+    )
+
+    class Meta:
+        model = DHCPScope
+        fields = ('id', 'url', 'display', 'name')
+
+
 class DHCPExclusionRangeSerializer(NetBoxModelSerializer):
     url = serializers.HyperlinkedIdentityField(
         view_name='plugins-api:netbox_windows_dhcp-api:dhcpexclusionrange-detail'
     )
-    scope = serializers.SerializerMethodField()
+    scope = _ScopeBriefSerializer(nested=True, read_only=True)
     scope_id = serializers.PrimaryKeyRelatedField(
         queryset=DHCPScope.objects.all(),
         source='scope',
@@ -122,9 +132,6 @@ class DHCPExclusionRangeSerializer(NetBoxModelSerializer):
             'tags', 'custom_fields', 'created', 'last_updated',
         )
         brief_fields = ('id', 'url', 'display', 'start_ip', 'end_ip')
-
-    def get_scope(self, obj):
-        return {'id': obj.scope_id, 'name': str(obj.scope), 'url': obj.scope.get_absolute_url()}
 
 
 class DHCPScopeSerializer(NetBoxModelSerializer):

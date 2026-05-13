@@ -3,6 +3,7 @@ from django import forms
 from extras.models import Tag
 from ipam.models import Prefix
 from netbox.forms import NetBoxModelBulkEditForm, NetBoxModelForm, NetBoxModelFilterSetForm
+from utilities.forms.utils import add_blank_choice
 from utilities.forms.fields import (
     DynamicModelChoiceField,
     DynamicModelMultipleChoiceField,
@@ -10,6 +11,7 @@ from utilities.forms.fields import (
 )
 from utilities.forms.rendering import FieldSet, InlineFields
 
+from .choices import DHCPOptionDataTypeChoices
 from .models import (
     DHCPExclusionRange,
     DHCPFailover,
@@ -202,7 +204,7 @@ class DHCPOptionCodeDefinitionForm(NetBoxModelForm):
 class DHCPOptionCodeDefinitionFilterForm(NetBoxModelFilterSetForm):
     model = DHCPOptionCodeDefinition
     data_type = forms.ChoiceField(
-        choices=[('', '---------')] + DHCPOptionCodeDefinition.DATA_TYPE_CHOICES,
+        choices=add_blank_choice(DHCPOptionDataTypeChoices),
         required=False,
         label='Data Type',
     )

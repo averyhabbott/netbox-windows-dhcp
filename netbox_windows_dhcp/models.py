@@ -7,6 +7,13 @@ from netaddr import IPAddress as NetAddrIP, IPNetwork
 from netbox.models import NetBoxModel
 from utilities.querysets import RestrictedQuerySet
 
+from .choices import (
+    DHCPFailoverModeChoices,
+    DHCPOptionDataTypeChoices,
+    DHCPServerHealthChoices,
+    SyncQueueChoices,
+)
+
 
 class DHCPPluginSettings(models.Model):
     """
@@ -77,19 +84,14 @@ class DHCPPluginSettings(models.Model):
         verbose_name='Sync Interval (minutes)',
         help_text='How often the background sync job runs (5–1440 minutes).',
     )
-    QUEUE_HIGH = 'high'
-    QUEUE_DEFAULT = 'default'
-    QUEUE_LOW = 'low'
-    QUEUE_CHOICES = [
-        (QUEUE_HIGH, 'High'),
-        (QUEUE_DEFAULT, 'Default'),
-        (QUEUE_LOW, 'Low'),
-    ]
+    QUEUE_HIGH = SyncQueueChoices.HIGH
+    QUEUE_DEFAULT = SyncQueueChoices.DEFAULT
+    QUEUE_LOW = SyncQueueChoices.LOW
 
     sync_queue = models.CharField(
         max_length=20,
-        choices=QUEUE_CHOICES,
-        default=QUEUE_DEFAULT,
+        choices=SyncQueueChoices,
+        default=SyncQueueChoices.DEFAULT,
         verbose_name='Sync Job Queue',
         help_text='Worker queue priority used for all DHCP sync and import jobs.',
     )
@@ -225,18 +227,14 @@ class DHCPServer(NetBoxModel):
     maintenance_notes = models.TextField(blank=True, default='')
 
     # Health tracking
-    HEALTH_UNKNOWN = 'unknown'
-    HEALTH_HEALTHY = 'healthy'
-    HEALTH_UNREACHABLE = 'unreachable'
-    HEALTH_CHOICES = [
-        (HEALTH_UNKNOWN, 'Unknown'),
-        (HEALTH_HEALTHY, 'Healthy'),
-        (HEALTH_UNREACHABLE, 'Unreachable'),
-    ]
+    HEALTH_UNKNOWN = DHCPServerHealthChoices.UNKNOWN
+    HEALTH_HEALTHY = DHCPServerHealthChoices.HEALTHY
+    HEALTH_UNREACHABLE = DHCPServerHealthChoices.UNREACHABLE
+
     health_status = models.CharField(
         max_length=20,
-        choices=HEALTH_CHOICES,
-        default=HEALTH_UNKNOWN,
+        choices=DHCPServerHealthChoices,
+        default=DHCPServerHealthChoices.UNKNOWN,
         verbose_name='Health Status',
     )
     last_health_check = models.DateTimeField(null=True, blank=True)
@@ -270,12 +268,9 @@ class DHCPServer(NetBoxModel):
 class DHCPFailover(NetBoxModel):
     """Represents a Windows DHCP failover relationship between exactly two servers."""
 
-    MODE_LOAD_BALANCE = 'LoadBalance'
-    MODE_HOT_STANDBY = 'HotStandby'
-    MODE_CHOICES = [
-        (MODE_LOAD_BALANCE, 'Load Balance'),
-        (MODE_HOT_STANDBY, 'Hot Standby'),
-    ]
+    MODE_LOAD_BALANCE = DHCPFailoverModeChoices.LOAD_BALANCE
+    MODE_HOT_STANDBY = DHCPFailoverModeChoices.HOT_STANDBY
+    MODE_CHOICES = DHCPFailoverModeChoices
 
     name = models.CharField(max_length=100, unique=True)
     primary_server = models.ForeignKey(
@@ -290,7 +285,11 @@ class DHCPFailover(NetBoxModel):
         related_name='secondary_failovers',
         verbose_name='Secondary Server',
     )
-    mode = models.CharField(max_length=20, choices=MODE_CHOICES, default=MODE_LOAD_BALANCE)
+    mode = models.CharField(
+        max_length=20,
+        choices=DHCPFailoverModeChoices,
+        default=DHCPFailoverModeChoices.LOAD_BALANCE,
+    )
     max_client_lead_time = models.PositiveIntegerField(
         default=3600,
         verbose_name='Max Client Lead Time (s)',
@@ -363,24 +362,15 @@ class DHCPFailover(NetBoxModel):
 class DHCPOptionCodeDefinition(NetBoxModel):
     """Defines a DHCP option code (e.g. option 3 = Router, option 6 = DNS Servers)."""
 
-    TYPE_STRING = 'String'
-    TYPE_IP_ADDRESS = 'IPAddress'
-    TYPE_IP_ADDRESS_LIST = 'IPAddressList'
-    TYPE_DWORD = 'DWORD'
-    TYPE_DWORD_DWORD = 'DWORD DWORD'
-    TYPE_BINARY = 'Binary'
-    TYPE_ENCAPSULATED = 'Encapsulated'
-    TYPE_IPV6_ADDRESS = 'IPv6Address'
-    DATA_TYPE_CHOICES = [
-        (TYPE_STRING, 'String'),
-        (TYPE_IP_ADDRESS, 'IP Address'),
-        (TYPE_IP_ADDRESS_LIST, 'IP Address List'),
-        (TYPE_DWORD, 'DWORD (32-bit)'),
-        (TYPE_DWORD_DWORD, 'DWORD DWORD (64-bit)'),
-        (TYPE_BINARY, 'Binary'),
-        (TYPE_ENCAPSULATED, 'Encapsulated'),
-        (TYPE_IPV6_ADDRESS, 'IPv6 Address'),
-    ]
+    TYPE_STRING = DHCPOptionDataTypeChoices.STRING
+    TYPE_IP_ADDRESS = DHCPOptionDataTypeChoices.IP_ADDRESS
+    TYPE_IP_ADDRESS_LIST = DHCPOptionDataTypeChoices.IP_ADDRESS_LIST
+    TYPE_DWORD = DHCPOptionDataTypeChoices.DWORD
+    TYPE_DWORD_DWORD = DHCPOptionDataTypeChoices.DWORD_DWORD
+    TYPE_BINARY = DHCPOptionDataTypeChoices.BINARY
+    TYPE_ENCAPSULATED = DHCPOptionDataTypeChoices.ENCAPSULATED
+    TYPE_IPV6_ADDRESS = DHCPOptionDataTypeChoices.IPV6_ADDRESS
+    DATA_TYPE_CHOICES = DHCPOptionDataTypeChoices
 
     code = models.PositiveSmallIntegerField(
         unique=True,
@@ -389,7 +379,11 @@ class DHCPOptionCodeDefinition(NetBoxModel):
     )
     name = models.CharField(max_length=200)
     description = models.TextField(blank=True)
-    data_type = models.CharField(max_length=20, choices=DATA_TYPE_CHOICES, default=TYPE_STRING)
+    data_type = models.CharField(
+        max_length=20,
+        choices=DHCPOptionDataTypeChoices,
+        default=DHCPOptionDataTypeChoices.STRING,
+    )
     is_builtin = models.BooleanField(
         default=False,
         verbose_name='Built-in',
