@@ -36,13 +36,13 @@ class DHCPFailoverSerializer(NetBoxModelSerializer):
     url = serializers.HyperlinkedIdentityField(
         view_name='plugins-api:netbox_windows_dhcp-api:dhcpfailover-detail'
     )
-    primary_server = DHCPServerSerializer(nested=True)
+    primary_server = DHCPServerSerializer(nested=True, read_only=True)
     primary_server_id = serializers.PrimaryKeyRelatedField(
         queryset=DHCPServer.objects.all(),
         source='primary_server',
         write_only=True,
     )
-    secondary_server = DHCPServerSerializer(nested=True)
+    secondary_server = DHCPServerSerializer(nested=True, read_only=True)
     secondary_server_id = serializers.PrimaryKeyRelatedField(
         queryset=DHCPServer.objects.all(),
         source='secondary_server',
@@ -84,7 +84,7 @@ class DHCPOptionValueSerializer(NetBoxModelSerializer):
     url = serializers.HyperlinkedIdentityField(
         view_name='plugins-api:netbox_windows_dhcp-api:dhcpoptionvalue-detail'
     )
-    option_definition = DHCPOptionCodeDefinitionSerializer(nested=True)
+    option_definition = DHCPOptionCodeDefinitionSerializer(nested=True, read_only=True)
     option_definition_id = serializers.PrimaryKeyRelatedField(
         queryset=DHCPOptionCodeDefinition.objects.all(),
         source='option_definition',
@@ -110,6 +110,7 @@ class _ScopeBriefSerializer(NetBoxModelSerializer):
     class Meta:
         model = DHCPScope
         fields = ('id', 'url', 'display', 'name')
+        brief_fields = ('id', 'url', 'display', 'name')
 
 
 class DHCPExclusionRangeSerializer(NetBoxModelSerializer):
@@ -186,13 +187,15 @@ class DHCPScopeSerializer(NetBoxModelSerializer):
 
     def validate(self, data):
         data = super().validate(data)
-        has_server = bool(data.get('server'))
-        has_failover = bool(data.get('failover'))
-        if has_server and has_failover:
+        # Fall back to the existing instance for fields absent from the payload so
+        # partial updates (PATCH) that don't touch server/failover still validate.
+        server = data.get('server', getattr(self.instance, 'server', None))
+        failover = data.get('failover', getattr(self.instance, 'failover', None))
+        if server and failover:
             raise serializers.ValidationError(
                 'Set either server_id or failover_id, not both.'
             )
-        if not has_server and not has_failover:
+        if not server and not failover:
             raise serializers.ValidationError(
                 'Either server_id or failover_id must be set.'
             )

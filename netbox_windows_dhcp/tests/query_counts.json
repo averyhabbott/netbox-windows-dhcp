@@ -1,0 +1,14 @@
+{
+  "dhcpexclusionrange:api_list_objects": 14,
+  "dhcpexclusionrange:list_objects_with_permission": 18,
+  "dhcpfailover:api_list_objects": 23,
+  "dhcpfailover:list_objects_with_permission": 21,
+  "dhcpoptioncodedefinition:api_list_objects": 23,
+  "dhcpoptioncodedefinition:list_objects_with_permission": 21,
+  "dhcpoptionvalue:api_list_objects": 23,
+  "dhcpoptionvalue:list_objects_with_permission": 21,
+  "dhcpscope:api_list_objects": 28,
+  "dhcpscope:list_objects_with_permission": 23,
+  "dhcpserver:api_list_objects": 23,
+  "dhcpserver:list_objects_with_permission": 21
+}

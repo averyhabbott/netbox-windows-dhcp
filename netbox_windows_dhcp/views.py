@@ -710,6 +710,13 @@ class DHCPScopeBulkDeleteView(generic.BulkDeleteView):
 # DHCPExclusionRange views
 # ---------------------------------------------------------------------------
 
+@register_model_view(DHCPExclusionRange, 'list', path='', detail=False)
+class DHCPExclusionRangeListView(generic.ObjectListView):
+    queryset = DHCPExclusionRange.objects.select_related('scope__prefix')
+    table = DHCPExclusionRangeTable
+    filterset = DHCPExclusionRangeFilterSet
+
+
 @register_model_view(DHCPExclusionRange)
 class DHCPExclusionRangeView(generic.ObjectView):
     queryset = DHCPExclusionRange.objects.select_related('scope__prefix')
