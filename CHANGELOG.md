@@ -2,11 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
-## [1.3.5] - 2026-06-11
+## [1.3.5] - 2026-06-12
 
 ### Added
 
 - **Global search for DHCP Servers and Scopes** — DHCP servers (by name and hostname) and DHCP scopes (by name and prefix CIDR) now appear in NetBox's global search, alongside the existing DHCP Lease Info results. Run `python manage.py reindex netbox_windows_dhcp` (or perform a NetBox upgrade, which reindexes lazily) to backfill existing objects into the search cache.
+- **NetBox 4.6.x support** — `max_version` raised to `4.6.99`, allowing the plugin to load on NetBox 4.6.x (Django 6.0) in addition to 4.5.x. Validated against NetBox 4.5.7 and 4.6.2.
+- **Test suite** — a comprehensive Django test suite now ships under `netbox_windows_dhcp/tests/`, covering models and validation, the REST API, UI views, filtersets, the sync engine, the import pipeline, the PSU HTTP client, certificate parsing, signals, and search. Runs fully offline (no DHCP/PSU server or network access required) via `python manage.py test netbox_windows_dhcp`.
+
+### Fixed
+
+- **DHCP Exclusion Range REST API returned HTTP 500** — the nested scope serializer was missing `brief_fields`, which broke every request to `/api/plugins/windows-dhcp/exclusion-ranges/`.
+- **Creating DHCP Failover and DHCP Option Value objects via the REST API was rejected** — their nested foreign-key fields were not marked read-only, so the API required a nested object instead of accepting an ID (`*_id`). The `_id` write fields now work as intended.
+- **Partial updates (PATCH) to a DHCP Scope via the REST API failed** with *"Either server_id or failover_id must be set"* when those fields were omitted from the payload. The serializer now falls back to the scope's existing server/failover.
+- **DHCP Exclusion Range detail page returned HTTP 500** (`NoReverseMatch` for `dhcpexclusionrange_list`) because no list view was registered. An exclusion-range list view is now registered, fixing the detail page.
 
 ---
 

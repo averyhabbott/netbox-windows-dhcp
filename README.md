@@ -1,6 +1,6 @@
 # netbox-windows-dhcp
 
-A NetBox v4.5.0+ plugin for full integration with Windows DHCP Server via [PowerShell Universal](https://ironmansoftware.com/powershell-universal) (PSU v5).
+A NetBox plugin (compatible with NetBox 4.5.x and 4.6.x) for full integration with Windows DHCP Server via [PowerShell Universal](https://ironmansoftware.com/powershell-universal) (PSU v5).
 
 ## Features
 
@@ -14,6 +14,7 @@ A NetBox v4.5.0+ plugin for full integration with Windows DHCP Server via [Power
 - Stale record cleanup: expired leases and removed reservations are deleted or downgraded automatically
 - Push reservations, scope config, and exclusion ranges from NetBox → DHCP server (optional, settings-controlled)
 - **DHCP Scopes** panel injected into the NetBox Prefix detail view
+- **Global search** — DHCP servers (name, hostname), scopes (name, prefix CIDR), and lease info are findable from NetBox's global search bar
 - All sync and import operations run as background jobs — no HTTP timeouts on large servers
 - All background job changes appear in the NetBox changelog (attributed to the user who queued the job)
 - Scheduled background sync (hourly by default, configurable) + manual **Sync Now** per server or for all servers
@@ -28,7 +29,7 @@ A NetBox v4.5.0+ plugin for full integration with Windows DHCP Server via [Power
 
 ### NetBox host
 
-- NetBox >= 4.5.0
+- NetBox 4.5.x or 4.6.x (tested on 4.5.7 and 4.6.2)
 - Python >= 3.10
 - `requests` >= 2.28
 - NetBox RQ workers running (required for background sync and import jobs)
@@ -459,7 +460,7 @@ When any of these overrides are active, the Plugin Settings page shows a banner 
 
 ## REST API
 
-The plugin exposes a REST API under `/api/plugins/netbox-windows-dhcp/`:
+The plugin exposes a REST API under `/api/plugins/windows-dhcp/`:
 
 | Endpoint | Model |
 | --- | --- |
@@ -469,6 +470,30 @@ The plugin exposes a REST API under `/api/plugins/netbox-windows-dhcp/`:
 | `/option-values/` | Option Values |
 | `/scopes/` | DHCP Scopes (includes nested `exclusion_ranges`) |
 | `/exclusion-ranges/` | DHCP Exclusion Ranges |
+
+Foreign-key fields are read as nested objects and written by ID using the
+`*_id` form (e.g. `prefix_id`, `server_id`, `failover_id`, `scope_id`,
+`option_definition_id`). The entire API can be disabled via the **API Enabled**
+setting, in which case every endpoint returns `503 Service Unavailable`.
+
+## Testing
+
+The plugin ships a Django test suite under `netbox_windows_dhcp/tests/`. It runs
+**fully offline** — no Windows DHCP server, PSU instance, or network access is
+required (the PSU client and job queue are mocked). Run it from the NetBox
+install directory with the plugin installed and listed in `PLUGINS`:
+
+```bash
+python manage.py test netbox_windows_dhcp --keepdb
+```
+
+The suite covers model validation, the REST API and UI views, filtersets, the
+background sync engine, the import pipeline, the PSU HTTP client, certificate
+parsing, signal handlers, and global search. It is validated against NetBox
+4.5.7 and 4.6.2. On NetBox 4.6+, the list-view tests assert against the recorded
+query-count baseline in `tests/query_counts.json`; if NetBox internals change
+the expected counts, regenerate it with
+`UPDATE_QUERY_COUNTS=1 python manage.py test netbox_windows_dhcp` (run serially).
 
 ## License
 
