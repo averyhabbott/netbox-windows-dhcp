@@ -2,6 +2,8 @@ import logging
 
 from netbox.plugins import PluginConfig
 
+__version__ = '1.3.5'
+
 logger = logging.getLogger('netbox_windows_dhcp')
 
 
@@ -57,11 +59,12 @@ class NetBoxWindowsDHCPConfig(PluginConfig):
     name = 'netbox_windows_dhcp'
     verbose_name = 'Windows DHCP'
     description = 'Full integration with Windows DHCP Server via PowerShell Universal'
-    version = '1.3.4'
+    version = __version__
     author = 'Avery Abbott'
     author_email = 'averyhabbott@yahoo.com'
     base_url = 'windows-dhcp'
     min_version = '4.5.0'
+    max_version = '4.5.99'
     required_settings = []
     default_settings = {}
 

@@ -469,3 +469,7 @@ The plugin exposes a REST API under `/api/plugins/netbox-windows-dhcp/`:
 | `/option-values/` | Option Values |
 | `/scopes/` | DHCP Scopes (includes nested `exclusion_ranges`) |
 | `/exclusion-ranges/` | DHCP Exclusion Ranges |
+
+## License
+
+Released under the GNU General Public License v3.0 (or later). See [LICENSE](LICENSE) for the full text.

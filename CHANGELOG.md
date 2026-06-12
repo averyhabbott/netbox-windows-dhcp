@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.5] - 2026-06-11
+
+### Added
+
+- **Global search for DHCP Servers and Scopes** — DHCP servers (by name and hostname) and DHCP scopes (by name and prefix CIDR) now appear in NetBox's global search, alongside the existing DHCP Lease Info results. Run `python manage.py reindex netbox_windows_dhcp` (or perform a NetBox upgrade, which reindexes lazily) to backfill existing objects into the search cache.
+
+---
+
+## [1.3.4] - 2026-05-19
+
+### Added
+
+- **Support for long-running tasks** — sync job timeout is now configurable in plugin settings, allowing long-running syncs to complete without being cut short.
+- **DHCP scopes now import during sync, not just during a one-time import** — scopes discovered on the server are created/updated as part of regular sync operations.
+
+### Changed
+
+- Revised code to align better with NetBox development guidelines.
+
+### Fixed
+
+- Several minor bug fixes.
+
+---
+
 ## [1.3.3] - 2026-04-28
 
 ### Fixed
