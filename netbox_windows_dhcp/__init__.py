@@ -2,7 +2,7 @@ import logging
 
 from netbox.plugins import PluginConfig
 
-__version__ = '1.3.5'
+__version__ = '1.3.6'
 
 logger = logging.getLogger('netbox_windows_dhcp')
 

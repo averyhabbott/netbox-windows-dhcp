@@ -63,7 +63,7 @@ if ($PSVersionTable.PSEdition -eq 'Core') {
     Import-Module DhcpServer -ErrorAction Stop
 }
 
-$PSU_SCRIPT_VERSION = '1.0.2'
+$PSU_SCRIPT_VERSION = '1.1.0'
 
 function ConvertTo-ScopeObject {
     param([Microsoft.Management.Infrastructure.CimInstance]$Scope)
@@ -180,6 +180,14 @@ function Assert-ValidIPv4 {
     return $false
 }
 
+function ConvertTo-UInt32Ip {
+    # IPv4 address (object or string) -> UInt32, for computing range sizes.
+    param($Ip)
+    $bytes = ([System.Net.IPAddress]::Parse([string]$Ip)).GetAddressBytes()
+    [Array]::Reverse($bytes)
+    [System.BitConverter]::ToUInt32($bytes, 0)
+}
+
 '@
 
 
@@ -207,6 +215,205 @@ New-PSUEndpoint -Url '/api/dhcp/health' -Method POST @_epWrite -Endpoint ([scrip
     New-PSUApiResponse -StatusCode 200 `
         -Body (@{ status = 'ok' } | ConvertTo-Json -Compress) `
         -ContentType 'application/json'
+}.ToString()))
+
+# ---------------------------------------------------------------------------
+# GET /api/dhcp/metrics
+# Aggregate health snapshot for external monitoring systems. Returns server
+# statistics, per-scope utilization, failover state, and database health in a
+# single call. Read-only; DHCPReader + DHCPWriter.
+#
+# The schema is intentionally generic (standard DHCP concepts only, no
+# consumer-specific fields). Counters under `server.packets` are cumulative
+# since the service started; consumers are expected to derive rates. Each
+# section is gathered independently so one failing cmdlet degrades to null
+# rather than failing the whole response.
+# ---------------------------------------------------------------------------
+New-PSUEndpoint -Url '/api/dhcp/metrics' -Method GET @_epRead -Endpoint ([scriptblock]::Create($H + {
+    try {
+        $now = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+
+        # --- Scope inventory (names/state), keyed by scope id ------------------
+        $scopeInfo = @{}
+        $activeCount = 0
+        try {
+            foreach ($sc in (Get-DhcpServerv4Scope -ErrorAction Stop)) {
+                $scopeInfo[$sc.ScopeId.ToString()] = $sc
+                if ($sc.State -eq 'Active') { $activeCount++ }
+            }
+        } catch {
+            Write-Verbose "Could not enumerate scopes: $_"
+        }
+
+        # --- Server statistics -------------------------------------------------
+        $server = $null
+        try {
+            $s = Get-DhcpServerv4Statistics -ErrorAction Stop
+            $uptime = $null
+            if ($s.ServerStartTime) {
+                $uptime = [int]((Get-Date) - $s.ServerStartTime).TotalSeconds
+            }
+            $server = [ordered]@{
+                uptime_seconds   = $uptime
+                scopes_total     = [int]$s.TotalScopes
+                scopes_active    = $activeCount
+                addresses_total  = [int]($s.AddressesInUse + $s.AddressesAvailable)
+                addresses_in_use = [int]$s.AddressesInUse
+                addresses_free   = [int]$s.AddressesAvailable
+                percent_in_use   = [math]::Round([double]$s.PercentageInUse, 2)
+                packets          = [ordered]@{
+                    discovers = [int64]$s.Discovers
+                    offers    = [int64]$s.Offers
+                    requests  = [int64]$s.Requests
+                    acks      = [int64]$s.Acks
+                    nacks     = [int64]$s.Naks
+                    declines  = [int64]$s.Declines
+                    releases  = [int64]$s.Releases
+                }
+            }
+        } catch {
+            Write-Verbose "Could not read server statistics: $_"
+        }
+
+        # --- Per-scope utilization --------------------------------------------
+        # Opt-in, query-gated lease scrapes (off by default -> cheapest call):
+        #   ?reservations=true  split ReservedAddress into active/inactive
+        #   ?declined=true      count bad/declined (conflict) addresses
+        # Both need per-scope lease enumeration, so they stay opt-in. The true
+        # total and total reserved are always returned (cheap, no enumeration).
+        $wantReservations = ("$reservations").Trim().ToLower() -in @('1', 'true', 'yes', 'on')
+        $wantDeclined     = ("$declined").Trim().ToLower()     -in @('1', 'true', 'yes', 'on')
+
+        # True scope size = address range - exclusions (one aggregate call). Unlike
+        # InUse+Free it is independent of lease state and doesn't double-count
+        # active reservations (which already sit inside AddressesInUse).
+        $exclByScope = @{}
+        $exclOk = $false
+        try {
+            foreach ($ex in (Get-DhcpServerv4ExclusionRange -ErrorAction Stop)) {
+                $esid = $ex.ScopeId.ToString()
+                $n = [int]((ConvertTo-UInt32Ip $ex.EndRange) - (ConvertTo-UInt32Ip $ex.StartRange) + 1)
+                if ($exclByScope.ContainsKey($esid)) { $exclByScope[$esid] += $n } else { $exclByScope[$esid] = $n }
+            }
+            $exclOk = $true
+        } catch {
+            Write-Verbose "Could not read exclusion ranges: $_"
+        }
+
+        $scopes = @()
+        try {
+            foreach ($st in (Get-DhcpServerv4ScopeStatistics -ErrorAction Stop)) {
+                $sid  = $st.ScopeId.ToString()
+                $info = $scopeInfo[$sid]
+                $inUse = [int]$st.AddressesInUse
+                $free  = [int]$st.AddressesFree
+                $reserved = [int]$st.ReservedAddress
+
+                # range - exclusions when both are known, else fall back to InUse+Free.
+                $total = $inUse + $free
+                if ($exclOk -and $info -and $info.StartRange -and $info.EndRange) {
+                    $rangeCount = [int]((ConvertTo-UInt32Ip $info.EndRange) - (ConvertTo-UInt32Ip $info.StartRange) + 1)
+                    if ($rangeCount -gt 0) { $total = $rangeCount - [int]($exclByScope[$sid]) }
+                }
+
+                # Gated enumeration. With reservation monitoring on and reservations
+                # present, one -AllLeases pass yields the active/inactive split and
+                # (when declined is also on) the Declined count for free.
+                $resActive = 0; $resInactive = 0; $badCount = 0; $enumerated = $false
+                if ($wantReservations -and $reserved -gt 0) {
+                    try {
+                        $byState = Get-DhcpServerv4Lease -ScopeId $sid -AllLeases -ErrorAction Stop | Group-Object AddressState
+                        foreach ($g in $byState) {
+                            switch ($g.Name) {
+                                'ActiveReservation'   { $resActive   = [int]$g.Count }
+                                'InactiveReservation' { $resInactive = [int]$g.Count }
+                                'Declined'            { if ($wantDeclined) { $badCount = [int]$g.Count } }
+                            }
+                        }
+                        $enumerated = $true
+                    } catch {
+                        Write-Verbose "Could not enumerate leases for ${sid}: $_"
+                    }
+                }
+                # Scopes not enumerated above still need a (server-side filtered)
+                # bad-lease count when declined monitoring is on.
+                if ($wantDeclined -and -not $enumerated) {
+                    try {
+                        $badCount = @(Get-DhcpServerv4Lease -ScopeId $sid -BadLeases -ErrorAction Stop).Count
+                    } catch {
+                        Write-Verbose "Could not read bad leases for ${sid}: $_"
+                    }
+                }
+
+                $scopes += [ordered]@{
+                    scope_id              = $sid
+                    name                  = if ($info) { [string]$info.Name } else { $null }
+                    state                 = if ($info) { $info.State.ToString().ToLower() } else { $null }
+                    addresses_total       = [int]$total
+                    addresses_in_use      = $inUse
+                    addresses_free        = $free
+                    addresses_reserved    = $reserved
+                    reservations_active   = $resActive
+                    reservations_inactive = $resInactive
+                    pending_offers        = [int]$st.PendingOffers
+                    bad_address_count     = $badCount
+                    percent_in_use        = [math]::Round([double]$st.PercentageInUse, 2)
+                }
+            }
+        } catch {
+            Write-Verbose "Could not read scope statistics: $_"
+        }
+
+        # --- Failover relationships -------------------------------------------
+        # `state` reflects the live relationship state when the OS exposes it.
+        # `in_sync` is left null unless the OS reports a definitive value, since
+        # it cannot be reliably derived from a single server's view.
+        $failover = @()
+        try {
+            foreach ($fo in (Get-DhcpServerv4Failover -ErrorAction Stop)) {
+                $state = $null
+                if ($fo.PSObject.Properties['State']) { $state = ([string]$fo.State).ToLower() }
+                $failover += [ordered]@{
+                    name           = [string]$fo.Name
+                    mode           = $fo.Mode.ToString()
+                    partner_server = [string]$fo.PartnerServer
+                    state          = $state
+                    in_sync        = $null
+                }
+            }
+        } catch {
+            Write-Verbose "Could not read failover relationships: $_"
+        }
+
+        # --- Database / backup health -----------------------------------------
+        $database = $null
+        try {
+            $db = Get-DhcpServerDatabase -ErrorAction Stop
+            $database = [ordered]@{
+                backup_interval_minutes = [int]$db.BackupInterval.TotalMinutes
+                logging_enabled         = [bool]$db.LoggingEnabled
+                cleanup_interval_minutes = [int]$db.CleanupInterval.TotalMinutes
+            }
+        } catch {
+            Write-Verbose "Could not read database settings: $_"
+        }
+
+        $payload = [ordered]@{
+            schema_version = 1
+            generated_at   = $now
+            server         = $server
+            scopes         = $scopes
+            failover       = $failover
+            database       = $database
+        }
+
+        New-PSUApiResponse -StatusCode 200 `
+            -Body ($payload | ConvertTo-Json -Depth 5 -Compress) `
+            -ContentType 'application/json'
+    }
+    catch {
+        Write-ApiError -Message $_.Exception.Message -StatusCode 500
+    }
 }.ToString()))
 
 

@@ -2,6 +2,32 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **`GET /api/dhcp/metrics` per-scope detail** — each scope now reports a true `addresses_total`
+  (address range minus exclusion ranges, independent of lease state) and two optional, query-gated
+  lease scrapes (off by default since they enumerate leases on the DHCP server):
+  `?reservations=true` splits the reserved count into `reservations_active` / `reservations_inactive`;
+  `?declined=true` adds a per-scope `bad_address_count`. When both are on, the reservation pass also
+  yields the declined count for scopes that have reservations, so the bad-lease scan only runs on the
+  rest. Schema stays additive (`schema_version` 1); `$PSU_SCRIPT_VERSION` stays `1.1.0` (not yet public).
+
+---
+
+## [1.3.6] - 2026-06-13
+
+### Added
+
+- **`GET /api/dhcp/metrics` endpoint** — a read-only aggregate health snapshot for external monitoring systems: server statistics (uptime, address counts, utilization, cumulative DHCP packet counters), per-scope utilization, failover state, and database health, returned in a single call. The schema is intentionally generic (standard DHCP concepts only, no consumer-specific fields) and is consumed by the companion [LibreNMS Windows DHCP plugin](https://github.com/averyhabbott/librenms-windows-dhcp).
+
+### Changed
+
+- PSU script version bumped to `1.1.0` for LibreNMS integration support.
+
+---
+
 ## [1.3.5] - 2026-06-12
 
 ### Added

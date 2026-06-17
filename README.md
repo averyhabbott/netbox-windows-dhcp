@@ -394,6 +394,7 @@ The plugin expects PowerShell Universal **v5.x** (tested on 5.6.11+) on each DHC
 | DELETE | `/api/dhcp/exclusions` | Delete an exclusion range (body: scope_id, start_ip, end_ip) |
 | GET | `/api/dhcp/health` | Health check (read) — returns `{"status":"ok","version":"x.y.z"}` |
 | POST | `/api/dhcp/health` | Health check (write) — tests write access; returns `{"status":"ok"}` |
+| GET | `/api/dhcp/metrics[?reservations=true][&declined=true]` | Aggregate health snapshot for external monitoring — server statistics (uptime, address counts, utilization, cumulative packet counters), per-scope utilization (size from range − exclusions, in-use/free/reserved/pending), failover state, and database health in one call. Read-only; generic schema (no consumer-specific fields). Optional flags add per-scope lease scrapes (off by default, since they enumerate leases on the server): `reservations=true` splits the reserved count into `reservations_active`/`reservations_inactive`; `declined=true` adds `bad_address_count`. Consumed by the companion [LibreNMS plugin](https://github.com/averyhabbott/librenms-windows-dhcp). |
 
 Authentication: PSU v5 App Tokens are sent as `Authorization: Bearer <token>`. Generate a token in the PSU admin console under **Security → App Tokens** and paste it into the **App Token** field on the DHCP Server object in NetBox.
 
