@@ -44,6 +44,20 @@ Restart the PSU service after any `appsettings.json` change:
 Restart-Service -Name "PowerShellUniversal"
 ```
 
+### Service Account Configuration for Failover Scopes (Optional)
+
+If you plan to use NetBox as the authoritative source for DHCP scope configuration in failover relationships (`push_scope_info=True` on any failover scope), the account **PSU's Windows Service runs as** must be a member of the DHCP Administrators group on **all failover member servers** — not just the primary. By default, PSU runs as Local System, which lacks these permissions on a remote partner server. (Reaching the partner from a delegated/impersonated identity — e.g. a WinRM-remoted session — doesn't work here regardless of that identity's rights, due to the standard Kerberos "double hop" limitation; the DHCP calls must run as PSU's own process identity.)
+
+To run PSU's Windows Service as a domain account, follow PSU's own documentation rather than any steps duplicated here: [Running as a Service Account](https://docs.devolutions.net/powershell-universal/config/running-as-a-service-account).
+
+Whichever account you use must be added to the **DHCP Administrators** group on every server in the failover relationship. If that group doesn't already exist on a server, create it with [`Add-DhcpServerSecurityGroup`](https://learn.microsoft.com/en-us/powershell/module/dhcpserver/add-dhcpserversecuritygroup).
+
+> **Troubleshooting:** If the PSU service fails to start after switching to a domain account (Windows Event ID 7000/7009, generic Error 1053), check the Application log for a `.NET Runtime` crash mentioning `SqliteException ... attempt to write a readonly database`. PSU's SQLite database (`C:\ProgramData\UniversalAutomation\database.db` by default) can have file-level permissions narrower than its parent folder, so the new account can't write to it even though the folder's ACL looks fine. Grant the account Modify rights directly, recursively:
+>
+> ```powershell
+> icacls 'C:\ProgramData\UniversalAutomation' /grant 'DOMAIN\svc-account:(OI)(CI)M' /T
+> ```
+
 ## Deployment
 
 ### Fresh install
@@ -168,7 +182,7 @@ If you prefer not to run `setup_roles.ps1`, create the roles and tokens through 
 
 PSU v5 runs each endpoint in an isolated runspace, so functions defined in one endpoint are not available in another. The script handles this by storing shared helper functions in the `$H` string and prepending them to every endpoint's scriptblock via `[scriptblock]::Create($H + {...}.ToString())`. This makes each endpoint fully self-contained.
 
-The script defines a `$PSUScriptVersion` constant (e.g. `'1.0.0'`) returned by `GET /api/dhcp/health`. The NetBox plugin compares this against its own `PSU_SCRIPT_VERSION` constant during health checks and shows a warning in the server list when they differ. Both constants must be kept in sync when the script changes — the plugin version and script version are independent; the script does not necessarily change with every plugin release.
+The script defines a `$PSU_SCRIPT_VERSION` constant (e.g. `'1.0.0'`) returned by `GET /api/dhcp/health`. The NetBox plugin compares this against its own `PSU_SCRIPT_VERSION` constant during health checks and shows a warning in the server list when they differ. Both constants must be kept in sync when the script changes — the plugin version and script version are independent; the script does not necessarily change with every plugin release.
 
 Shared helpers defined in `$H`:
 
@@ -195,6 +209,7 @@ URL path parameters (`:param`) and the `$Body` variable are injected automatical
 | GET | `/api/dhcp/scopes/:scope_id` | Get single scope by network address |
 | POST | `/api/dhcp/scopes` | Create a scope |
 | PUT | `/api/dhcp/scopes/:scope_id` | Update a scope |
+| DELETE | `/api/dhcp/scopes/:scope_id` | Delete a scope — returns 204 |
 | GET | `/api/dhcp/leases` | List active leases (optional `?scope_id=`) |
 | GET | `/api/dhcp/reservations` | List reservations (optional `?scope_id=`) |
 | POST | `/api/dhcp/reservations` | Create a reservation |
@@ -202,6 +217,7 @@ URL path parameters (`:param`) and the `$Body` variable are injected automatical
 | DELETE | `/api/dhcp/reservations/:client_id` | Delete reservation by MAC — returns 204 |
 | GET | `/api/dhcp/failover` | List failover relationships |
 | POST | `/api/dhcp/failover` | Create a failover relationship |
+| POST | `/api/dhcp/failover/replicate` | Force replication for specific scopes (body: `scope_ids`) |
 | GET | `/api/dhcp/options/server` | Server-level option values |
 | GET | `/api/dhcp/options/scope/:scope_id` | Scope-level option values |
 | GET | `/api/dhcp/exclusions?scope_id=` | List exclusion ranges for a scope |
@@ -228,6 +244,8 @@ URL path parameters (`:param`) and the `$Body` variable are injected automatical
 ```
 
 `router` is read from DHCP Option 3 on the scope; `null` if not set. `failover_name` is `null` if the scope is not part of a failover relationship.
+
+`DELETE /api/dhcp/scopes/:scope_id` returns 204 with no body.
 
 ### Lease
 
@@ -274,6 +292,8 @@ Only leases with `address_state` of `Active` or `ActiveReservation` are returned
 ```
 
 `primary_server` is resolved from the local machine's FQDN. `state_switchover_interval` is `null` when automatic state switchover is disabled.
+
+`POST /api/dhcp/failover/replicate` returns `{"replicated": ["10.0.1.0", "10.0.2.0"]}` — the same `scope_ids` sent in the request body.
 
 ### Option Value
 

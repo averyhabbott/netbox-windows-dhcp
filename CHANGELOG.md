@@ -2,7 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [1.3.7] - 2026-09-10
+
+### Fixed
+
+- **Duplicate/multiplying scheduled sync job chains (regression of v1.3.2/v1.3.3)** — `DHCPSyncJob` had no self-cleanup since v1.3.4, so duplicate scheduled jobs could accumulate indefinitely (hit in production: 33 concurrent overlapping syncs). Restored an advisory-locked convergence step that prunes duplicates down to one, run at the top of every sync and on settings save.
+- **Scope option values never reconciled after initial import** — option values (DNS servers, domain name, etc.) were only ever synced once, at creation, so a scope could drift arbitrarily afterward without detection. Added real two-way reconciliation on every sync; requires the bundled PSU script update (v1.1.1).
+- **Pushing a brand-new scope to the DHCP server always failed with a 500** — the create endpoint passed a bogus `-ScopeId` parameter to `Add-DhcpServerv4Scope`, which doesn't accept one. Removed the invalid parameter.
+- **Failover relationship membership never configured on the DHCP server, and config changes never replicated to the standby** — pushing a failover-assigned scope created it as a plain standalone scope, and no config change ever propagated to the secondary. Fixed both directions: pushes now enroll/remove failover membership and trigger batched replication, and pulls keep NetBox's failover assignment in sync with the server. Requires the same PSU script update (v1.1.1).
+- **Saving a DHCPScope never actually pushed it to the DHCP server**, and the intended mechanism would have triggered a full reconcile of every server on every single save. Replaced with a dedicated `DHCPScopePushJob` that pushes only the changed scope(s), batched per transaction, to only the correct server.
+- **Bulk maintenance mode on the Scopes list crashed with `UnboundLocalError`** — a local re-import of `DHCPScope` shadowed the module-level one partway through the function. Removed the redundant imports.
+- **"Edit Selected" and other bulk-action buttons could disappear from the Scopes/Servers/Failovers list pages** after a search, sort, or page change, because they shared a CSS class that NetBox's own htmx table refresh overwrites. Moved the plugin's custom buttons into their own container so they persist through any table interaction.
+- **Deleting a `DHCPScope` in NetBox never removed it from the Windows DHCP server**, and the failover-removal cmdlet it depends on was itself broken (`Remove-DhcpServerv4Failover` doesn't take a `-ScopeId` at all). Added a `DHCPScopeDeleteJob` that deconfigures failover and deletes the scope, fixed the cmdlet bug, and fixed a live-found follow-up where the scope-update endpoint rejected a deconfigure-only request with no scope-attribute changes. Requires the same PSU script update.
+- **A follow-up sweep on the scope-delete work above found several smaller gaps**: the new delete paths didn't respect maintenance-mode/sync-enabled/standalone-sync settings the way the push job does, a couple of PSU endpoints could mask real errors as fake 404s or reject a minimal request body, and some documentation had gone stale. All fixed, with new regression tests covering the eligibility checks.
+
+### Changed
+
+- **Clarified PSU service account setup for DHCP failover** (`psu/README.md`) — the account PSU's Windows Service runs as must be a DHCP Administrator on every server in the relationship, not just the primary, due to the Kerberos "double hop" limitation.
 
 ## [1.3.6] - 2026-06-18
 

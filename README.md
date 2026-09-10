@@ -380,6 +380,7 @@ The plugin expects PowerShell Universal **v5.x** (tested on 5.6.11+) on each DHC
 | GET | `/api/dhcp/scopes/:scope_id` | Get a single scope |
 | POST | `/api/dhcp/scopes` | Create a scope |
 | PUT | `/api/dhcp/scopes/:scope_id` | Update a scope |
+| DELETE | `/api/dhcp/scopes/:scope_id` | Delete a scope |
 | GET | `/api/dhcp/leases[?scope_id=]` | List active leases |
 | GET | `/api/dhcp/reservations[?scope_id=]` | List reservations |
 | POST | `/api/dhcp/reservations` | Create a reservation |
@@ -387,6 +388,7 @@ The plugin expects PowerShell Universal **v5.x** (tested on 5.6.11+) on each DHC
 | DELETE | `/api/dhcp/reservations/:client_id` | Delete a reservation |
 | GET | `/api/dhcp/failover` | List failover relationships |
 | POST | `/api/dhcp/failover` | Create a failover relationship |
+| POST | `/api/dhcp/failover/replicate` | Force failover replication for specific scopes (body: `scope_ids`) |
 | GET | `/api/dhcp/options/server` | Server-level option values |
 | GET | `/api/dhcp/options/scope/:scope_id` | Scope-level option values |
 | GET | `/api/dhcp/exclusions?scope_id=` | List exclusion ranges for a scope |
@@ -400,11 +402,13 @@ Authentication: PSU v5 App Tokens are sent as `Authorization: Bearer <token>`. G
 
 ### PSU script version tracking
 
-The PSU script embeds a version constant (`$PSUScriptVersion`). The plugin defines a matching `PSU_SCRIPT_VERSION` Python constant and checks it during the health check phase of every sync:
+The PSU script embeds a version constant (`$PSU_SCRIPT_VERSION`). The plugin defines a matching `PSU_SCRIPT_VERSION` Python constant and checks it during the health check phase of every sync:
 
 - When the versions **match**, a green check mark and version number appear in the server list.
 - When they **mismatch**, an amber warning icon and the observed version appear. The sync continues normally — the mismatch is advisory only, logged in the job output.
 - When the version is **unknown** (no health check has run yet), a gray question mark appears.
+
+This is advisory, not a guarantee: the version constant only changes when a release deliberately bumps it, so a plugin update that changes PSU script behavior without bumping `PSU_SCRIPT_VERSION` won't show as a mismatch. Always re-run **Update PSU Scripts** (below) after upgrading the plugin, rather than relying on this indicator alone to signal that an update is needed.
 
 The health check also confirms read/write access on every sync run; results update the server's **Health Status** (`Healthy` / `Unreachable` / `Unknown`) and **Last Health Check** time visible in the server list and detail view.
 

@@ -63,7 +63,7 @@ if ($PSVersionTable.PSEdition -eq 'Core') {
     Import-Module DhcpServer -ErrorAction Stop
 }
 
-$PSU_SCRIPT_VERSION = '1.1.0'
+$PSU_SCRIPT_VERSION = '1.1.1'
 
 function ConvertTo-ScopeObject {
     param([Microsoft.Management.Infrastructure.CimInstance]$Scope)
@@ -482,8 +482,11 @@ New-PSUEndpoint -Url '/api/dhcp/scopes/:scope_id' -Method GET @_epRead -Endpoint
         $scope = Get-DhcpServerv4Scope -ScopeId $scope_id -ErrorAction Stop
         ConvertTo-ScopeObject $scope | ConvertTo-Json -Depth 4 -Compress
     }
-    catch {
+    catch [Microsoft.Management.Infrastructure.CimException] {
         Write-ApiError -Message 'Scope not found.' -StatusCode 404
+    }
+    catch {
+        Write-ApiError -Message $_.Exception.Message -StatusCode 500
     }
 }.ToString()))
 
@@ -501,7 +504,12 @@ New-PSUEndpoint -Url '/api/dhcp/scopes/:scope_id' -Method GET @_epRead -Endpoint
 #     "subnet_mask": "255.255.255.0",
 #     "router": "10.0.1.1",           <- optional; sets DHCP Option 3
 #     "lease_duration_seconds": 86400,
-#     "description": ""
+#     "description": "",
+#     "options": {                    <- optional; arbitrary option codes
+#       "set": [{"code": 6, "value": ["10.0.0.1", "10.0.0.2"]}]
+#     },
+#     "failover": { "enroll": "FAILOVER-BUILDING-A" }   <- optional; relationship
+#                                                           must already exist
 #   }
 # ---------------------------------------------------------------------------
 New-PSUEndpoint -Url '/api/dhcp/scopes' -Method POST @_epWrite -Endpoint ([scriptblock]::Create($H + {
@@ -521,7 +529,6 @@ New-PSUEndpoint -Url '/api/dhcp/scopes' -Method POST @_epWrite -Endpoint ([scrip
         if ($body.router -and $body.router -ne '' -and -not (Assert-ValidIPv4 -Value $body.router -FieldName 'router')) { return }
 
         $addParams = @{
-            ScopeId     = $body.scope_id
             Name        = $body.name
             StartRange  = $body.start_ip
             EndRange    = $body.end_ip
@@ -546,6 +553,25 @@ New-PSUEndpoint -Url '/api/dhcp/scopes' -Method POST @_epWrite -Endpoint ([scrip
                 -ErrorAction SilentlyContinue
         }
 
+        # Set additional option values, if provided (excludes Option 3/51, which
+        # are handled via the router/lease_duration_seconds fields above).
+        if ($body.options -and $body.options.set) {
+            foreach ($opt in $body.options.set) {
+                Set-DhcpServerv4OptionValue -ScopeId $body.scope_id `
+                    -OptionId ([int]$opt.code) -Value @($opt.value) `
+                    -ErrorAction SilentlyContinue
+            }
+        }
+
+        # Enroll in a failover relationship, if requested. The relationship
+        # must already exist on this server (created separately via
+        # POST /api/dhcp/failover) — Add-DhcpServerv4FailoverScope adds a scope
+        # to an existing relationship by name; Add-DhcpServerv4Failover is only
+        # for creating a brand new relationship (always requires -PartnerServer).
+        if ($body.failover -and $body.failover.enroll) {
+            Add-DhcpServerv4FailoverScope -ScopeId $body.scope_id -Name $body.failover.enroll -ErrorAction Stop
+        }
+
         $scope = Get-DhcpServerv4Scope -ScopeId $body.scope_id -ErrorAction Stop
         New-PSUApiResponse -StatusCode 201 `
             -Body (ConvertTo-ScopeObject $scope | ConvertTo-Json -Depth 4 -Compress) `
@@ -562,6 +588,21 @@ New-PSUEndpoint -Url '/api/dhcp/scopes' -Method POST @_epWrite -Endpoint ([scrip
 # Updates an existing DHCP scope.
 #
 # Accepts the same body shape as POST.  Only provided fields are updated.
+# "options" and "failover", if provided, are applied as explicit instructions
+# rather than a desired-state list — the caller (NetBox) has already diffed
+# against the live scope, so this endpoint just executes them verbatim:
+#   "options": {
+#     "set":    [{"code": 6, "value": ["10.0.0.1", "10.0.0.2"]}],
+#     "remove": [66]
+#   },
+#   "failover": {
+#     "remove": "FAILOVER-CURRENT-NAME",  <- pull out of this (current) relationship;
+#                                             must be the exact relationship the scope
+#                                             is presently a member of
+#     "enroll": "FAILOVER-BUILDING-A"     <- then add to this one (reassignment
+#                                             sends both; the relationship must
+#                                             already exist)
+#   }
 # ---------------------------------------------------------------------------
 New-PSUEndpoint -Url '/api/dhcp/scopes/:scope_id' -Method PUT @_epWrite -Endpoint ([scriptblock]::Create($H + {
     if (-not (Assert-ValidIPv4 -Value $scope_id -FieldName 'scope_id')) { return }
@@ -578,15 +619,22 @@ New-PSUEndpoint -Url '/api/dhcp/scopes/:scope_id' -Method PUT @_epWrite -Endpoin
             ScopeId     = $scope_id
             ErrorAction = 'Stop'
         }
-        if ($body.PSObject.Properties.Name -contains 'name')        { $setParams['Name']        = $body.name }
-        if ($body.PSObject.Properties.Name -contains 'start_ip')    { $setParams['StartRange']  = $body.start_ip }
-        if ($body.PSObject.Properties.Name -contains 'end_ip')      { $setParams['EndRange']    = $body.end_ip }
-        if ($body.PSObject.Properties.Name -contains 'description') { $setParams['Description'] = $body.description }
+        $hasScopeChanges = $false
+        if ($body.PSObject.Properties.Name -contains 'name')        { $setParams['Name']        = $body.name; $hasScopeChanges = $true }
+        if ($body.PSObject.Properties.Name -contains 'start_ip')    { $setParams['StartRange']  = $body.start_ip; $hasScopeChanges = $true }
+        if ($body.PSObject.Properties.Name -contains 'end_ip')      { $setParams['EndRange']    = $body.end_ip; $hasScopeChanges = $true }
+        if ($body.PSObject.Properties.Name -contains 'description') { $setParams['Description'] = $body.description; $hasScopeChanges = $true }
         if ($body.PSObject.Properties.Name -contains 'lease_duration_seconds' -and $body.lease_duration_seconds -gt 0) {
             $setParams['LeaseDuration'] = [TimeSpan]::FromSeconds([int]$body.lease_duration_seconds)
+            $hasScopeChanges = $true
         }
 
-        Set-DhcpServerv4Scope @setParams
+        # Set-DhcpServerv4Scope rejects being called with no optional parameters
+        # (WIN32 87) — skip it entirely for a body that only carries options/
+        # router/failover instructions and no scope-attribute changes.
+        if ($hasScopeChanges) {
+            Set-DhcpServerv4Scope @setParams
+        }
 
         # Update router (Option 3) if provided
         if ($body.PSObject.Properties.Name -contains 'router') {
@@ -601,8 +649,59 @@ New-PSUEndpoint -Url '/api/dhcp/scopes/:scope_id' -Method PUT @_epWrite -Endpoin
             }
         }
 
+        # Apply option value changes, if provided (excludes Option 3/51, which
+        # are handled via the router/lease_duration_seconds fields above).
+        if ($body.options) {
+            foreach ($opt in $body.options.set) {
+                Set-DhcpServerv4OptionValue -ScopeId $scope_id `
+                    -OptionId ([int]$opt.code) -Value @($opt.value) `
+                    -ErrorAction SilentlyContinue
+            }
+            foreach ($code in $body.options.remove) {
+                Remove-DhcpServerv4OptionValue -ScopeId $scope_id `
+                    -OptionId ([int]$code) -ErrorAction SilentlyContinue
+            }
+        }
+
+        # Reconcile failover relationship membership, if requested. Applied in
+        # remove-then-enroll order so a reassignment (both keys present) lands
+        # the scope in its new relationship rather than erroring because it's
+        # still a member of the old one.
+        if ($body.failover) {
+            if ($body.failover.remove) {
+                # Remove-DhcpServerv4Failover has no -ScopeId parameter — it deletes
+                # an entire relationship from both partners. Removing a single scope
+                # from a relationship (without touching the relationship itself)
+                # requires Remove-DhcpServerv4FailoverScope, which also deletes the
+                # scope from the partner server as part of deconfiguring it.
+                Remove-DhcpServerv4FailoverScope -Name $body.failover.remove -ScopeId $scope_id -Force -ErrorAction Stop
+            }
+            if ($body.failover.enroll) {
+                Add-DhcpServerv4FailoverScope -ScopeId $scope_id -Name $body.failover.enroll -ErrorAction Stop
+            }
+        }
+
         $scope = Get-DhcpServerv4Scope -ScopeId $scope_id -ErrorAction Stop
         ConvertTo-ScopeObject $scope | ConvertTo-Json -Depth 4 -Compress
+    }
+    catch [Microsoft.Management.Infrastructure.CimException] {
+        Write-ApiError -Message 'Scope not found.' -StatusCode 404
+    }
+    catch {
+        Write-ApiError -Message $_.Exception.Message -StatusCode 500
+    }
+}.ToString()))
+
+
+# ---------------------------------------------------------------------------
+# DELETE /api/dhcp/scopes/:scope_id
+# Deletes a DHCP scope. Returns 204 No Content.
+# ---------------------------------------------------------------------------
+New-PSUEndpoint -Url '/api/dhcp/scopes/:scope_id' -Method DELETE @_epWrite -Endpoint ([scriptblock]::Create($H + {
+    if (-not (Assert-ValidIPv4 -Value $scope_id -FieldName 'scope_id')) { return }
+    try {
+        Remove-DhcpServerv4Scope -ScopeId $scope_id -Force -ErrorAction Stop
+        New-PSUApiResponse -StatusCode 204
     }
     catch [Microsoft.Management.Infrastructure.CimException] {
         Write-ApiError -Message 'Scope not found.' -StatusCode 404
@@ -763,11 +862,17 @@ New-PSUEndpoint -Url '/api/dhcp/reservations/:client_id' -Method PUT @_epWrite -
             IPAddress   = $reservation.IPAddress
             ErrorAction = 'Stop'
         }
-        if ($body.PSObject.Properties.Name -contains 'name')        { $setParams['Name']        = $body.name }
-        if ($body.PSObject.Properties.Name -contains 'description') { $setParams['Description'] = $body.description }
-        if ($body.PSObject.Properties.Name -contains 'type')        { $setParams['Type']        = $body.type }
+        $hasChanges = $false
+        if ($body.PSObject.Properties.Name -contains 'name')        { $setParams['Name']        = $body.name; $hasChanges = $true }
+        if ($body.PSObject.Properties.Name -contains 'description') { $setParams['Description'] = $body.description; $hasChanges = $true }
+        if ($body.PSObject.Properties.Name -contains 'type')        { $setParams['Type']        = $body.type; $hasChanges = $true }
 
-        Set-DhcpServerv4Reservation @setParams
+        # Set-DhcpServerv4Reservation rejects being called with no optional
+        # parameters, the same WIN32 87 behavior as Set-DhcpServerv4Scope —
+        # skip it entirely for a body with no actual attribute changes.
+        if ($hasChanges) {
+            Set-DhcpServerv4Reservation @setParams
+        }
 
         $updated = Get-DhcpServerv4Reservation -ScopeId $reservation.ScopeId -ErrorAction Stop |
                    Where-Object { $_.IPAddress -eq $reservation.IPAddress } |
@@ -877,28 +982,56 @@ New-PSUEndpoint -Url '/api/dhcp/failover' -Method POST @_epWrite -Endpoint ([scr
             MaxResponseDelay  = [TimeSpan]::FromSeconds($mrd)
             ErrorAction       = 'Stop'
         }
-
-        # Mode
         if ($body.mode) { $addParams['Mode'] = $body.mode }
-
-        # State switchover interval (null/0 = disabled)
         if ($body.state_switchover_interval -and [int]$body.state_switchover_interval -gt 0) {
             $addParams['StateSwitchInterval'] = [TimeSpan]::FromSeconds([int]$body.state_switchover_interval)
         }
-
-        # Authentication
         if ($body.enable_auth -eq $true) {
             $addParams['EnableAuth'] = $true
-            if ($body.shared_secret) {
-                $addParams['SharedSecret'] = $body.shared_secret
-            }
+            if ($body.shared_secret) { $addParams['SharedSecret'] = $body.shared_secret }
         }
-
         Add-DhcpServerv4Failover @addParams
 
         $failover = Get-DhcpServerv4Failover -Name $body.name -ErrorAction Stop
         New-PSUApiResponse -StatusCode 201 `
             -Body (ConvertTo-FailoverObject $failover | ConvertTo-Json -Depth 5 -Compress) `
+            -ContentType 'application/json'
+    }
+    catch {
+        Write-ApiError -Message $_.Exception.Message -StatusCode 500
+    }
+}.ToString()))
+
+
+# ---------------------------------------------------------------------------
+# POST /api/dhcp/failover/replicate
+# Forces failover replication for specific scopes only — much faster than
+# replicating an entire relationship (Invoke-DhcpServerv4FailoverReplication
+# with -Name walks every scope the relationship covers). Each scope's
+# relationship/partner is resolved internally by the cmdlet, so scope IDs
+# from different relationships can be batched into a single call.
+#
+# Expected body:
+#   { "scope_ids": ["10.101.1.0", "10.101.2.0"] }
+# ---------------------------------------------------------------------------
+New-PSUEndpoint -Url '/api/dhcp/failover/replicate' -Method POST @_epWrite -Endpoint ([scriptblock]::Create($H + {
+    try {
+        $body = $Body | ConvertFrom-Json
+
+        if (-not $body.scope_ids -or @($body.scope_ids).Count -eq 0) {
+            New-PSUApiResponse -StatusCode 400 `
+                -Body (@{ error = 'scope_ids is required and must be a non-empty array.' } | ConvertTo-Json -Compress) `
+                -ContentType 'application/json'
+            return
+        }
+        foreach ($sid in @($body.scope_ids)) {
+            if (-not (Assert-ValidIPv4 -Value $sid -FieldName 'scope_ids')) { return }
+        }
+
+        Invoke-DhcpServerv4FailoverReplication -ScopeId @($body.scope_ids) -Force -ErrorAction Stop
+
+        New-PSUApiResponse -StatusCode 200 `
+            -Body (@{ replicated = @($body.scope_ids) } | ConvertTo-Json -Compress) `
             -ContentType 'application/json'
     }
     catch {
@@ -1031,6 +1164,9 @@ New-PSUEndpoint -Url '/api/dhcp/exclusions' -Method POST @_epWrite -Endpoint ([s
             -Body (ConvertTo-ExclusionRangeObject $exclusions | ConvertTo-Json -Depth 4 -Compress) `
             -ContentType 'application/json'
     }
+    catch [Microsoft.Management.Infrastructure.CimException] {
+        Write-ApiError -Message 'Scope not found.' -StatusCode 404
+    }
     catch {
         Write-ApiError -Message $_.Exception.Message -StatusCode 500
     }
@@ -1071,6 +1207,9 @@ New-PSUEndpoint -Url '/api/dhcp/exclusions' -Method DELETE @_epWrite -Endpoint (
             -ErrorAction Stop
 
         New-PSUApiResponse -StatusCode 204
+    }
+    catch [Microsoft.Management.Infrastructure.CimException] {
+        Write-ApiError -Message 'Scope not found.' -StatusCode 404
     }
     catch {
         Write-ApiError -Message $_.Exception.Message -StatusCode 500

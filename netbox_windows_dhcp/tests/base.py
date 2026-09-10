@@ -145,7 +145,10 @@ class FakePSUClient:
 
     Recorded writes are available on ``created_reservations``,
     ``created_exclusions``, ``deleted_exclusions``, ``created_scopes``,
-    ``updated_scopes`` for assertions.
+    ``updated_scopes``, ``deleted_scopes``, ``replicated_failover_calls`` for
+    assertions.
+    ``list_scopes_calls`` records the ``active_only`` argument passed on each
+    ``list_scopes()`` call.
     """
 
     def __init__(self, scopes=None, leases=None, reservations=None,
@@ -166,6 +169,9 @@ class FakePSUClient:
         self.deleted_exclusions = []
         self.created_scopes = []
         self.updated_scopes = []
+        self.deleted_scopes = []
+        self.list_scopes_calls = []
+        self.replicated_failover_calls = []
 
     # --- reads ---
     def ping_read(self):
@@ -175,7 +181,16 @@ class FakePSUClient:
         return True
 
     def list_scopes(self, active_only=False):
+        self.list_scopes_calls.append(active_only)
         return list(self._scopes)
+
+    def get_scope(self, scope_id):
+        from ..api_client import PSUClientError
+        for s in self._scopes:
+            sid = s.get('scope_id') or s.get('ScopeId') or s.get('network_address')
+            if sid == scope_id:
+                return s
+        raise PSUClientError(f'Scope {scope_id} not found', status_code=404)
 
     def list_leases(self, scope_id=None):
         return list(self._leases.get(scope_id, []))
@@ -218,6 +233,13 @@ class FakePSUClient:
     def update_scope(self, scope_id, payload):
         self.updated_scopes.append((scope_id, payload))
         return payload
+
+    def delete_scope(self, scope_id):
+        self.deleted_scopes.append(scope_id)
+
+    def replicate_failover(self, scope_ids):
+        self.replicated_failover_calls.append(list(scope_ids))
+        return {'replicated': list(scope_ids)}
 
 
 # Canned PSU response payloads (snake_case, the primary contract documented in

@@ -224,6 +224,9 @@ class PSUClient:
     def update_scope(self, scope_id: str, payload: Dict) -> Dict:
         return self._put(f'scopes/{scope_id}', payload)
 
+    def delete_scope(self, scope_id: str) -> None:
+        self._delete(f'scopes/{scope_id}')
+
     # ------------------------------------------------------------------
     # Leases
     # ------------------------------------------------------------------
@@ -309,6 +312,16 @@ class PSUClient:
             }
         """
         return self._post('failover', payload)
+
+    def replicate_failover(self, scope_ids: List[str]) -> Dict:
+        """
+        Force failover replication for specific scopes only — faster than
+        replicating an entire relationship, since it skips every other scope
+        the relationship covers. The server resolves each scope's relationship
+        (and partner) internally, so scope IDs from different relationships
+        can be batched into a single call.
+        """
+        return self._post('failover/replicate', {'scope_ids': scope_ids})
 
     # ------------------------------------------------------------------
     # Options

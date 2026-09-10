@@ -62,7 +62,8 @@ class DHCPPluginSettings(models.Model):
         help_text=(
             'When enabled, NetBox is the source of truth: scope configuration '
             '(name, range, options) is pushed to the DHCP server on save, and '
-            'unknown remote scopes are ignored. When disabled, the DHCP server '
+            'unknown remote scopes are removed from the server (subject to '
+            'maintenance mode and sync settings). When disabled, the DHCP server '
             'is the source of truth: scope attributes are pulled from the server '
             'on every sync, scopes present on the server but not in NetBox are '
             'auto-created, and scopes removed from the server are deleted from '

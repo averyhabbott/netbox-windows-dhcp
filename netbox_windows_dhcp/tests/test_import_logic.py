@@ -147,3 +147,15 @@ class RunImportTests(TestCase):
             results = run_import(self.server)
         self.assertEqual(len(results['scopes']['created']), 1)
         self.assertTrue(DHCPScope.objects.filter(name='Building A').exists())
+
+    def test_run_import_defaults_to_all_scopes(self):
+        fake = FakePSUClient(scopes=[dict(FAKE_SCOPE_SNAKE)], failover=[])
+        with mock.patch('netbox_windows_dhcp.api_client.PSUClient', return_value=fake):
+            run_import(self.server)
+        self.assertEqual(fake.list_scopes_calls, [False])
+
+    def test_run_import_forwards_active_only(self):
+        fake = FakePSUClient(scopes=[dict(FAKE_SCOPE_SNAKE)], failover=[])
+        with mock.patch('netbox_windows_dhcp.api_client.PSUClient', return_value=fake):
+            run_import(self.server, active_only=True)
+        self.assertEqual(fake.list_scopes_calls, [True])

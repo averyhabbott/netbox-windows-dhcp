@@ -256,7 +256,7 @@ class DHCPGlobalSyncView(LoginRequiredMixin, View):
                 job_timeout=cfg.sync_job_timeout,
             )
             count += 1
-        messages.success(request, f'Queued sync job for {count} server(s). Check System → Jobs for progress.')
+        messages.success(request, f'Queued sync job for {count} server(s). Check Operations → Jobs for progress.')
         return redirect('plugins:netbox_windows_dhcp:dhcpserver_list')
 
 
@@ -819,7 +819,6 @@ class DHCPFailoverMaintenanceView(LoginRequiredMixin, View):
 @register_model_view(DHCPScope, 'maintenance', path='maintenance')
 class DHCPScopeMaintenanceView(LoginRequiredMixin, View):
     def get(self, request, pk):
-        from .models import DHCPScope
         scope = get_object_or_404(DHCPScope, pk=pk)
         return render(request, 'netbox_windows_dhcp/dhcpmaintenance_toggle.html', {
             'object': scope,
@@ -832,7 +831,6 @@ class DHCPScopeMaintenanceView(LoginRequiredMixin, View):
         if not request.user.has_perm(get_permission_for_model(DHCPScope, 'change')):
             messages.error(request, 'You do not have permission to modify scope maintenance settings.')
             return redirect('plugins:netbox_windows_dhcp:dhcpscope_list')
-        from .models import DHCPScope
         scope = get_object_or_404(DHCPScope, pk=pk)
         enabled = request.POST.get('maintenance_mode') == '1'
         notes = request.POST.get('maintenance_notes', '')
@@ -917,7 +915,6 @@ class DHCPScopeBulkMaintenanceView(LoginRequiredMixin, View):
         if request.POST.get('confirm'):
             enabled = request.POST.get('maintenance_mode') == '1'
             notes = request.POST.get('maintenance_notes', '')
-            from .models import DHCPScope
             objs = DHCPScope.objects.filter(pk__in=pk_list)
             count = objs.count()
             for obj in objs:
@@ -926,7 +923,6 @@ class DHCPScopeBulkMaintenanceView(LoginRequiredMixin, View):
             messages.success(request, f'Maintenance mode {action} for {count} scope(s).')
             return redirect('plugins:netbox_windows_dhcp:dhcpscope_list')
         from django.urls import reverse
-        from .models import DHCPScope
         return render(request, 'netbox_windows_dhcp/dhcpmaintenance_bulk.html', {
             'objects': DHCPScope.objects.filter(pk__in=pk_list),
             'object_type': 'Scope',
@@ -943,7 +939,6 @@ class DHCPCurrentMaintenanceView(LoginRequiredMixin, View):
     template_name = 'netbox_windows_dhcp/dhcpcurrentmaintenance.html'
 
     def get(self, request):
-        from .models import DHCPScope
         filter_type = request.GET.get('type', 'all')
 
         items = []
@@ -1009,7 +1004,6 @@ class DHCPCurrentMaintenanceBulkDisableView(LoginRequiredMixin, View):
     """Disable maintenance on any mix of servers, failovers, and scopes in one POST."""
 
     def post(self, request):
-        from .models import DHCPScope
         selected = request.POST.getlist('selected')
         if not selected:
             messages.warning(request, 'No items selected.')
@@ -1124,10 +1118,15 @@ class ScheduleSyncView(LoginRequiredMixin, View):
     """
     Handle 'Run Now' and 'Schedule' actions for the recurring DHCPSyncJob.
 
-    POST action=run_now  — cancel any existing scheduled job, enqueue immediately
-                           (job auto-reschedules after it completes).
-    POST action=schedule — cancel any existing scheduled job, create a new one
-                           scheduled at the user-supplied start_at datetime.
+    POST action=run_now  — enqueue a one-off immediate run (interval=None, so
+                           it does not itself reschedule). Does NOT cancel or
+                           otherwise affect the existing recurring chain.
+    POST action=schedule — replace the recurring chain's next entry with one
+                           starting at the user-supplied start_at datetime.
+                           Collapses any duplicate scheduled/pending
+                           "Windows DHCP Sync" jobs down to one via
+                           DHCPSyncJob.converge_schedule() before applying
+                           the new schedule.
     """
 
     def post(self, request):
@@ -1155,9 +1154,10 @@ class ScheduleSyncView(LoginRequiredMixin, View):
             return redirect(job.get_absolute_url())
 
         # action == 'schedule' — replace the recurring chain's next entry with
-        # one starting at the user-supplied time. enqueue_once handles the
-        # delete-and-replace atomically (advisory-locked) and cleans up the
-        # Redis entry of the old scheduled job.
+        # one starting at the user-supplied time. converge_schedule() collapses
+        # any duplicate scheduled/pending jobs down to one (advisory-locked,
+        # per-instance delete so the Redis entry is canceled too) before
+        # applying the new schedule via enqueue_once() semantics.
         from django.utils.dateparse import parse_datetime
 
         raw = request.POST.get('start_at', '').strip()
@@ -1174,7 +1174,7 @@ class ScheduleSyncView(LoginRequiredMixin, View):
             messages.error(request, 'Start time must be in the future.')
             return redirect('plugins:netbox_windows_dhcp:settings')
 
-        DHCPSyncJob.enqueue_once(
+        DHCPSyncJob.converge_schedule(
             schedule_at=scheduled_at,
             interval=cfg.sync_interval,
             user=request.user,
@@ -1375,5 +1375,5 @@ class DHCPServerBulkPSUUpdateView(LoginRequiredMixin, View):
                 queue_name=cfg.sync_queue,
             )
             count += 1
-        messages.success(request, f'PSU script update jobs queued for {count} server(s). Check System → Jobs for progress.')
+        messages.success(request, f'PSU script update jobs queued for {count} server(s). Check Operations → Jobs for progress.')
         return redirect('plugins:netbox_windows_dhcp:dhcpserver_list')

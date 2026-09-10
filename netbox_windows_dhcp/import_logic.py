@@ -14,7 +14,7 @@ from netaddr import AddrFormatError, IPNetwork
 logger = logging.getLogger('netbox_windows_dhcp')
 
 
-def run_import(server) -> Dict:
+def run_import(server, active_only: bool = False) -> Dict:
     """
     Connect to *server* and import failovers, scopes, and scope options.
     Returns a results dict suitable for template rendering.
@@ -50,7 +50,7 @@ def run_import(server) -> Dict:
     # 2. Scopes (+ scope-level option values)
     # ------------------------------------------------------------------ #
     try:
-        remote_scopes = client.list_scopes()
+        remote_scopes = client.list_scopes(active_only=active_only)
     except PSUClientError as exc:
         results['scopes']['errors'].append(f'Could not fetch scope list: {exc}')
         remote_scopes = []
@@ -238,55 +238,90 @@ def _import_scope(client, rs: Dict, results: Dict, server=None):
 # Option value helper
 # ---------------------------------------------------------------------- #
 
-def _import_option_value(scope, ro: Dict, results: Dict):
-    from .models import DHCPOptionCodeDefinition, DHCPOptionValue
+#: Option 3 (Router) and Option 51 (Lease Time) are stored on DHCPScope's own
+#: router/lease_lifetime fields instead of as DHCPOptionValue rows, so every
+#: option-value code path (import, and the recurring pull/push sync) skips them.
+SCOPE_FIELD_OPTION_CODES = (3, 51)
 
+
+def normalize_option_value(ro: Dict):
+    """
+    Parse a raw PSU scope-option dict into (code, value, name, vendor_class).
+
+    Returns None if no option code is present. `value` is always a string —
+    PSU returns multi-value options (e.g. DNS servers) as a JSON array, which
+    is joined into a comma-separated string for storage in DHCPOptionValue.value.
+    """
     # PSU returns 'code'; older/alternative shapes use 'OptionId' or 'option_id'
-    code_raw     = ro.get('code') or ro.get('OptionId') or ro.get('option_id')
+    code_raw = ro.get('code') or ro.get('OptionId') or ro.get('option_id')
+    if code_raw is None:
+        return None
+
+    code = int(code_raw)
     value_raw    = ro.get('value') or ro.get('Value') or ''
     opt_name     = ro.get('name')  or ro.get('Name')  or ''
     vendor_class = ro.get('vendor_class') or ro.get('VendorClass') or ''
 
-    if code_raw is None:
-        return
-
-    code = int(code_raw)
-
-    # Option 3 (Router) is stored on the scope's router field.
-    # Option 51 (Lease Time) is stored on the scope's lease_lifetime field.
-    # Skip both here to avoid duplicate data.
-    if code in (3, 51):
-        return
-
-    # PSU returns value as a JSON array (multi-value options like DNS servers);
-    # join to a comma-separated string for storage.
     if isinstance(value_raw, list):
         value = ', '.join(str(v) for v in value_raw if v is not None)
     else:
         value = str(value_raw)
+
+    return code, value, opt_name, vendor_class
+
+
+def denormalize_option_value(value: str):
+    """
+    Reverse of the comma-join in normalize_option_value(), for sending a value
+    back to PSU as the array Set-DhcpServerv4OptionValue expects.
+
+    Note: this is a best-effort split on the exact ', ' separator used above —
+    a value containing a literal ', ' inside a single item won't round-trip.
+    """
+    return value.split(', ') if value else []
+
+
+def get_or_create_option_value(code: int, value: str, name: str = '', vendor_class: str = ''):
+    """
+    Find-or-create the DHCPOptionCodeDefinition and DHCPOptionValue for a
+    normalized (code, value) pair. Shared by the one-time import and the
+    recurring pull-direction sync so both create identical records.
+    """
+    from .models import DHCPOptionCodeDefinition, DHCPOptionValue
 
     # Find or create the option code definition, using the PSU-provided name
     # when creating a new record; never overwrite the name on an existing record.
     opt_def, _ = DHCPOptionCodeDefinition.objects.get_or_create(
         code=code,
         defaults={
-            'name': opt_name or f'Option {code}',
+            'name': name or f'Option {code}',
             'data_type': 'String',
             'is_builtin': False,
             'vendor_class': vendor_class,
         },
     )
 
-    # Find or create the option value
     opt_val, created = DHCPOptionValue.objects.get_or_create(
         option_definition=opt_def,
         value=value,
         defaults={'friendly_name': ''},
     )
+    return opt_val, created
 
+
+def _import_option_value(scope, ro: Dict, results: Dict):
+    parsed = normalize_option_value(ro)
+    if parsed is None:
+        return
+
+    code, value, opt_name, vendor_class = parsed
+    if code in SCOPE_FIELD_OPTION_CODES:
+        return
+
+    opt_val, created = get_or_create_option_value(code, value, opt_name, vendor_class)
     scope.option_values.add(opt_val)
 
-    label = f'Option {code} ({opt_def.name}): {value} — scope: {scope.name}'
+    label = f'Option {code} ({opt_val.option_definition.name}): {value} — scope: {scope.name}'
     if created:
         results['option_values']['created'].append(label)
     else:
