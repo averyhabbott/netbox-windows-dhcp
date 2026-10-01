@@ -1,7 +1,8 @@
 from django import forms
+from django.utils.html import format_html
 
 from extras.models import Tag
-from ipam.models import Prefix
+from ipam.models import VRF, Prefix
 from netbox.forms import NetBoxModelBulkEditForm, NetBoxModelForm, NetBoxModelFilterSetForm
 from utilities.forms.utils import add_blank_choice
 from utilities.forms.fields import (
@@ -9,9 +10,12 @@ from utilities.forms.fields import (
     DynamicModelMultipleChoiceField,
     TagFilterField,
 )
+from utilities.forms.constants import BOOLEAN_WITH_BLANK_CHOICES
 from utilities.forms.rendering import FieldSet, InlineFields
+from utilities.forms.widgets import BulkEditNullBooleanSelect
 
-from .choices import DHCPOptionDataTypeChoices
+from .choices import DHCPOptionDataTypeChoices, DHCPServerAccessChoices, DHCPServerHealthChoices
+from .locks import check_option_codes, server_owns_scope_info
 from .models import (
     DHCPExclusionRange,
     DHCPFailover,
@@ -29,7 +33,7 @@ from .models import (
 
 class DHCPExclusionRangeForm(NetBoxModelForm):
     fieldsets = (
-        FieldSet('scope', 'start_ip', 'end_ip', name='Exclusion Range'),
+        FieldSet('scope', 'start_ip', 'end_ip', 'description', name='Exclusion Range'),
         FieldSet('tags', name='Tags'),
     )
 
@@ -38,9 +42,12 @@ class DHCPExclusionRangeForm(NetBoxModelForm):
         label='Scope',
     )
 
+    #: Shown read-only on an edit while push_scope_info is off (the server owns them).
+    READ_ONLY_WHEN_PUSH_OFF = ('scope', 'start_ip', 'end_ip')
+
     class Meta:
         model = DHCPExclusionRange
-        fields = ('scope', 'start_ip', 'end_ip', 'tags')
+        fields = ('scope', 'start_ip', 'end_ip', 'description', 'tags')
         labels = {
             'start_ip': 'Start IP',
             'end_ip': 'End IP',
@@ -55,6 +62,13 @@ class DHCPExclusionRangeForm(NetBoxModelForm):
                 self.initial['scope'] = int(scope_id)
             except (TypeError, ValueError):
                 pass
+        # push_scope_info off: the server owns the range, so only the NetBox-only
+        # fields stay editable (disabled fields ignore anything posted).
+        self.server_owned = bool(self.instance.pk and server_owns_scope_info())
+        if self.server_owned:
+            for name in self.READ_ONLY_WHEN_PUSH_OFF:
+                self.fields[name].disabled = True
+                self.fields[name].required = False
 
 
 # ---------------------------------------------------------------------------
@@ -64,10 +78,19 @@ class DHCPExclusionRangeForm(NetBoxModelForm):
 class DHCPServerForm(NetBoxModelForm):
     fieldsets = (
         FieldSet('name', 'hostname', 'port', 'use_https', 'api_key', 'verify_ssl', name='Server'),
-        FieldSet('sync_standalone_scopes', name='Sync'),
+        FieldSet('sync_standalone_scopes', 'default_scope_vrf', name='Sync'),
         FieldSet('tags', name='Tags'),
     )
 
+    default_scope_vrf = DynamicModelChoiceField(
+        queryset=VRF.objects.all(),
+        required=False,
+        label='Default Scope VRF',
+        help_text=(
+            'Where standalone scopes learned from this server look for (or create) their prefix. '
+            'Blank means the global VRF. Changing it only affects scopes learned from then on.'
+        ),
+    )
     ca_cert = forms.CharField(widget=forms.HiddenInput(), required=False)
     ca_cert_expiry = forms.CharField(widget=forms.HiddenInput(), required=False)
 
@@ -75,7 +98,7 @@ class DHCPServerForm(NetBoxModelForm):
         model = DHCPServer
         fields = (
             'name', 'hostname', 'port', 'use_https', 'api_key', 'verify_ssl',
-            'sync_standalone_scopes', 'tags', 'ca_cert', 'ca_cert_expiry',
+            'sync_standalone_scopes', 'default_scope_vrf', 'tags', 'ca_cert', 'ca_cert_expiry',
         )
         labels = {
             'api_key': 'App Token',
@@ -122,6 +145,16 @@ class DHCPServerForm(NetBoxModelForm):
 
 class DHCPServerFilterForm(NetBoxModelFilterSetForm):
     model = DHCPServer
+    health_status = forms.MultipleChoiceField(
+        choices=DHCPServerHealthChoices,
+        required=False,
+        label='Health Status',
+    )
+    access_level = forms.MultipleChoiceField(
+        choices=DHCPServerAccessChoices,
+        required=False,
+        label='Writable',
+    )
     tag = TagFilterField(model)
 
 
@@ -130,47 +163,69 @@ class DHCPServerFilterForm(NetBoxModelFilterSetForm):
 # ---------------------------------------------------------------------------
 
 class DHCPFailoverForm(NetBoxModelForm):
+    """
+    Failovers are managed on the DHCP server and imported. Only the NetBox-side fields
+    can be edited here — Default Scope VRF, description and tags; the rest is shown
+    read-only (disabled fields ignore anything posted). The shared secret is never shown.
+    Sync on/off and maintenance mode live on the failover's own page.
+    """
     fieldsets = (
-        FieldSet('name', 'primary_server', 'secondary_server', 'mode', name='Failover'),
-        FieldSet('max_client_lead_time', 'max_response_delay', 'state_switchover_interval', name='Timing'),
-        FieldSet('enable_auth', 'shared_secret', name='Authentication'),
-        FieldSet('sync_enabled', name='Sync'),
+        FieldSet('name', 'description', 'default_scope_vrf', name='Failover'),
+        FieldSet('primary_server', 'secondary_server', 'mode', name='Servers (read-only)'),
+        FieldSet(
+            'max_client_lead_time', 'max_response_delay', 'state_switchover_interval', 'enable_auth',
+            name='Settings from the DHCP server (read-only)',
+        ),
         FieldSet('tags', name='Tags'),
+    )
+
+    #: Fields owned by the DHCP server — shown, never edited.
+    READ_ONLY_FIELDS = (
+        'name', 'primary_server', 'secondary_server', 'mode', 'max_client_lead_time',
+        'max_response_delay', 'state_switchover_interval', 'enable_auth',
     )
 
     primary_server = DynamicModelChoiceField(
         queryset=DHCPServer.objects.all(),
+        required=False,
         label='Primary Server',
     )
     secondary_server = DynamicModelChoiceField(
         queryset=DHCPServer.objects.all(),
+        required=False,
         label='Secondary Server',
+    )
+    default_scope_vrf = DynamicModelChoiceField(
+        queryset=VRF.objects.all(),
+        required=False,
+        label='Default Scope VRF',
+        help_text=(
+            'Where scopes learned for this failover look for (or create) their prefix. '
+            'Blank means the global VRF. Changing it only affects scopes learned from then on.'
+        ),
     )
 
     class Meta:
         model = DHCPFailover
         fields = (
             'name',
+            'description',
+            'default_scope_vrf',
             'primary_server',
             'secondary_server',
             'mode',
             'max_client_lead_time',
             'max_response_delay',
             'state_switchover_interval',
-            'sync_enabled',
             'enable_auth',
-            'shared_secret',
             'tags',
         )
-        widgets = {
-            'shared_secret': forms.PasswordInput(render_value=False),
-        }
 
-    def clean_shared_secret(self):
-        value = self.cleaned_data.get('shared_secret', '').strip()
-        if not value and self.instance.pk:
-            return self.instance.shared_secret
-        return value
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        for name in self.READ_ONLY_FIELDS:
+            self.fields[name].disabled = True
+            self.fields[name].required = False
 
 
 class DHCPFailoverFilterForm(NetBoxModelFilterSetForm):
@@ -269,7 +324,7 @@ LEASE_LIFETIME_UNIT_MULTIPLIERS = {
 
 class DHCPScopeForm(NetBoxModelForm):
     fieldsets = (
-        FieldSet('name', 'prefix', name='Scope Identity'),
+        FieldSet('name', 'active', 'description', 'prefix', 'network', 'prefix_length', name='Scope Identity'),
         FieldSet(
             'start_ip', 'end_ip', 'router',
             InlineFields('lease_lifetime_value', 'lease_lifetime_unit', label='Lease Lifetime'),
@@ -281,7 +336,25 @@ class DHCPScopeForm(NetBoxModelForm):
 
     prefix = DynamicModelChoiceField(
         queryset=Prefix.objects.all(),
+        required=False,
         label='Prefix',
+        help_text=(
+            'A prefix can have only one scope. Leave blank for a scope with no prefix '
+            '(IP sync and reservations are skipped for it) and enter its network below.'
+        ),
+    )
+    network = forms.GenericIPAddressField(
+        protocol='IPv4',
+        required=False,
+        label='Network',
+        help_text='Only needed when no prefix is set (the scope ID on the DHCP server, e.g. 10.0.1.0).',
+    )
+    prefix_length = forms.IntegerField(
+        min_value=1,
+        max_value=32,
+        required=False,
+        label='Prefix Length',
+        help_text='Only needed when no prefix is set (e.g. 24).',
     )
     server = DynamicModelChoiceField(
         queryset=DHCPServer.objects.all(),
@@ -309,11 +382,21 @@ class DHCPScopeForm(NetBoxModelForm):
         label='Unit',
     )
 
+    #: Shown read-only on an edit while push_scope_info is off (the server owns them).
+    READ_ONLY_WHEN_PUSH_OFF = (
+        'name', 'active', 'description', 'network', 'prefix_length', 'start_ip', 'end_ip', 'router',
+        'lease_lifetime_value', 'lease_lifetime_unit', 'server', 'failover', 'option_values',
+    )
+
     class Meta:
         model = DHCPScope
         fields = (
             'name',
+            'active',
+            'description',
             'prefix',
+            'network',
+            'prefix_length',
             'start_ip',
             'end_ip',
             'router',
@@ -334,6 +417,18 @@ class DHCPScopeForm(NetBoxModelForm):
         else:
             self.initial.setdefault('lease_lifetime_value', 1)
             self.initial.setdefault('lease_lifetime_unit', 'days')
+        # A scope with a prefix takes its network from it — shown, not edited.
+        if self.instance and self.instance.pk and self.instance.prefix_id:
+            for name in ('network', 'prefix_length'):
+                self.fields[name].disabled = True
+                self.fields[name].help_text = 'Copied from the prefix.'
+        # push_scope_info off: the server owns the settings, so only the NetBox-only
+        # fields stay editable (disabled fields ignore anything posted).
+        self.server_owned = bool(self.instance and self.instance.pk and server_owns_scope_info())
+        if self.server_owned:
+            for name in self.READ_ONLY_WHEN_PUSH_OFF:
+                self.fields[name].disabled = True
+                self.fields[name].required = False
 
     def clean(self):
         cleaned = super().clean() or self.cleaned_data
@@ -350,23 +445,10 @@ class DHCPScopeForm(NetBoxModelForm):
                 'A scope must be associated with either a Server or a Failover Relationship.'
             )
 
-        # Validate that no two selected option values share the same option code.
+        # No two selected option values may share an option code.
         option_values = cleaned.get('option_values')
         if option_values:
-            seen_codes = {}
-            duplicates = []
-            for ov in option_values:
-                code = ov.option_definition.code
-                if code in seen_codes:
-                    duplicates.append(code)
-                else:
-                    seen_codes[code] = ov
-            if duplicates:
-                codes_str = ', '.join(str(c) for c in sorted(set(duplicates)))
-                raise forms.ValidationError(
-                    f'A scope cannot have more than one value for the same option code. '
-                    f'Duplicate code(s): {codes_str}.'
-                )
+            check_option_codes(option_values)
 
         value = cleaned.get('lease_lifetime_value')
         unit = cleaned.get('lease_lifetime_unit', 'seconds')
@@ -398,6 +480,18 @@ class DHCPScopeFilterForm(NetBoxModelFilterSetForm):
         label='Within Prefix',
         widget=forms.TextInput(attrs={'placeholder': '10.0.0.0/8'}),
     )
+    has_prefix = forms.NullBooleanField(
+        required=False,
+        label='Has Prefix',
+        widget=forms.Select(
+            choices=[('', '---------'), ('true', 'Yes'), ('false', 'No (unassigned)')]
+        ),
+    )
+    active = forms.NullBooleanField(
+        required=False,
+        label='Active',
+        widget=forms.Select(choices=BOOLEAN_WITH_BLANK_CHOICES),
+    )
     tag = TagFilterField(model)
 
     def __init__(self, *args, **kwargs):
@@ -420,6 +514,8 @@ class DHCPScopeBulkEditForm(NetBoxModelBulkEditForm):
 
     fieldsets = (
         FieldSet(
+            'active',
+            'description',
             'router',
             InlineFields('lease_lifetime_value', 'lease_lifetime_unit', label='Lease Lifetime'),
             'server',
@@ -429,6 +525,16 @@ class DHCPScopeBulkEditForm(NetBoxModelBulkEditForm):
         FieldSet('add_option_values', 'remove_option_values', name='Option Values'),
     )
 
+    active = forms.NullBooleanField(
+        required=False,
+        widget=BulkEditNullBooleanSelect(),
+        label='Active',
+    )
+    description = forms.CharField(
+        max_length=200,
+        required=False,
+        label='Description',
+    )
     router = forms.GenericIPAddressField(
         required=False,
         label='Router (Option 3)',
@@ -481,7 +587,7 @@ class DHCPScopeBulkEditForm(NetBoxModelBulkEditForm):
         label='Remove Option Values',
     )
 
-    nullable_fields = ('router', 'server', 'failover')
+    nullable_fields = ('description', 'router', 'server', 'failover')
 
 
 # ---------------------------------------------------------------------------
@@ -493,6 +599,71 @@ _SETTINGS_OVERRIDE_FIELD_MAP = {
     'sync_ips_from_dhcp': 'sync_ip_addresses',
     'push_reservations': 'push_reservations',
     'push_scope_info': 'push_scope_info',
+}
+
+
+# Settings page layout. Each column is a list of cards: (title, description, groups), where
+# each group is (subheading or None, field names). The page shows the columns side by side.
+_SETTINGS_COLUMNS = (
+    (
+        (
+            'Leases & Reservations',
+            'What the sync does with DHCP leases and reservations, and which IP Addresses it leaves alone.',
+            (
+                ('Pulled from the DHCP server', ('sync_ip_addresses', 'lease_status', 'reservation_status')),
+                ('Pushed to the DHCP server', ('push_reservations', 'reservation_placeholders')),
+                ('Protected IP Addresses', ('sync_protect_tag', 'sync_protect_update_client_id')),
+            ),
+        ),
+    ),
+    (
+        (
+            'Scopes',
+            'How scopes are kept in step between NetBox and the DHCP servers.',
+            (
+                (None, ('push_scope_info', 'create_missing_prefixes')),
+            ),
+        ),
+        (
+            'Global',
+            'How and when the background sync runs.',
+            (
+                ('Sync job', ('sync_interval', 'sync_queue', 'sync_job_timeout', 'sync_log_level')),
+                ('REST API', ('api_enabled',)),
+            ),
+        ),
+    ),
+)
+
+# Settings whose full explanation is too long to show inline: the short help text is shown
+# under the field, and the full explanation opens in a popup from the (?) after it. The
+# explanation is the field's model help text unless one is given here.
+_SETTINGS_HELP_DETAILS = {
+    'push_reservations': (
+        'On: NetBox is the source of truth for reservations. Off: the DHCP server is.',
+        None,
+    ),
+    'push_scope_info': (
+        'On: NetBox is the source of truth for scopes. Off: the DHCP server is.',
+        None,
+    ),
+    'create_missing_prefixes': (
+        'A learned scope whose prefix is not in NetBox gets one, in the Default Scope VRF.',
+        None,
+    ),
+    'reservation_placeholders': (
+        'Keeps the DHCP server from handing out reserved IPs that have no client ID.',
+        None,
+    ),
+    'sync_job_timeout': (
+        'Maximum seconds a sync job may run before RQ stops it. Increase for servers with large '
+        'scope counts.',
+        None,
+    ),
+    'sync_log_level': (
+        'Minimum severity written to the job log for DHCP sync/push/delete jobs.',
+        None,
+    ),
 }
 
 
@@ -518,8 +689,9 @@ class PluginSettingsForm(forms.ModelForm):
         required=False,
         label='Sync-Protected Tag',
         help_text=(
-            'IP Addresses carrying this tag are fully protected from sync: '
-            'status, DNS name, and the IP itself are never modified or removed by the sync. '
+            'IP Addresses carrying this tag, or inside a prefix carrying it, are protected from '
+            'being overwritten by a sync: status, DNS name, and the IP itself are never modified '
+            'or removed by the sync. The tag does not stop pushes to the DHCP server. '
             'Leave blank to disable.'
         ),
     )
@@ -541,17 +713,31 @@ class PluginSettingsForm(forms.ModelForm):
             'sync_protect_update_client_id',
             'sync_ip_addresses',
             'push_reservations',
+            'reservation_placeholders',
             'push_scope_info',
-            'sync_active_scopes_only',
             'create_missing_prefixes',
             'sync_interval',
             'sync_queue',
             'sync_job_timeout',
             'api_enabled',
+            'sync_log_level',
         )
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.overridden_fields = set()
+
+        self.help_details = []
+        for name, (short, details) in _SETTINGS_HELP_DETAILS.items():
+            field = self.fields[name]
+            self.help_details.append(
+                (name, field.label, details or DHCPPluginSettings._meta.get_field(name).help_text)
+            )
+            field.help_text = format_html(
+                '{} <a href="#" data-bs-toggle="modal" data-bs-target="#{}_details" '
+                'aria-label="{} details"><i class="mdi mdi-help-circle"></i></a>',
+                short, name, field.label,
+            )
 
         # Populate status choices from NetBox (includes any custom statuses from FIELD_CHOICES)
         try:
@@ -586,7 +772,25 @@ class PluginSettingsForm(forms.ModelForm):
             for cfg_key, field_name in _SETTINGS_OVERRIDE_FIELD_MAP.items():
                 if plugin_cfg.get(cfg_key) is not None:
                     self.fields[field_name].disabled = True
+                    self.overridden_fields.add(field_name)
                     if raw_db is not None:
                         self.initial[field_name] = getattr(raw_db, field_name)
         except Exception:
             pass
+
+    @property
+    def columns(self):
+        """
+        The settings page layout, as columns of cards: (title, description, groups), where each
+        group is (subheading, [(bound field, overridden)]).
+        """
+        return [
+            [
+                (title, description, [
+                    (heading, [(self[name], name in self.overridden_fields) for name in names])
+                    for heading, names in groups
+                ])
+                for title, description, groups in cards
+            ]
+            for cards in _SETTINGS_COLUMNS
+        ]

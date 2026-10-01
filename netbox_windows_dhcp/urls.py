@@ -39,5 +39,6 @@ urlpatterns = [
     path('maintenance/',                 views.DHCPCurrentMaintenanceView.as_view(),            name='current_maintenance'),
     path('maintenance/disable/',         views.DHCPCurrentMaintenanceBulkDisableView.as_view(), name='current_maintenance_bulk_disable'),
     path('settings/',                    views.SettingsView.as_view(),                          name='settings'),
+    path('schedule/',                    views.ScheduleView.as_view(),                          name='schedule'),
     path('settings/sync/',               views.ScheduleSyncView.as_view(),                      name='schedule_sync'),
 ]

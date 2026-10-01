@@ -1,24 +1,29 @@
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
+from django.db.models.deletion import ProtectedError
 from django.urls import reverse
 from netaddr import IPAddress as NetAddrIP, IPNetwork
 
 from netbox.models import NetBoxModel
+from netbox.models.features import ChangeLoggingMixin
 from utilities.querysets import RestrictedQuerySet
 
 from .choices import (
     DHCPFailoverModeChoices,
     DHCPOptionDataTypeChoices,
+    DHCPServerAccessChoices,
     DHCPServerHealthChoices,
+    SyncLogLevelChoices,
     SyncQueueChoices,
 )
 
 
-class DHCPPluginSettings(models.Model):
+class DHCPPluginSettings(ChangeLoggingMixin, models.Model):
     """
     Singleton model that stores plugin-wide settings in the database.
     Always accessed via DHCPPluginSettings.load() — never instantiated directly.
+    Saves from the Settings page are recorded in NetBox's changelog.
     """
 
     sync_ip_addresses = models.BooleanField(
@@ -52,32 +57,36 @@ class DHCPPluginSettings(models.Model):
         default=False,
         verbose_name='Push Reservations to DHCP Server',
         help_text=(
-            'When enabled, NetBox IP Addresses with the configured reservation status are '
-            'pushed to the DHCP server as reservations.'
+            'When enabled, NetBox is the source of truth for reservations: IP Addresses with the '
+            'configured reservation status are created, updated and deleted on the DHCP server, '
+            'and server reservations NetBox doesn\'t have are deleted. When disabled, the DHCP '
+            'server is the source of truth and NetBox mirrors its reservations. A server with a '
+            'read-only API key always syncs as if this were disabled.'
         ),
     )
     push_scope_info = models.BooleanField(
         default=False,
         verbose_name='Push Scope Info to DHCP Server',
         help_text=(
-            'When enabled, NetBox is the source of truth: scope configuration '
-            '(name, range, options) is pushed to the DHCP server on save, and '
-            'unknown remote scopes are removed from the server (subject to '
-            'maintenance mode and sync settings). When disabled, the DHCP server '
-            'is the source of truth: scope attributes are pulled from the server '
-            'on every sync, scopes present on the server but not in NetBox are '
-            'auto-created, and scopes removed from the server are deleted from '
-            'NetBox.'
+            'When enabled, NetBox is the source of truth for scopes: name, description, range, '
+            'router, lease time, active state, failover, options and exclusions are pushed to the '
+            'DHCP server, NetBox-only scopes are created on it, and scopes on the server but not '
+            'in NetBox are removed from it. When disabled, the DHCP server is the source of truth: '
+            'scope settings are pulled on every sync, new server scopes are imported, and scopes '
+            'removed from the server are deleted from NetBox. Maintenance mode and the server and '
+            'failover sync settings apply either way. A server with a read-only API key always '
+            'syncs as if this were disabled.'
         ),
     )
-    sync_active_scopes_only = models.BooleanField(
+    reservation_placeholders = models.BooleanField(
         default=False,
-        verbose_name='Sync Active Scopes Only',
+        verbose_name='Placeholder Reservations',
         help_text=(
-            'When enabled, disabled/inactive scopes on the Windows DHCP server are ignored '
-            'during sync. Useful when migrating scopes between servers — disable the scope '
-            'on the old server and activate it on the new one to control which server NetBox '
-            'treats as authoritative.'
+            'Reserving an IP inside a DHCP scope without a client ID does nothing on its own, '
+            'because the DHCP server can still hand that IP out. When enabled (with Push '
+            'Reservations on), such IPs get a placeholder client ID (ba-dc-0d-ed-…) in NetBox '
+            'and on the DHCP server so the server stops handing them out. Turning this off '
+            'stops new placeholders; existing ones are left as they are.'
         ),
     )
     sync_interval = models.PositiveIntegerField(
@@ -94,7 +103,7 @@ class DHCPPluginSettings(models.Model):
         choices=SyncQueueChoices,
         default=SyncQueueChoices.DEFAULT,
         verbose_name='Sync Job Queue',
-        help_text='Worker queue priority used for all DHCP sync and import jobs.',
+        help_text="Worker queue priority used for the plugin's sync, import, push and PSU script update jobs.",
     )
     sync_job_timeout = models.PositiveIntegerField(
         default=300,
@@ -114,8 +123,9 @@ class DHCPPluginSettings(models.Model):
         related_name='+',
         verbose_name='Sync-Protected Tag',
         help_text=(
-            'IP Addresses carrying this tag are fully protected from sync: '
-            'status, DNS name, and the IP itself are never modified or removed by the sync. '
+            'IP Addresses carrying this tag, or inside a prefix carrying it, are protected from '
+            'being overwritten by a sync: status, DNS name, and the IP itself are never modified '
+            'or removed by the sync. The tag does not stop pushes to the DHCP server. '
             'Leave blank to disable.'
         ),
     )
@@ -132,9 +142,10 @@ class DHCPPluginSettings(models.Model):
         default=True,
         verbose_name='Create Missing Prefixes on Import',
         help_text=(
-            'When enabled, importing a scope whose CIDR does not exist in NetBox will '
-            'automatically create the Prefix. Disable if Prefixes are managed by another '
-            'source and should never be created by the DHCP plugin.'
+            'When enabled, a scope learned from a DHCP server (by Import or the sync) whose prefix '
+            'isn\'t in NetBox gets one, created in the Default Scope VRF. When disabled, the scope '
+            'is created without a prefix instead (see the Unassigned Scopes saved filter). '
+            'Disable if Prefixes are managed by another source.'
         ),
     )
     api_enabled = models.BooleanField(
@@ -142,12 +153,26 @@ class DHCPPluginSettings(models.Model):
         verbose_name='API Enabled',
         help_text='When disabled, all plugin REST API endpoints return 503 Service Unavailable.',
     )
+    sync_log_level = models.CharField(
+        max_length=10,
+        choices=SyncLogLevelChoices,
+        default=SyncLogLevelChoices.DEBUG,
+        verbose_name='Sync Job Log Level',
+        help_text=(
+            'Minimum severity written to the job log for DHCP sync/push/delete jobs. '
+            'Lower levels produce more detail but slow down large syncs. '
+            'Does not affect the Import or Update PSU Scripts jobs.'
+        ),
+    )
 
     class Meta:
         verbose_name = 'Plugin Settings'
 
     def __str__(self):
         return 'Windows DHCP Plugin Settings'
+
+    def get_absolute_url(self):
+        return reverse('plugins:netbox_windows_dhcp:settings')
 
     @classmethod
     def load(cls):
@@ -215,6 +240,18 @@ class DHCPServer(NetBoxModel):
             'When enabled, scopes with no failover relationship are included in sync operations for this server.'
         ),
     )
+    default_scope_vrf = models.ForeignKey(
+        'ipam.VRF',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='+',
+        verbose_name='Default Scope VRF',
+        help_text=(
+            'Where standalone scopes learned from this server look for (or create) their prefix. '
+            'Blank means the global VRF. Changing it only affects scopes learned from then on.'
+        ),
+    )
 
     # Maintenance mode
     maintenance_mode = models.BooleanField(default=False, verbose_name='Maintenance Mode')
@@ -240,6 +277,18 @@ class DHCPServer(NetBoxModel):
     )
     last_health_check = models.DateTimeField(null=True, blank=True)
     health_error = models.TextField(blank=True, default='')
+
+    # API key write access, detected via ping_write() alongside the health check
+    ACCESS_UNKNOWN = DHCPServerAccessChoices.UNKNOWN
+    ACCESS_RO = DHCPServerAccessChoices.RO
+    ACCESS_RW = DHCPServerAccessChoices.RW
+
+    access_level = models.CharField(
+        max_length=20,
+        choices=DHCPServerAccessChoices,
+        default=DHCPServerAccessChoices.UNKNOWN,
+        verbose_name='Access Level',
+    )
     last_sync_at = models.DateTimeField(null=True, blank=True, verbose_name='Last Sync')
     last_sync_error = models.TextField(blank=True, default='')
     psu_script_version = models.CharField(
@@ -258,7 +307,11 @@ class DHCPServer(NetBoxModel):
         return reverse('plugins:netbox_windows_dhcp:dhcpserver', args=[self.pk])
 
     def serialize_object(self, exclude=None):
-        return super().serialize_object(exclude=[*(exclude or []), 'last_sync_at', 'last_health_check'])
+        data = super().serialize_object(exclude=[*(exclude or []), 'last_sync_at', 'last_health_check'])
+        # The changelog and webhook snapshots must never carry the App Token itself
+        if 'api_key' in data:
+            data['api_key'] = '********' if self.api_key else ''
+        return data
 
     @property
     def base_url(self):
@@ -273,7 +326,10 @@ class DHCPFailover(NetBoxModel):
     MODE_HOT_STANDBY = DHCPFailoverModeChoices.HOT_STANDBY
     MODE_CHOICES = DHCPFailoverModeChoices
 
-    name = models.CharField(max_length=100, unique=True)
+    # Not unique: Windows keeps names unique per server, but two separate server pairs
+    # (dev and prod, say) can use the same name. Look failovers up with find_failover().
+    name = models.CharField(max_length=100)
+    description = models.CharField(max_length=200, blank=True)
     primary_server = models.ForeignKey(
         DHCPServer,
         on_delete=models.PROTECT,
@@ -323,6 +379,18 @@ class DHCPFailover(NetBoxModel):
         blank=True,
         verbose_name='Shared Secret',
         help_text='Required when authentication is enabled',
+    )
+    default_scope_vrf = models.ForeignKey(
+        'ipam.VRF',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='+',
+        verbose_name='Default Scope VRF',
+        help_text=(
+            'Where scopes learned for this failover look for (or create) their prefix. '
+            'Blank means the global VRF. Changing it only affects scopes learned from then on.'
+        ),
     )
 
     # Maintenance mode
@@ -410,7 +478,10 @@ class DHCPOptionCodeDefinition(NetBoxModel):
 
     def delete(self, *args, **kwargs):
         if self.is_builtin:
-            raise ValidationError('Built-in DHCP option code definitions cannot be deleted.')
+            raise ProtectedError(
+                'Built-in DHCP option code definitions cannot be deleted.',
+                set(),
+            )
         return super().delete(*args, **kwargs)
 
 
@@ -448,6 +519,12 @@ class DHCPOptionValue(NetBoxModel):
     def get_absolute_url(self):
         return reverse('plugins:netbox_windows_dhcp:dhcpoptionvalue', args=[self.pk])
 
+    def delete(self, *args, **kwargs):
+        # Refused while any scope still uses it (UI, bulk and API all delete one by one).
+        from .locks import check_option_value_delete
+        check_option_value_delete(self)
+        return super().delete(*args, **kwargs)
+
 
 class DHCPExclusionRange(NetBoxModel):
     """
@@ -464,6 +541,11 @@ class DHCPExclusionRange(NetBoxModel):
     )
     start_ip = models.GenericIPAddressField(verbose_name='Start IP')
     end_ip = models.GenericIPAddressField(verbose_name='End IP')
+    description = models.CharField(
+        max_length=200,
+        blank=True,
+        help_text='Stored in NetBox only — Windows DHCP exclusions have no description.',
+    )
 
     class Meta:
         ordering = ['scope', 'start_ip']
@@ -491,32 +573,61 @@ class DHCPExclusionRange(NetBoxModel):
                 {'end_ip': 'End IP must be greater than or equal to the Start IP.'}
             )
         if self.scope_id:
-            try:
-                prefix_network = IPNetwork(str(self.scope.prefix.prefix))
-            except Exception:
+            scope_net = self.scope.network_cidr
+            if scope_net is None:
                 return
-            if start not in prefix_network:
+            if start not in scope_net:
                 raise ValidationError(
-                    {'start_ip': f'Start IP must be within the scope prefix {self.scope.prefix.prefix}.'}
+                    {'start_ip': f'Start IP must be within the scope network {scope_net}.'}
                 )
-            if end not in prefix_network:
+            if end not in scope_net:
                 raise ValidationError(
-                    {'end_ip': f'End IP must be within the scope prefix {self.scope.prefix.prefix}.'}
+                    {'end_ip': f'End IP must be within the scope network {scope_net}.'}
                 )
+        from .locks import check_exclusion_change
+        check_exclusion_change(self)
+
+    def delete(self, *args, **kwargs):
+        # Only a direct delete — deleting the whole scope cascades past this.
+        from .locks import check_exclusion_delete
+        check_exclusion_delete(self)
+        return super().delete(*args, **kwargs)
 
 
 class DHCPScope(NetBoxModel):
     """
-    A DHCP scope associated with a NetBox Prefix.
-    Many scopes can reference the same Prefix; each scope belongs to exactly one Prefix.
+    A DHCP scope, usually associated with a NetBox Prefix.
+
+    The scope stores its own network and prefix length (copied from the prefix when it
+    has one); the scope ID on the Windows server is that network address. A scope with
+    no prefix is "settings-only": its name, range, options and exclusions are still
+    synced, but nothing that depends on NetBox IPs (IP sync, reservations, locks).
     """
 
     name = models.CharField(max_length=200)
+    description = models.CharField(max_length=200, blank=True)
     prefix = models.ForeignKey(
         'ipam.Prefix',
         on_delete=models.PROTECT,
+        null=True,
+        blank=True,
         related_name='dhcp_scopes',
         verbose_name='Prefix',
+        help_text='Leave blank for a scope with no prefix (IP sync and reservations are skipped for it).',
+    )
+    # Optional at the database level: filled in from the prefix in clean()/save(), and
+    # required by clean() when there's no prefix.
+    network = models.GenericIPAddressField(
+        null=True,
+        blank=True,
+        verbose_name='Network',
+        help_text='The scope ID on the DHCP server. Copied from the prefix when one is set.',
+    )
+    prefix_length = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        verbose_name='Prefix Length',
+        help_text='Copied from the prefix when one is set.',
     )
     start_ip = models.GenericIPAddressField(verbose_name='Start IP')
     end_ip = models.GenericIPAddressField(verbose_name='End IP')
@@ -530,6 +641,13 @@ class DHCPScope(NetBoxModel):
         default=86400,
         verbose_name='Lease Lifetime',
         help_text='Lease duration in seconds',
+    )
+    # The Windows scope state (Active/InActive): pulled while push_scope_info is off,
+    # pushed (to the primary, then replicated) while it is on.
+    active = models.BooleanField(
+        default=True,
+        verbose_name='Active',
+        help_text='Whether the scope is active on the DHCP server.',
     )
     server = models.ForeignKey(
         DHCPServer,
@@ -586,6 +704,123 @@ class DHCPScope(NetBoxModel):
         from .utils import lease_lifetime_display
         return lease_lifetime_display(self.lease_lifetime)
 
+    @property
+    def network_cidr(self):
+        """The scope's subnet (stored network + prefix length) as an IPNetwork, or None."""
+        if not self.network or self.prefix_length is None:
+            return None
+        try:
+            return IPNetwork(f'{self.network}/{self.prefix_length}')
+        except Exception:
+            return None
+
+    def _copy_network_from_prefix(self):
+        """Set network and prefix_length from the prefix, when there is one."""
+        if not self.prefix_id:
+            return
+        try:
+            prefix_net = IPNetwork(str(self.prefix.prefix))
+        except Exception:
+            return
+        self.network = str(prefix_net.network)
+        self.prefix_length = prefix_net.prefixlen
+
+    def save(self, *args, **kwargs):
+        self._copy_network_from_prefix()
+        update_fields = kwargs.get('update_fields')
+        if update_fields is not None and 'prefix' in update_fields:
+            kwargs['update_fields'] = {*update_fields, 'network', 'prefix_length'}
+        super().save(*args, **kwargs)
+
+    def _clean_network(self):
+        """
+        Check the stored network against the prefix (or on its own when there's none),
+        then copy it from the prefix. Linking a prefix to a scope that had none needs a
+        prefix whose network and length match what the scope already stores.
+        """
+        stored = None
+        if self.pk:
+            stored = DHCPScope.objects.filter(pk=self.pk).values(
+                'prefix_id', 'network', 'prefix_length',
+            ).first()
+
+        if self.prefix_id:
+            try:
+                prefix_net = IPNetwork(str(self.prefix.prefix))
+            except Exception:
+                return
+            if stored and stored['prefix_id'] is None:
+                wanted = (stored['network'], stored['prefix_length'])
+                what = 'this scope\'s stored network'
+            elif not stored and self.network:
+                wanted = (self.network, self.prefix_length)
+                what = 'the network entered'
+            else:
+                wanted = None
+            if wanted and wanted != (str(prefix_net.network), prefix_net.prefixlen):
+                raise ValidationError({
+                    'prefix': f'Prefix {prefix_net} doesn\'t match {what} '
+                              f'({wanted[0]}/{wanted[1]}). Pick a prefix with the same '
+                              f'network and length.',
+                })
+            self._copy_network_from_prefix()
+            return
+
+        if not self.network or self.prefix_length is None:
+            raise ValidationError(
+                'Set a prefix, or enter the network and prefix length for a scope with no prefix.'
+            )
+        try:
+            net = IPNetwork(f'{self.network}/{self.prefix_length}')
+        except Exception:
+            raise ValidationError({'network': f'{self.network}/{self.prefix_length} is not a valid network.'})
+        if net.version != 4:
+            raise ValidationError({'network': 'Windows DHCP scopes are IPv4 only.'})
+        if str(net.network) != str(self.network):
+            raise ValidationError({
+                'network': f'{self.network} is not the network address of a /{self.prefix_length} '
+                           f'(did you mean {net.network}?).',
+            })
+
+    def _server_ids(self):
+        """The DHCP servers this scope lives on: its own server, or both failover partners."""
+        if self.server_id:
+            return {self.server_id}
+        if self.failover_id:
+            return {self.failover.primary_server_id, self.failover.secondary_server_id}
+        return set()
+
+    def _clean_uniqueness(self):
+        """
+        One scope per prefix, and one scope per network on each DHCP server (standalone
+        scopes on it plus scopes in any failover it's a member of).
+        """
+        from django.db.models import Q
+
+        others = DHCPScope.objects.exclude(pk=self.pk) if self.pk else DHCPScope.objects.all()
+
+        if self.prefix_id:
+            taken = others.filter(prefix_id=self.prefix_id).first()
+            if taken is not None:
+                raise ValidationError({
+                    'prefix': f'Prefix {self.prefix.prefix} already belongs to scope "{taken.name}". '
+                              f'A prefix can have only one scope.',
+                })
+
+        server_ids = self._server_ids()
+        if not server_ids or not self.network:
+            return
+        clash = others.filter(network=self.network).filter(
+            Q(server_id__in=server_ids)
+            | Q(failover__primary_server_id__in=server_ids)
+            | Q(failover__secondary_server_id__in=server_ids)
+        ).first()
+        if clash is not None:
+            raise ValidationError(
+                f'Scope "{clash.name}" already uses network {self.network} on the same DHCP '
+                f'server. A DHCP server can have only one scope per network.'
+            )
+
     def clean(self):
         super().clean()
         has_server = bool(self.server_id)
@@ -599,28 +834,34 @@ class DHCPScope(NetBoxModel):
                 'A scope must be associated with either a server or a failover relationship.'
             )
 
-        if not self.prefix_id or not self.start_ip or not self.end_ip:
+        self._clean_network()
+        self._clean_uniqueness()
+
+        scope_net = self.network_cidr
+        if scope_net is None or not self.start_ip or not self.end_ip:
             return
 
         try:
-            prefix_network = IPNetwork(str(self.prefix.prefix))
             start = NetAddrIP(self.start_ip)
             end = NetAddrIP(self.end_ip)
         except Exception:
             return
 
-        if start not in prefix_network:
+        if start not in scope_net:
             raise ValidationError(
-                {'start_ip': f'Start IP must be within the prefix {self.prefix.prefix}.'}
+                {'start_ip': f'Start IP must be within the scope network {scope_net}.'}
             )
-        if end not in prefix_network:
+        if end not in scope_net:
             raise ValidationError(
-                {'end_ip': f'End IP must be within the prefix {self.prefix.prefix}.'}
+                {'end_ip': f'End IP must be within the scope network {scope_net}.'}
             )
         if start > end:
             raise ValidationError(
                 {'end_ip': 'End IP must be greater than or equal to the Start IP.'}
             )
+
+        from .locks import check_scope_range
+        check_scope_range(self)
 
 
 class DHCPLeaseInfo(models.Model):

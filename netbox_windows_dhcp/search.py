@@ -43,6 +43,7 @@ class DHCPScopeIndex(SearchIndex):
     fields = (
         ('name', 100),
         ('prefix', 60),
+        ('network', 60),
     )
     display_attrs = ('prefix', 'start_ip', 'end_ip')
 

@@ -13,6 +13,14 @@
             <td>{{ object.name }}</td>
           </tr>
           <tr>
+            <th scope="row">Description</th>
+            <td>{{ object.description|placeholder }}</td>
+          </tr>
+          <tr>
+            <th scope="row">Default Scope VRF</th>
+            <td>{% if object.default_scope_vrf %}{{ object.default_scope_vrf|linkify }}{% else %}<span class="text-muted">Global</span>{% endif %}</td>
+          </tr>
+          <tr>
             <th scope="row">Primary Server</th>
             <td><a href="{{ object.primary_server.get_absolute_url }}">{{ object.primary_server }}</a></td>
           </tr>

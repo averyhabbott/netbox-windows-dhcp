@@ -100,6 +100,10 @@
             <th scope="row">Sync Standalone Scopes</th>
             <td>{% if object.sync_standalone_scopes %}<i class="mdi mdi-check-bold text-success"></i>{% else %}<i class="mdi mdi-close text-danger"></i>{% endif %}</td>
           </tr>
+          <tr>
+            <th scope="row">Default Scope VRF</th>
+            <td>{% if object.default_scope_vrf %}{{ object.default_scope_vrf|linkify }}{% else %}<span class="text-muted">Global</span>{% endif %}</td>
+          </tr>
         </table>
       </div>
     </div>

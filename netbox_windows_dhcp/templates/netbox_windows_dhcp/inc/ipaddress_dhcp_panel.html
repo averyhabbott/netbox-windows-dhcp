@@ -1,3 +1,4 @@
+{% load tz %}{% get_current_timezone as current_tz %}
 <div class="card">
   <h5 class="card-header">DHCP Lease Details</h5>
   <div class="card-body">
@@ -17,7 +18,7 @@
         </td>
       </tr>
       <tr>
-        <th scope="row">Lease Expiration</th>
+        <th scope="row">Lease Expiration ({{ current_tz }})</th>
         <td>
           {% if dhcp_info.lease_expiration %}
             {{ dhcp_info.lease_expiration }}

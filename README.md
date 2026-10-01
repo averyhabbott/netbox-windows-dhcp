@@ -1,505 +1,53 @@
 # netbox-windows-dhcp
 
-A NetBox plugin (compatible with NetBox 4.5.x and 4.6.x) for full integration with Windows DHCP Server via [PowerShell Universal](https://ironmansoftware.com/powershell-universal) (PSU v5).
+A NetBox plugin that connects NetBox to Windows DHCP Server through [PowerShell Universal](https://docs.devolutions.net/powershell-universal/) (PSU). It keeps DHCP scopes, options, exclusions, reservations and leases in step between NetBox and your DHCP servers, in whichever direction you choose.
 
-## Features
+## What it does
 
-- Define Windows DHCP Servers (hostname, port, HTTP/HTTPS, App Token auth, optional SSL verification)
-- Define DHCP Failover relationships (Load Balance or Hot Standby)
-- Correlate DHCP Scopes with NetBox Prefixes (many scopes → one prefix)
-- Lease lifetime stored in seconds, displayed in the most readable unit (e.g. `3 Days`, `73 Hours`, `30 Minutes`)
-- Global library of reusable DHCP Option Values with Option Code Definitions (pre-populated with all standard Windows DHCP built-in codes)
-- One-time **Import from Server** — pulls failovers, scopes, scope-level option values, and exclusion ranges from a live DHCP server into NetBox
-- Active sync mode: pull leases and reservations → create/update NetBox IP Addresses with status, DNS name, and client MAC
-- Stale record cleanup: expired leases and removed reservations are deleted or downgraded automatically
-- Push reservations, scope config, and exclusion ranges from NetBox → DHCP server (optional, settings-controlled)
-- **DHCP Scopes** panel injected into the NetBox Prefix detail view
-- **Global search** — DHCP servers (name, hostname), scopes (name, prefix CIDR), and lease info are findable from NetBox's global search bar
-- All sync and import operations run as background jobs — no HTTP timeouts on large servers
-- All background job changes appear in the NetBox changelog (attributed to the user who queued the job)
-- Scheduled background sync (hourly by default, configurable) + manual **Sync Now** per server or for all servers
-- **Maintenance mode** on servers, failover relationships, and scopes — pauses sync without changing configuration
-- **Server health checks** — live connectivity status, PSU reachability, and script version visible in the UI
-- **Automatic secondary fallback** — when a failover primary is unreachable or in maintenance mode, failover-scope syncing routes through the secondary automatically
-- **Update PSU Scripts** — push the latest endpoint scriptBlocks to PSU directly from NetBox without manually touching the server
-- Full REST API for all plugin objects (with optional enable/disable toggle)
-- Plugin-wide settings managed via the NetBox UI (no `PLUGINS_CONFIG` entry required)
+- **Brings your DHCP servers into NetBox.** Import failovers, scopes, option values and exclusion ranges from a live server, then keep them up to date with a scheduled sync.
+- **Tracks leases and reservations as NetBox IP Addresses**, with status, DNS name, client MAC and lease details, and cleans up the ones the server no longer has.
+- **Lets you choose the source of truth.** With the push settings on, NetBox wins and changes are pushed to the DHCP servers, most of them right away. With them off, the DHCP servers win and NetBox mirrors them.
+- **Handles failover pairs:** changes go to the primary and are replicated to the partner. If the primary is down, the sync reads through the secondary.
+- **Protects what you choose:** a tag keeps IPs (or whole prefixes) out of the sync's reach, and maintenance mode pauses a server, failover or scope.
+- **Keeps you out of trouble:** edits the next sync would undo are refused, and a failed read from a server never deletes anything.
+- **Runs everything as background jobs,** recorded in NetBox's changelog and able to fire NetBox event rules.
+- **Full REST API** for all plugin objects.
 
 ## Requirements
 
-### NetBox host
+NetBox 4.5 or 4.6, Python 3.12 or later, and a licensed PowerShell Universal install on each Windows DHCP server. See [Requirements](https://github.com/averyhabbott/netbox-windows-dhcp/blob/main/docs/requirements.md) for the details.
 
-- NetBox 4.5.x or 4.6.x (tested on 4.5.7 and 4.6.2)
-- Python >= 3.10
-- `requests` >= 2.28
-- NetBox RQ workers running (required for background sync and import jobs)
-
-### Each Windows DHCP server
-
-- Windows Server 2016 or later with the **DHCP Server** role installed
-- PowerShell Universal **v5.x** (tested on 5.6.11+) — see [PSU Setup](#psu-setup)
-- `DhcpServer` PowerShell module (included with the DHCP Server role)
-
-## Installation
-
-### 1. Install the package
+## Quick start
 
 ```bash
 pip install netbox-windows-dhcp
 ```
 
-Or from source (editable install recommended for development):
+Add `'netbox_windows_dhcp'` to `PLUGINS` in `configuration.py`, run `python manage.py migrate`, and restart NetBox and its RQ workers. Then set up PSU on each DHCP server and import your first server; the [Installation guide](https://github.com/averyhabbott/netbox-windows-dhcp/blob/main/docs/installation.md) walks through every step.
 
-```bash
-pip install -e /path/to/netbox-windows-dhcp
-```
+## Documentation
 
-### 2. Add to NetBox configuration (`configuration.py`)
-
-```python
-PLUGINS = [
-    'netbox_windows_dhcp',
-]
-```
-
-No `PLUGINS_CONFIG` entry is required. All settings are managed through the plugin's **Admin → Settings** page in the NetBox UI.
-
-### 3. Run migrations
-
-```bash
-python manage.py migrate
-```
-
-Running migrations also triggers the `post_migrate` signal which auto-registers the `dhcp_client_id` custom field on IP Address objects.
-
-### 4. Restart NetBox
-
-Restart gunicorn/uwsgi and the RQ workers.
-
-## Getting Started
-
-### Set up PSU on each DHCP server
-
-Before adding a server to NetBox, PSU must be installed and configured on the Windows DHCP server. See [psu/README.md](psu/README.md) for the complete deployment guide, including:
-
-- Firewall and HTTPS configuration
-- Creating the `DHCPReader` and `DHCPWriter` PSU roles with `setup_roles.ps1`
-- Deploying the API endpoints from NetBox with the **Update PSU Scripts** button
-
-### Add a DHCP Server
-
-1. Go to **Windows DHCP → Infrastructure → Servers → Add**
-2. Enter the hostname/IP, port, and PSU App Token (from `setup_roles.ps1` output)
-3. Toggle **Use HTTPS** as appropriate (default: on)
-4. If the server uses a self-signed certificate, leave **Verify SSL Certificate** enabled and click **Fetch Certificate** on the edit page to import it inline — no need to navigate away
-5. Click **Save**, then **Update PSU Scripts** on the server detail page to push the endpoint definitions to PSU
-
-> **Note:** The **App Token** field displays blank when editing an existing record — this is intentional. Leaving the field blank preserves the stored value. Enter a new value only when you need to rotate the credential.
-
-### CA Certificate
-
-If the PSU server uses a self-signed TLS certificate, import it inline on the server edit page:
-
-1. Click **Fetch Certificate** in the **CA Certificate** section of the edit form.
-2. The plugin retrieves the certificate and displays its Subject, SANs, Issuer, expiry date, and SHA-256 fingerprint.
-3. Verify the fingerprint against the actual server certificate, then click **Trust This Certificate**. The cert is staged in the form and saved to the database when you click **Save**.
-
-Once stored, the certificate is used automatically whenever **Verify SSL Certificate** is enabled. The server detail page shows the CN and expiry inline in the **DHCP Server** attributes table, with **Replace** and **Remove** buttons. A warning badge appears when the cert is within 90 days of expiry or has expired.
-
-> **Warning:** Always verify the SHA-256 fingerprint before trusting a certificate. Trusting an unverified certificate can expose your DHCP API traffic to interception.
-
-### Import from a Server
-
-Once a server is configured, click **Import from Server** on the server detail page to run a one-time background import of:
-
-- Failover relationships (matched to existing DHCP Server objects by hostname)
-- Scopes (NetBox Prefixes are created automatically if they don't exist, when **Create Missing Prefixes on Import** is enabled — see Settings)
-- Scope-level option values (unknown option codes are created automatically)
-  - Option 3 (Router) and Option 51 (Lease Time) are skipped — they are stored directly on the Scope object
-
-You will be redirected to the job status page where you can monitor progress and view the full results log. Existing records are skipped; the import never overwrites data already in NetBox.
-
-### Configure Sync Settings
-
-Go to **Windows DHCP → Admin → Settings** to configure:
-
-| Setting | Description |
+| Guide | What's in it |
 | --- | --- |
-| DHCP Lease Status | IP Address status assigned to active DHCP leases by the sync. Defaults to `dhcp`. Changing this mid-deployment causes the next sync to update all managed lease IPs to the new status. |
-| DHCP Reservation Status | IP Address status assigned to DHCP reservations by the sync, and the status that triggers a push to the DHCP server when **Push Reservations** is enabled. Defaults to `reserved`. |
-| Sync IP Addresses from Leases & Reservations | When checked, pull leases and reservations and create/update/delete NetBox IP Address records. When unchecked, sync scope config only. |
-| Push Reservations to DHCP Server | Push NetBox IPs with the configured reservation status to the DHCP server as reservations |
-| Push Scope Info to DHCP Server | Push scope config changes from NetBox to the DHCP server |
-| Sync Active Scopes Only | When checked, only scopes with **State: Active** on the DHCP server are pulled during sync. Inactive/disabled scopes are ignored. Useful during server migrations when the replacement server has scopes in an inactive state that should not yet be managed by NetBox. |
-| Create Missing Prefixes on Import | When checked (default), importing a scope whose CIDR does not exist in NetBox automatically creates the Prefix. Uncheck if Prefixes are managed by another source. |
-| Sync Interval (minutes) | How often the background sync runs (5–1440) |
-| Sync Job Queue | Worker queue priority (`High` / `Default` / `Low`) used for all sync and import background jobs. Default: `Default`. |
-| Sync-Protected Tag | A NetBox tag. Any IP Address carrying this tag, or whose IP falls within a Prefix carrying this tag, is fully shielded from sync — its status, DNS name, and record itself are never modified or removed. Leave blank to disable. |
-| Update Client ID for Protected IPs | When enabled, the sync updates the `dhcp_client_id` custom field on protected IPs to match the DHCP server's active lease. All other sync writes remain blocked. Useful after a server replacement when the client MAC changes. |
-| API Enabled | When unchecked, all plugin REST API endpoints return `503 Service Unavailable`. Use this to disable external API access without removing credentials or changing permissions. |
-
-The **DHCP Lease Status** and **DHCP Reservation Status** settings allow the plugin to work with custom IP Address statuses defined in NetBox's `FIELD_CHOICES` configuration. The status validation, sync logic, cleanup rules, and push behavior all apply to whichever statuses are configured here.
-
-## Editing Rules
-
-Not all objects in the plugin support full CRUD. The table below summarises what operations are allowed and under what conditions.
-
-### Failover Relationships
-
-| Operation | Allowed |
-| --- | --- |
-| View | ✅ Always |
-| Delete | ✅ Always |
-| Create | ❌ Never — import from the DHCP server |
-| Edit | ✅ Via direct URL only (not exposed in the UI) |
-
-Failover relationships are created automatically during an **Import from Server** run. The **Add** button and **Edit** button are intentionally hidden from the list and detail views — relationships should be managed on the DHCP server and imported into NetBox. The **Sync Enabled** toggle on the list view is the primary way to manage a failover relationship after import.
-
-### DHCP Scopes
-
-| Operation | Push Scope Info **off** | Push Scope Info **on** |
-| --- | --- | --- |
-| View | ✅ | ✅ |
-| Create | ❌ | ✅ |
-| Edit | ❌ | ✅ |
-| Delete | ❌ | ✅ |
-
-When **Push Scope Info to DHCP Server** is disabled, the DHCP server is the source of truth for scope configuration. Scopes reach NetBox via **Import from Server** and are kept up to date by periodic sync. Direct edits are blocked to prevent NetBox from drifting out of sync with the server.
-
-When **Push Scope Info to DHCP Server** is enabled, NetBox becomes the source of truth. Scope changes saved in NetBox are pushed to the DHCP server on the next sync. Full CRUD is permitted.
-
-> **Note:** Exclusion Ranges follow scope info — create, edit, and delete are permitted whenever **Push Scope Info** is enabled, and blocked when it is disabled.
-
-### IP Address Status Validation
-
-Any IP Address with status `dhcp` must satisfy both of the following conditions when saved through the UI or REST API:
-
-1. The IP address must fall within the prefix of at least one configured DHCP Scope.
-2. The IP address must **not** fall within any exclusion range of that scope.
-
-This validation runs during form submission and API writes. It does **not** run during background sync — the sync sets statuses based on authoritative data from the DHCP server and bypasses this check by design.
-
-The `reserved` status is not validated against DHCP scope membership — it is a general-purpose NetBox status used for both DHCP reservations and non-DHCP purposes.
-
-There are no UI-level restrictions on editing IP addresses with `dhcp` or `reserved` status beyond the above. Changes made manually to DHCP-managed IPs will be overwritten on the next sync if **Sync IP Addresses from Leases & Reservations** is enabled.
-
-> [!IMPORTANT]
-> Throughout this documentation, `dhcp` and `reserved` are used as **placeholder names** for the statuses assigned to DHCP leases and reservations respectively. The actual statuses used by the plugin are configurable in **Windows DHCP → Admin → Settings** via the **DHCP Lease Status** and **DHCP Reservation Status** fields. The validation logic, sync behavior, and cleanup rules described here all apply to whichever statuses are configured, not specifically to the built-in `dhcp` and `reserved` values.
-
-## Scope Source
-
-Every DHCP Scope must be associated with exactly one of:
-
-- **Server** — for standalone scopes that are not part of a failover relationship. Set automatically during **Import from Server** when the scope has no failover name.
-- **Failover Relationship** — for scopes managed under a Windows DHCP failover pair.
-
-This association determines which server is responsible for syncing the scope. Standalone scopes are only synced against their assigned server; failover scopes are synced via the primary server of their failover relationship.
-
-## Sync Behavior
-
-### Scope eligibility
-
-Not every scope is synced on every server. Before processing a scope, the sync checks eligibility:
-
-| Scope type | Synced when |
-| --- | --- |
-| Standalone (has Server) | Server's **Sync Standalone Scopes** is enabled, and the scope's assigned server matches the server being synced |
-| Failover-linked | The failover relationship's **Sync Enabled** is on, and the server being synced is the **primary** of that failover |
-| Neither assigned | Never synced |
-
-**Server pre-flight:** If a server has **Sync Standalone Scopes** disabled and is not the primary server for any active failover relationship, the sync skips it entirely — no network connection is made.
-
-### Server health checks
-
-At the start of every sync job run, the plugin checks the health of each server before performing any sync work:
-
-1. `GET /api/dhcp/health` is called for each server (if not in maintenance mode).
-2. A successful response marks the server **Healthy** and records the PSU script version in the database.
-3. If the request fails, the server is marked **Unreachable** and the error is recorded.
-4. Health status, last check time, and PSU script version are visible in the server list and detail view.
-
-Health check results from the single-server **Sync Now** action cover only the target server. If that server is unreachable, the job fails immediately with no fallback attempted.
-
-### Secondary failback
-
-When a failover primary is unreachable (health check failed) or in maintenance mode, and the secondary server is healthy and not in maintenance mode, the plugin automatically routes failover-scope sync through the secondary for that job run:
-
-- Failover-linked scopes are synced against the secondary instead of the primary.
-- The secondary's own standalone scopes are not affected — they sync independently based on the secondary's own **Sync Standalone Scopes** setting.
-- This is entirely automatic — no configuration change is needed.
-
-> **Note:** Secondary fallback applies only to failover-linked scopes. If a primary server is down, its standalone scopes are inaccessible via the secondary in Windows DHCP and are skipped.
-
-**Server pre-flight:** If a server has **Sync Standalone Scopes** disabled and is not the primary server for any active failover relationship, the sync skips it entirely — no network connection is made.
-
-### Per-failover sync control
-
-Each failover relationship has a **Sync Enabled** toggle (visible on the failover list and toggleable per-row). When disabled, all scopes using that failover are excluded from sync. This allows pausing sync for a specific failover pair without affecting others.
-
-### IP Address sync
-
-When **Sync IP Addresses from Leases & Reservations** is unchecked (default), the sync pulls and stores scope config only — no IP Address objects are created or modified.
-
-When checked, the sync pulls leases and reservations from each DHCP server and creates/updates/deletes NetBox IP Address records.
-
-### IP Address lifecycle (active sync)
-
-**Creating and updating:**
-
-| Source | `IPAddress.status` | `dns_name` | `dhcp_client_id` |
-| --- | --- | --- | --- |
-| Active DHCP lease | `dhcp` | Hostname from DHCP (lowercased) | Client MAC address |
-| DHCP reservation | `reserved` | Name from reservation (lowercased) | Client MAC address |
-
-Reservations take precedence — a `reserved` IP is not overwritten by a lease record for the same address.
-
-**Special case — `reserved` IP with no `dhcp_client_id`:** If a `reserved` IP address has no `dhcp_client_id` set (e.g. it was manually created before the client MAC was known), and a lease is discovered on the DHCP server for that address, the sync will populate `dhcp_client_id` from the lease but will not change the status or `dns_name`. This allows the IP to be pre-registered before provisioning.
-
-New IP Addresses are created using the prefix length of the associated scope's NetBox Prefix (not `/32`).
-
-The `dhcp_client_id` custom field (auto-registered on IP Address) stores the client MAC address in Windows DHCP hyphen-separated format (`00-11-22-33-44-55`).
-
-All IP Address creates and updates are recorded in the NetBox changelog, attributed to the `DHCP-Sync-Service` account (auto-created on first `migrate`). This makes sync-driven changes clearly distinguishable from human edits in the audit trail. DHCP lease metadata (lease hostname, active status, expiration) is stored in a separate non-changelog side-table (`DHCPLeaseInfo`) and displayed on the IP Address detail page — these updates do not generate changelog entries.
-
-**Cleanup (stale record removal):**
-
-After syncing leases and reservations for a scope, the plugin removes records that no longer exist on the server:
-
-| NetBox status | `dhcp_client_id` | DHCP-managed? | Server state | Action |
-| --- | --- | --- | --- | --- |
-| `dhcp` | — | — | Lease still active | No change |
-| `dhcp` | — | — | Lease expired or gone | Deleted |
-| `reserved` | — | — | Any | Never auto-deleted (pre-staged or manual) |
-| `reserved` | set | No (manually created) | Any | Never auto-deleted |
-| `reserved` | set | Yes (sync-created) | Reservation still exists | No change |
-| `reserved` | set | Yes (sync-created) | No reservation, but lease exists | Downgraded to `dhcp` |
-| `reserved` | set | Yes (sync-created) | Neither reservation nor lease | Deleted |
-
-"DHCP-managed" means the record was created or previously updated by the sync (indicated by a `DHCPLeaseInfo` side-record). Manually-created `reserved` IPs are never auto-deleted even if they have a `dhcp_client_id`.
-
-> **Note:** When **Push Reservations to DHCP Server** is enabled, NetBox is the source of truth for reservations. `reserved` IP Addresses with a `dhcp_client_id` are never deleted or downgraded based on server state — they will be pushed to the server on the next sync instead.
-
-**Scope cleanup:**
-
-When a scope exists in NetBox but is no longer reported by the DHCP server, and the server was successfully reached, and **Push Scope Info to DHCP Server** is disabled, the scope is deleted from NetBox. Only scopes whose Scope Source links them to the server being synced (either directly as a standalone scope, or via a failover relationship where this server is primary) are considered.
-
-> When **Push Scope Info to DHCP Server** is enabled, a scope missing from the server will instead be created on the server.
-
-**Safety:** If the API call to fetch leases/reservations fails for a scope, cleanup is skipped for that scope. If `list_scopes()` fails entirely, the server is unreachable and no cleanup runs at all.
-
-### Pre-Staging IPs
-
-To register a device in NetBox before its client MAC is known, create the IP Address with:
-
-- Status `reserved`
-- `dns_name` set to the planned canonical hostname
-- Leave `dhcp_client_id` blank
-
-The sync will never delete or overwrite the status or `dns_name` of a `reserved` IP with no `dhcp_client_id`. If a lease appears on the DHCP server for that address, the sync populates `dhcp_client_id` from the lease (so the reservation can be pushed once the MAC is known) but leaves everything else unchanged.
-
-**Typical lifecycle:**
-
-1. Create the IP in NetBox with status `reserved`, `dns_name` set to the planned hostname, and no `dhcp_client_id`.
-2. Device is provisioned; it receives a DHCP lease. The sync populates `dhcp_client_id` from the lease.
-3. Once `dhcp_client_id` is set, the reservation is pushed to the DHCP server on the next sync (if **Push Reservations** is enabled). The `dns_name` is used as the reservation name on the server.
-
-### Sync Now
-
-The **Sync Now** button on a server detail page enqueues a background sync job and redirects to the job status page. The full sync log is visible there.
-
-**Sync Now is blocked when maintenance mode is enabled** on a server — disable maintenance mode first. Sync continues normally for other servers.
-
-## Maintenance Mode
-
-Maintenance mode is available on all three object types: **Servers**, **Failover Relationships**, and **Scopes**. When enabled, the object is skipped entirely during sync:
-
-- **Server in maintenance** — The entire server (all scopes) is skipped. Sync Now is also blocked on that server.
-- **Failover relationship in maintenance** — All scopes linked to that failover are skipped, regardless of server health.
-- **Scope in maintenance** — That individual scope is skipped; other scopes on the same server continue normally.
-
-Maintenance mode stores when it was enabled and by which user. A **Notes** field is available for free-form context (e.g. a ticket number or reason). All three fields are cleared automatically when maintenance mode is disabled.
-
-### Toggling maintenance mode
-
-- **Single-item:** Click the amber pause icon on the list row, or open the object detail page and use the action button. A confirmation form shows the current state with an option to enable or disable and add optional notes.
-- **Bulk:** Select objects on the list page and click **Bulk Maintenance Mode**. Choose enable or disable and optionally set notes (applied to all selected objects).
-
-### Current Maintenance view
-
-**Windows DHCP → Admin → Current Maintenance** shows a combined table of every object currently in maintenance mode across all three types — sorted by enabled time, filterable by type. Use this as a dashboard to see what is paused before triggering a sync. Each row has a **Resume** button to disable maintenance inline; select multiple rows and click **Resume Selected** to bulk-disable across object types in one action.
-
-## Sync-Protected IPs
-
-Any IP Address tagged with the configured **Sync-Protected Tag** is fully shielded from sync writes. The sync will never change its status, DNS name, or `dhcp_client_id`, and will never delete the record during cleanup.
-
-**Prefix-level protection:** The tag can also be applied to a **NetBox Prefix** (any prefix, not just the scope's prefix). Every IP address that falls within a tagged prefix is protected, even if the IP itself does not carry the tag. This provides deep inheritance — a tag on a `/16` protects all IPs within it, including those in nested `/24` sub-prefixes that don't themselves carry the tag.
-
-Combined rule: an IP is protected if it carries the tag **or** falls within any prefix that carries the tag.
-
-DHCP lease metadata (`DHCPLeaseInfo`) is always updated for protected IPs regardless of protection status — the lease hostname, active state, and expiration are still recorded and visible on the IP Address detail page.
-
-### Update Client ID for Protected IPs
-
-Enable this checkbox to allow one narrow exception: the sync may update the `dhcp_client_id` custom field on a protected IP when the server's active lease carries a different client MAC. All other writes (status, DNS name, record deletion) remain blocked. This is useful after a DHCP server replacement where the client MAC for the same device changes.
-
-**Typical use:** Tag an IP as protected when it has been manually configured and should not be overwritten by automated sync, even if the DHCP server has a conflicting record.
-
-## Lease Lifetime Display
-
-Lease lifetimes are stored in seconds and displayed in the most readable exact unit:
-
-- `86400` → **1 Day**
-- `259200` → **3 Days**
-- `262800` → **73 Hours** (not an exact number of days)
-- `3600` → **1 Hour**
-- `60` → **1 Minute**
-- `45` → **45 Seconds**
-
-When configuring a scope, enter the value and select the unit (Seconds / Minutes / Hours / Days). The form defaults to **1 Day** for new scopes. Values learned from the DHCP server are automatically decomposed to the largest clean unit.
-
-## Navigation
-
-The plugin adds a **Windows DHCP** menu to the NetBox left sidebar:
-
-- **Infrastructure** → Servers, Failover
-- **Scopes** → Scopes
-- **Options** → Option Values, Option Code Definitions
-- **Admin** → Current Maintenance, Settings
-
-## PSU Setup
-
-See [psu/README.md](psu/README.md) for the full PSU deployment guide (fresh install, upgrades, manual setup).
-
-The plugin expects PowerShell Universal **v5.x** (tested on 5.6.11+) on each DHCP server, exposing endpoints under `/api/dhcp/`. The endpoint script is bundled with the plugin and deployed to PSU via the **Update PSU Scripts** button — no manual file copying required.
-
-### Endpoint reference
-
-| Method | Path | Description |
-| --- | --- | --- |
-| GET | `/api/dhcp/scopes[?active_only=true]` | List all scopes (includes router and failover name); pass `active_only=true` to exclude inactive/disabled scopes |
-| GET | `/api/dhcp/scopes/:scope_id` | Get a single scope |
-| POST | `/api/dhcp/scopes` | Create a scope |
-| PUT | `/api/dhcp/scopes/:scope_id` | Update a scope |
-| DELETE | `/api/dhcp/scopes/:scope_id` | Delete a scope |
-| GET | `/api/dhcp/leases[?scope_id=]` | List active leases |
-| GET | `/api/dhcp/reservations[?scope_id=]` | List reservations |
-| POST | `/api/dhcp/reservations` | Create a reservation |
-| PUT | `/api/dhcp/reservations/:client_id` | Update a reservation |
-| DELETE | `/api/dhcp/reservations/:client_id` | Delete a reservation |
-| GET | `/api/dhcp/failover` | List failover relationships |
-| POST | `/api/dhcp/failover` | Create a failover relationship |
-| POST | `/api/dhcp/failover/replicate` | Force failover replication for specific scopes (body: `scope_ids`) |
-| GET | `/api/dhcp/options/server` | Server-level option values |
-| GET | `/api/dhcp/options/scope/:scope_id` | Scope-level option values |
-| GET | `/api/dhcp/exclusions?scope_id=` | List exclusion ranges for a scope |
-| POST | `/api/dhcp/exclusions` | Create an exclusion range |
-| DELETE | `/api/dhcp/exclusions` | Delete an exclusion range (body: scope_id, start_ip, end_ip) |
-| GET | `/api/dhcp/health` | Health check (read) — returns `{"status":"ok","version":"x.y.z"}` |
-| POST | `/api/dhcp/health` | Health check (write) — tests write access; returns `{"status":"ok"}` |
-| GET | `/api/dhcp/metrics[?reservations=true][&declined=true]` | Aggregate health snapshot for external monitoring — server statistics (uptime, address counts, utilization, cumulative packet counters), per-scope utilization (size from range − exclusions, in-use/free/reserved/pending), failover state, and database health in one call. Read-only; generic schema (no consumer-specific fields). Optional flags add per-scope lease scrapes (off by default, since they enumerate leases on the server): `reservations=true` splits the reserved count into `reservations_active`/`reservations_inactive`; `declined=true` adds `bad_address_count`. Consumed by the companion [LibreNMS plugin](https://github.com/averyhabbott/librenms-windows-dhcp). |
-
-Authentication: PSU v5 App Tokens are sent as `Authorization: Bearer <token>`. Generate a token in the PSU admin console under **Security → App Tokens** and paste it into the **App Token** field on the DHCP Server object in NetBox.
-
-### PSU script version tracking
-
-The PSU script embeds a version constant (`$PSU_SCRIPT_VERSION`). The plugin defines a matching `PSU_SCRIPT_VERSION` Python constant and checks it during the health check phase of every sync:
-
-- When the versions **match**, a green check mark and version number appear in the server list.
-- When they **mismatch**, an amber warning icon and the observed version appear. The sync continues normally — the mismatch is advisory only, logged in the job output.
-- When the version is **unknown** (no health check has run yet), a gray question mark appears.
-
-This is advisory, not a guarantee: the version constant only changes when a release deliberately bumps it, so a plugin update that changes PSU script behavior without bumping `PSU_SCRIPT_VERSION` won't show as a mismatch. Always re-run **Update PSU Scripts** (below) after upgrading the plugin, rather than relying on this indicator alone to signal that an update is needed.
-
-The health check also confirms read/write access on every sync run; results update the server's **Health Status** (`Healthy` / `Unreachable` / `Unknown`) and **Last Health Check** time visible in the server list and detail view.
-
-### Updating PSU scripts from NetBox
-
-When a new plugin version includes updated endpoint scriptBlocks, push them directly from NetBox without touching the server:
-
-1. Open the DHCP Server detail page and click **Update PSU Scripts**.
-2. The job fetches the current endpoint records from PSU, updates each one's `scriptBlock` in place, creates any new endpoints, removes any deleted endpoints, then restarts PSU's endpoint definitions.
-3. A follow-up health check verifies the new version is live and updates `psu_script_version` in the database.
-
-The App Token used for sync must have `apis/*` permission on the PSU `DHCPWriter` role (configured automatically by `setup_roles.ps1`). **Bulk update** is available from the server list page.
-
-## PLUGINS_CONFIG Overrides
-
-For environments where a production database is replicated to a dev or staging NetBox instance, `PLUGINS_CONFIG` in `configuration.py` can override credentials and sync behavior without touching the database.
-
-### Per-server API key
-
-```python
-PLUGINS_CONFIG = {
-    'netbox_windows_dhcp': {
-        'server_overrides': {
-            'dhcp01.example.com': {'api_key': 'dev-token-here'},
-            'dhcp02.example.com': {'api_key': 'dev-token-here'},
-        }
-    }
-}
-```
-
-The match key is the server's **Hostname** field (exact string match). When an override is active, the server detail page shows a notice and the value stored in the database is not used.
-
-The value is a dict to allow additional per-server overrides to be added in future versions without a breaking configuration change.
-
-### Global sync behavior
-
-Three boolean settings can be forced off (or on) regardless of what is saved in the Plugin Settings UI:
-
-```python
-PLUGINS_CONFIG = {
-    'netbox_windows_dhcp': {
-        'sync_ips_from_dhcp': False,   # disable IP sync in dev
-        'push_reservations': False,    # prevent pushing reservations to prod DHCP servers
-        'push_scope_info': False,      # prevent pushing scope changes to prod DHCP servers
-    }
-}
-```
-
-Use `None` (or simply omit the key) to leave the database value in effect. `True` or `False` forces the setting regardless of what is saved in the UI.
-
-When any of these overrides are active, the Plugin Settings page shows a banner listing the overridden fields and their current values. The affected checkboxes are disabled to prevent confusion.
-
-> **Note:** Overriding `push_scope_info` to `False` also blocks scope create, edit, and delete in the UI, since those operations are gated on this setting.
-
-## REST API
-
-The plugin exposes a REST API under `/api/plugins/windows-dhcp/`:
-
-| Endpoint | Model |
-| --- | --- |
-| `/servers/` | DHCP Servers |
-| `/failover/` | Failover relationships |
-| `/option-codes/` | Option Code Definitions |
-| `/option-values/` | Option Values |
-| `/scopes/` | DHCP Scopes (includes nested `exclusion_ranges`) |
-| `/exclusion-ranges/` | DHCP Exclusion Ranges |
-
-Foreign-key fields are read as nested objects and written by ID using the
-`*_id` form (e.g. `prefix_id`, `server_id`, `failover_id`, `scope_id`,
-`option_definition_id`). The entire API can be disabled via the **API Enabled**
-setting, in which case every endpoint returns `503 Service Unavailable`.
+| [Requirements](https://github.com/averyhabbott/netbox-windows-dhcp/blob/main/docs/requirements.md) | Software versions and licenses |
+| [Installation](https://github.com/averyhabbott/netbox-windows-dhcp/blob/main/docs/installation.md) | From a running NetBox and PSU to your first imported DHCP server |
+| [Upgrading](https://github.com/averyhabbott/netbox-windows-dhcp/blob/main/docs/upgrading.md) | Upgrading the plugin and the PSU scripts |
+| [Configuration](https://github.com/averyhabbott/netbox-windows-dhcp/blob/main/docs/configuration.md) | The Settings and Schedule pages, and `PLUGINS_CONFIG` overrides |
+| [How the sync works](https://github.com/averyhabbott/netbox-windows-dhcp/blob/main/docs/sync-logic.md) | Who wins for what, how scopes and IPs are matched, and the safety rules |
+| [Editing rules](https://github.com/averyhabbott/netbox-windows-dhcp/blob/main/docs/editing-rules.md) | What you can create, edit and delete, and when |
+| [Operations](https://github.com/averyhabbott/netbox-windows-dhcp/blob/main/docs/operations.md) | Maintenance mode, protected IPs, Unassigned Scopes, commands and troubleshooting |
+| [REST API](https://github.com/averyhabbott/netbox-windows-dhcp/blob/main/docs/api.md) | The plugin's NetBox API |
+| [PowerShell Universal](https://github.com/averyhabbott/netbox-windows-dhcp/blob/main/docs/psu.md) | How the plugin uses PSU, and the PSU endpoint reference |
+| [Changelog](https://github.com/averyhabbott/netbox-windows-dhcp/blob/main/CHANGELOG.md) | What changed in each release |
 
 ## Testing
 
-The plugin ships a Django test suite under `netbox_windows_dhcp/tests/`. It runs
-**fully offline** — no Windows DHCP server, PSU instance, or network access is
-required (the PSU client and job queue are mocked). Run it from the NetBox
-install directory with the plugin installed and listed in `PLUGINS`:
+The plugin ships an offline Django test suite (no DHCP server, PSU or network needed). Run it from the NetBox install directory:
 
 ```bash
 python manage.py test netbox_windows_dhcp --keepdb
 ```
 
-The suite covers model validation, the REST API and UI views, filtersets, the
-background sync engine, the import pipeline, the PSU HTTP client, certificate
-parsing, signal handlers, and global search. It is validated against NetBox
-4.5.7 and 4.6.2. On NetBox 4.6+, the list-view tests assert against the recorded
-query-count baseline in `tests/query_counts.json`; if NetBox internals change
-the expected counts, regenerate it with
-`UPDATE_QUERY_COUNTS=1 python manage.py test netbox_windows_dhcp` (run serially).
-
 ## License
 
-Released under the GNU General Public License v3.0 (or later). See [LICENSE](LICENSE) for the full text.
+Released under the GNU General Public License v3.0 (or later). See [LICENSE](https://github.com/averyhabbott/netbox-windows-dhcp/blob/main/LICENSE).

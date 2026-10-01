@@ -11,8 +11,8 @@
           This will connect to <strong>{{ object.hostname }}</strong> and perform a one-time import of:
         </p>
         <ul>
-          <li>Failover relationships (matched to existing DHCP Server objects by hostname)</li>
-          <li>Scopes (NetBox Prefixes will be created if they do not already exist)</li>
+          <li>Failover relationships (matched to existing DHCP Server objects by hostname). A new failover starts in maintenance mode and its scopes aren't imported yet: check its Default Scope VRF, take it out of maintenance mode, then run the import again.</li>
+          <li>Scopes (each looks for its prefix in its Default Scope VRF — the failover's, or this server's for a standalone scope; a missing prefix is created there when "Create Missing Prefixes on Import" is on, otherwise the scope is listed under Unassigned Scopes). A scope in a failover that isn't in NetBox is skipped.</li>
           <li>Scope-level option values (unknown option codes will be created automatically)</li>
         </ul>
         <p class="text-muted">

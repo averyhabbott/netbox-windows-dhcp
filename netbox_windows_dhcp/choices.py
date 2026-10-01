@@ -13,6 +13,20 @@ class SyncQueueChoices(ChoiceSet):
     ]
 
 
+class SyncLogLevelChoices(ChoiceSet):
+    DEBUG = 'DEBUG'
+    INFO = 'INFO'
+    WARNING = 'WARNING'
+    ERROR = 'ERROR'
+
+    CHOICES = [
+        (DEBUG, 'Debug'),
+        (INFO, 'Info'),
+        (WARNING, 'Warning'),
+        (ERROR, 'Error'),
+    ]
+
+
 class DHCPServerHealthChoices(ChoiceSet):
     UNKNOWN = 'unknown'
     HEALTHY = 'healthy'
@@ -22,6 +36,18 @@ class DHCPServerHealthChoices(ChoiceSet):
         (UNKNOWN, 'Unknown', 'gray'),
         (HEALTHY, 'Healthy', 'green'),
         (UNREACHABLE, 'Unreachable', 'red'),
+    ]
+
+
+class DHCPServerAccessChoices(ChoiceSet):
+    UNKNOWN = 'unknown'
+    RO = 'ro'
+    RW = 'rw'
+
+    CHOICES = [
+        (UNKNOWN, 'Unknown', 'gray'),
+        (RO, 'Read-Only', 'blue'),
+        (RW, 'Read-Write', 'green'),
     ]
 
 

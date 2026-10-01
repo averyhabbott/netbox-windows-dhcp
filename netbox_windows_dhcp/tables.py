@@ -31,7 +31,21 @@ class DHCPServerTable(NetBoxTable):
     port = tables.Column()
     use_https = BooleanColumn(verbose_name='HTTPS')
     verify_ssl = BooleanColumn(verbose_name='SSL Verify')
+    access_level = tables.TemplateColumn(
+        template_code=(
+            '{% if record.access_level == "rw" %}'
+            '<span class="badge text-bg-success">Read-Write</span>'
+            '{% elif record.access_level == "ro" %}'
+            '<span class="badge text-bg-info">Read-Only</span>'
+            '{% else %}'
+            '<span class="badge text-bg-secondary">Unknown</span>'
+            '{% endif %}'
+        ),
+        verbose_name='Writable',
+        orderable=True,
+    )
     sync_standalone_scopes = BooleanColumn(verbose_name='Sync Standalone')
+    default_scope_vrf = tables.Column(linkify=True, verbose_name='Default Scope VRF')
     has_api_key = tables.Column(
         accessor='api_key',
         verbose_name='API Key',
@@ -58,22 +72,23 @@ class DHCPServerTable(NetBoxTable):
             '   class="btn btn-sm btn-azure" title="Maintenance Mode">'
             '<i class="mdi mdi-pause-circle-outline"></i>'
             '</a>'
-            '<a href="{% url \'plugins:netbox_windows_dhcp:dhcpserver_sync\' record.pk %}"'
+            # A submit button, not a link: the list table sits inside NetBox's POST form (with its CSRF token)
+            '<button type="submit" formaction="{% url \'plugins:netbox_windows_dhcp:dhcpserver_sync\' record.pk %}"'
             '   class="btn btn-sm btn-primary" title="Sync Now">'
             '<i class="mdi mdi-sync"></i>'
-            '</a>'
+            '</button>'
         ),
     )
 
     class Meta(NetBoxTable.Meta):
         model = DHCPServer
         fields = (
-            'pk', 'name', 'hostname', 'port', 'use_https', 'verify_ssl',
-            'sync_standalone_scopes', 'has_api_key',
+            'pk', 'name', 'hostname', 'port', 'use_https', 'verify_ssl', 'access_level',
+            'sync_standalone_scopes', 'default_scope_vrf', 'has_api_key',
             'health_status', 'psu_script_version', 'maintenance_mode', 'actions',
         )
         default_columns = (
-            'name', 'hostname', 'use_https', 'verify_ssl', 'sync_standalone_scopes',
+            'name', 'hostname', 'use_https', 'verify_ssl', 'access_level', 'sync_standalone_scopes',
             'health_status', 'maintenance_mode', 'actions',
         )
 
@@ -107,9 +122,10 @@ class DHCPFailoverTable(NetBoxTable):
     mode = tables.Column()
     enable_auth = BooleanColumn(verbose_name='Auth')
     sync_enabled = BooleanColumn(verbose_name='Sync')
+    default_scope_vrf = tables.Column(linkify=True, verbose_name='Default Scope VRF')
     maintenance_mode = _MAINTENANCE_COLUMN
     actions = ActionsColumn(
-        actions=('delete', 'changelog'),
+        actions=('edit', 'delete', 'changelog'),
         extra_buttons=(
             '<a href="{% url \'plugins:netbox_windows_dhcp:dhcpfailover_maintenance\' record.pk %}"'
             '   class="btn btn-sm btn-azure" title="Maintenance Mode">'
@@ -127,9 +143,9 @@ class DHCPFailoverTable(NetBoxTable):
     class Meta(NetBoxTable.Meta):
         model = DHCPFailover
         fields = (
-            'pk', 'name', 'primary_server', 'secondary_server',
+            'pk', 'name', 'description', 'primary_server', 'secondary_server',
             'mode', 'max_client_lead_time', 'max_response_delay',
-            'enable_auth', 'sync_enabled', 'maintenance_mode', 'actions',
+            'enable_auth', 'sync_enabled', 'default_scope_vrf', 'maintenance_mode', 'actions',
         )
         default_columns = (
             'name', 'primary_server', 'secondary_server', 'mode',
@@ -177,12 +193,18 @@ class DHCPExclusionRangeTable(NetBoxTable):
 
     class Meta(NetBoxTable.Meta):
         model = DHCPExclusionRange
-        fields = ('pk', 'start_ip', 'end_ip', 'scope', 'actions')
-        default_columns = ('start_ip', 'end_ip', 'actions')
+        fields = ('pk', 'start_ip', 'end_ip', 'scope', 'description', 'actions')
+        default_columns = ('start_ip', 'end_ip', 'description', 'actions')
 
 
 class DHCPScopeTable(NetBoxTable):
     name = tables.Column(linkify=True)
+    active = BooleanColumn(verbose_name='Active')
+    network = tables.TemplateColumn(
+        template_code='{{ record.network }}/{{ record.prefix_length }}',
+        verbose_name='Network',
+        order_by=('network', 'prefix_length'),
+    )
     prefix = tables.Column(linkify=True)
     start_ip = tables.Column(verbose_name='Start IP')
     end_ip = tables.Column(verbose_name='End IP')
@@ -223,9 +245,29 @@ class DHCPScopeTable(NetBoxTable):
     class Meta(NetBoxTable.Meta):
         model = DHCPScope
         fields = (
-            'pk', 'name', 'prefix', 'start_ip', 'end_ip',
+            'pk', 'name', 'active', 'description', 'network', 'prefix', 'start_ip', 'end_ip',
             'router', 'source', 'lease_lifetime', 'tags', 'maintenance_mode', 'actions',
         )
         default_columns = (
-            'name', 'prefix', 'start_ip', 'end_ip', 'source', 'tags', 'maintenance_mode', 'actions',
+            'name', 'active', 'network', 'prefix', 'start_ip', 'end_ip', 'source', 'tags', 'maintenance_mode', 'actions',
         )
+
+
+# ---------------------------------------------------------------------------
+# Extra column on NetBox's core IP Addresses table (opt-in via "Configure Table")
+# ---------------------------------------------------------------------------
+
+def register_core_table_columns():
+    """Called once from PluginConfig.ready()."""
+    from ipam.tables import IPAddressTable
+    from utilities.tables import register_table_column
+
+    register_table_column(
+        tables.Column(
+            verbose_name='Lease Hostname',
+            accessor=tables.A('dhcp_lease_info__lease_hostname'),
+            order_by=('dhcp_lease_info__lease_hostname',),
+        ),
+        'dhcp_lease_hostname',
+        IPAddressTable,
+    )

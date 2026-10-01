@@ -4,11 +4,12 @@ UI view tests using NetBox's ViewTestCases harness.
 Mixins are composed per model to match exactly the views that are registered
 (see urls.py / views.py); notably:
   * No model registers a bulk-import (CSV) view, so those mixins are omitted.
-  * DHCPExclusionRange has no list or bulk views.
+  * DHCPExclusionRange's only bulk view is bulk delete.
   * DHCPFailover's "add" view is intentionally a redirect (failovers are
     import-only) — Create is replaced by a redirect assertion.
-  * DHCPScope's add/edit/delete/bulk views are gated behind the push_scope_info
-    setting, so those tests enable it and patch the resulting job enqueue.
+  * DHCPScope, DHCPExclusionRange and DHCPOptionValue write views are gated
+    behind the push_scope_info setting, so those tests enable it (scope tests
+    also patch the resulting job enqueue).
 
 Custom action views (sync / maintenance / global sync) are covered separately
 with the job layer patched, so no test reaches RQ/Redis or a DHCP server.
@@ -17,16 +18,18 @@ with the job layer patched, so no test reaches RQ/Redis or a DHCP server.
 from datetime import timedelta
 from unittest import mock
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
-from django.test import Client
+from django.test import Client, override_settings
 from django.urls import reverse
 from django.utils import timezone
-from ipam.models import Prefix
+from ipam.models import IPAddress, Prefix, VRF
 from utilities.testing import TestCase, ViewTestCases
 
 from ..models import (
     DHCPExclusionRange,
     DHCPFailover,
+    DHCPLeaseInfo,
     DHCPOptionCodeDefinition,
     DHCPOptionValue,
     DHCPPluginSettings,
@@ -34,25 +37,48 @@ from ..models import (
     DHCPServer,
 )
 from .base import (
+    changes_for,
+    grant,
     PluginViewTestMixin,
     clear_builtin_option_codes,
+    job_mock,
     make_failover,
+    make_option_definition,
+    make_option_value,
+    make_prefix,
+    make_scope,
     make_server,
+    make_unassigned_scope,
     set_plugin_settings,
+    ui_url,
 )
 
+
 ENQUEUE = 'netbox_windows_dhcp.background_tasks.DHCPServerSyncJob.enqueue'
-ENQUEUE_ONCE = 'netbox_windows_dhcp.background_tasks.DHCPSyncJob.enqueue_once'
-SYNC_ENQUEUE = 'netbox_windows_dhcp.background_tasks.DHCPSyncJob.enqueue'
+SCHEDULE_JOB_ENQUEUE = 'netbox_windows_dhcp.background_tasks.SetDHCPSyncScheduleJob.enqueue'
 IMPORT_ENQUEUE = 'netbox_windows_dhcp.background_tasks.DHCPImportJob.enqueue'
 PSU_ENQUEUE = 'netbox_windows_dhcp.background_tasks.DHCPPSUUpdateJob.enqueue'
+SETTINGS_FORM = {
+    'lease_status': 'active',
+    'reservation_status': 'reserved',
+    'sync_interval': 60,
+    'sync_queue': 'default',
+    'sync_job_timeout': 300,
+    'sync_log_level': 'DEBUG',
+}
+SCOPE_PUSH = 'netbox_windows_dhcp.signals._queue_scope_push'
 
 
-def _job_mock():
-    """A stand-in job whose get_absolute_url() returns a real string for redirect()."""
-    job = mock.Mock()
-    job.get_absolute_url.return_value = '/core/jobs/1/'
-    return job
+class _OptionCodeFixtures:
+
+    def _fixtures(self):
+        set_plugin_settings(push_scope_info=True)
+        code = make_option_definition(code=210, name='Opt 210')
+        other = make_option_definition(code=211, name='Opt 211')
+        self.a = make_option_value(option_definition=code, value='1.1.1.1', friendly_name='A')
+        self.b = make_option_value(option_definition=code, value='2.2.2.2', friendly_name='B')
+        self.c = make_option_value(option_definition=other, value='3.3.3.3', friendly_name='C')
+        self.scope = make_scope()
 
 
 class DHCPServerViewTests(
@@ -101,15 +127,10 @@ class DHCPFailoverViewTests(
             DHCPFailover(name='FO 2', primary_server=servers[2], secondary_server=servers[3]),
             DHCPFailover(name='FO 3', primary_server=servers[4], secondary_server=servers[5]),
         ])
+        # Only the NetBox-side fields can be edited (the rest are read-only on the form).
         cls.form_data = {
-            'name': 'FO X',
-            'primary_server': servers[0].pk,
-            'secondary_server': servers[1].pk,
-            'mode': 'LoadBalance',
-            'max_client_lead_time': 3600,
-            'max_response_delay': 30,
-            'sync_enabled': True,
-            'enable_auth': False,
+            'description': 'Edited failover',
+            'default_scope_vrf': VRF.objects.create(name='Red').pk,
         }
 
     def test_add_view_is_readonly_redirect(self):
@@ -173,6 +194,8 @@ class DHCPOptionValueViewTests(
         cls.form_data = {
             'option_definition': opt.pk, 'value': '10.9.9.9', 'friendly_name': 'VX',
         }
+        # Unblock the gated add/edit/delete/bulk views.
+        set_plugin_settings(push_scope_info=True)
 
 
 class DHCPScopeViewTests(
@@ -190,23 +213,25 @@ class DHCPScopeViewTests(
 
     @classmethod
     def setUpTestData(cls):
-        prefix = Prefix.objects.create(prefix='10.0.1.0/24', status='active')
+        # One scope per prefix, and one per network on a server.
+        prefixes = [Prefix.objects.create(prefix=f'10.0.{i}.0/24', status='active') for i in range(1, 4)]
+        new_prefix = Prefix.objects.create(prefix='10.0.9.0/24', status='active')
         server = DHCPServer.objects.create(name='ScopeSrv', hostname='scopesrv.example.com')
         # Create scopes while push_scope_info is still False so the post_save
         # signal does not enqueue during fixture setup.
         DHCPScope.objects.bulk_create([
-            DHCPScope(name='Scope 1', prefix=prefix, server=server, start_ip='10.0.1.10', end_ip='10.0.1.20'),
-            DHCPScope(name='Scope 2', prefix=prefix, server=server, start_ip='10.0.1.30', end_ip='10.0.1.40'),
-            DHCPScope(name='Scope 3', prefix=prefix, server=server, start_ip='10.0.1.50', end_ip='10.0.1.60'),
+            DHCPScope(name=f'Scope {i}', prefix=prefixes[i - 1], network=f'10.0.{i}.0', prefix_length=24,
+                      server=server, start_ip=f'10.0.{i}.10', end_ip=f'10.0.{i}.20')
+            for i in range(1, 4)
         ])
         # Unblock the gated add/edit/delete/bulk views.
         set_plugin_settings(push_scope_info=True)
         cls.form_data = {
-            'name': 'Scope X', 'prefix': prefix.pk,
-            'start_ip': '10.0.1.150', 'end_ip': '10.0.1.200', 'router': '10.0.1.1',
+            'name': 'Scope X', 'description': 'Building X', 'prefix': new_prefix.pk,
+            'start_ip': '10.0.9.150', 'end_ip': '10.0.9.200', 'router': '10.0.9.1',
             'server': server.pk, 'lease_lifetime_value': 1, 'lease_lifetime_unit': 'days',
         }
-        cls.bulk_edit_data = {'router': '10.0.1.254'}
+        cls.bulk_edit_data = {'router': '10.0.1.254', 'description': 'Bulk described'}
 
     def setUp(self):
         super().setUp()
@@ -225,8 +250,9 @@ class DHCPExclusionRangeViewTests(
     ViewTestCases.EditObjectViewTestCase,
     ViewTestCases.DeleteObjectViewTestCase,
     ViewTestCases.ListObjectsViewTestCase,
+    ViewTestCases.BulkDeleteObjectsViewTestCase,
 ):
-    # No bulk views are registered for exclusion ranges.
+    # Bulk delete is the only bulk view registered for exclusion ranges.
     model = DHCPExclusionRange
 
     @classmethod
@@ -243,7 +269,69 @@ class DHCPExclusionRangeViewTests(
         ])
         cls.form_data = {
             'scope': scope.pk, 'start_ip': '10.0.1.210', 'end_ip': '10.0.1.220',
+            'description': 'Printers',
         }
+        # Unblock the gated add/edit/delete views.
+        set_plugin_settings(push_scope_info=True)
+
+
+class ScopeWithoutPrefixViewTests(TestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.user.is_superuser = True
+        self.user.save()
+        self.server = make_server()
+
+    def test_detail_page_renders(self):
+        scope = make_unassigned_scope(server=self.server)
+        response = self.client.get(scope.get_absolute_url())
+        self.assertHttpStatus(response, 200)
+        self.assertContains(response, 'Unassigned')
+        self.assertContains(response, '10.0.1.0/24')
+
+    def test_create_through_the_form(self):
+        set_plugin_settings(push_scope_info=True)
+        data = {
+            'name': 'Form scope', 'network': '10.0.3.0', 'prefix_length': 24,
+            'start_ip': '10.0.3.10', 'end_ip': '10.0.3.20', 'server': self.server.pk,
+            'lease_lifetime_value': 1, 'lease_lifetime_unit': 'days',
+        }
+        with mock.patch('netbox_windows_dhcp.background_tasks.DHCPScopePushJob.enqueue'):
+            response = self.client.post(reverse('plugins:netbox_windows_dhcp:dhcpscope_add'), data)
+        self.assertHttpStatus(response, 302)
+        scope = DHCPScope.objects.get(name='Form scope')
+        self.assertIsNone(scope.prefix)
+        self.assertEqual((scope.network, scope.prefix_length), ('10.0.3.0', 24))
+
+    def test_a_prefix_is_not_required_but_something_is(self):
+        set_plugin_settings(push_scope_info=True)
+        data = {
+            'name': 'Form scope', 'start_ip': '10.0.3.10', 'end_ip': '10.0.3.20',
+            'server': self.server.pk, 'lease_lifetime_value': 1, 'lease_lifetime_unit': 'days',
+        }
+        response = self.client.post(reverse('plugins:netbox_windows_dhcp:dhcpscope_add'), data)
+        self.assertHttpStatus(response, 200)
+        self.assertTrue(response.context['form'].errors)
+        self.assertFalse(DHCPScope.objects.filter(name='Form scope').exists())
+
+
+class ScopeDetailVRFTests(TestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.user.is_superuser = True
+        self.user.save()
+
+    def test_ip_table_only_lists_the_scopes_vrf(self):
+        red = VRF.objects.create(name='Red')
+        scope = make_scope(prefix=make_prefix('10.0.1.0/24', vrf=red))
+        IPAddress.objects.create(address='10.0.1.50/24', status='dhcp', vrf=red)
+        IPAddress.objects.create(address='10.0.1.51/24', status='dhcp')
+        response = self.client.get(reverse('plugins:netbox_windows_dhcp:dhcpscope', args=[scope.pk]))
+        self.assertHttpStatus(response, 200)
+        listed = [str(ip.address) for ip in response.context['ip_table'].data]
+        self.assertEqual(listed, ['10.0.1.50/24'])
 
 
 class CustomActionViewTests(TestCase):
@@ -287,14 +375,14 @@ class CustomActionViewTests(TestCase):
 
     def test_server_import_enqueues_job(self):
         url = reverse('plugins:netbox_windows_dhcp:dhcpserver_import', kwargs={'pk': self.server.pk})
-        with mock.patch(IMPORT_ENQUEUE, return_value=_job_mock()) as enq:
+        with mock.patch(IMPORT_ENQUEUE, return_value=job_mock()) as enq:
             self.client.post(url)
         enq.assert_called_once()
         self.assertEqual(enq.call_args.kwargs.get('server_pk'), self.server.pk)
 
     def test_server_psu_update_enqueues_job(self):
         url = reverse('plugins:netbox_windows_dhcp:dhcpserver_psu_update', kwargs={'pk': self.server.pk})
-        with mock.patch(PSU_ENQUEUE, return_value=_job_mock()) as enq:
+        with mock.patch(PSU_ENQUEUE, return_value=job_mock()) as enq:
             self.client.post(url)
         enq.assert_called_once()
         self.assertEqual(enq.call_args.kwargs.get('server_pk'), self.server.pk)
@@ -307,6 +395,179 @@ class CustomActionViewTests(TestCase):
         self.assertFalse(failover.sync_enabled)
 
 
+class SyncNowNeedsPostTests(TestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.user.is_superuser = True
+        self.user.save()
+        self.server = make_server()
+        self.url = reverse('plugins:netbox_windows_dhcp:dhcpserver_sync', kwargs={'pk': self.server.pk})
+
+    def test_get_is_refused_and_starts_nothing(self):
+        with mock.patch(ENQUEUE) as enq:
+            response = self.client.get(self.url)
+        self.assertHttpStatus(response, 405)
+        enq.assert_not_called()
+
+
+class PerObjectPermissionViewTests(TestCase):
+    """The user may change server A only (and view both)."""
+
+    def setUp(self):
+        super().setUp()
+        self.a = make_server(name='A', hostname='a.example.com')
+        self.b = make_server(name='B', hostname='b.example.com')
+        grant(self.user, DHCPServer, ['view'])
+        grant(self.user, DHCPServer, ['change'], pk=self.a.pk)
+
+    def test_single_sync_only_on_permitted_server(self):
+        with mock.patch(ENQUEUE, return_value=job_mock()) as enq:
+            self.assertEqual(self.client.post(ui_url('dhcpserver_sync', self.b.pk)).status_code, 404)
+            enq.assert_not_called()
+            self.client.post(ui_url('dhcpserver_sync', self.a.pk))
+            enq.assert_called_once()
+
+    def test_global_sync_skips_unpermitted(self):
+        with mock.patch(ENQUEUE, return_value=job_mock()) as enq:
+            self.client.post(ui_url('global_sync'))
+        self.assertEqual([c.kwargs['server_pk'] for c in enq.call_args_list], [self.a.pk])
+
+    def test_bulk_maintenance_skips_unpermitted(self):
+        self.client.post(ui_url('dhcpserver_bulk_maintenance'),
+                         {'pk': [self.a.pk, self.b.pk], 'confirm': '1', 'maintenance_mode': '1'})
+        self.a.refresh_from_db()
+        self.b.refresh_from_db()
+        self.assertEqual((self.a.maintenance_mode, self.b.maintenance_mode), (True, False))
+
+    def test_bulk_psu_update_skips_unpermitted(self):
+        with mock.patch(PSU_ENQUEUE, return_value=job_mock()) as enq:
+            self.client.post(ui_url('dhcpserver_bulk_psu_update'), {'pk': [self.a.pk, self.b.pk]})
+        self.assertEqual([c.kwargs['server_pk'] for c in enq.call_args_list], [self.a.pk])
+
+    def test_single_maintenance_and_import_and_cert_remove_refused_on_other_server(self):
+        DHCPServer.objects.filter(pk=self.b.pk).update(ca_cert='pem')
+        for name in ('dhcpserver_maintenance', 'dhcpserver_import', 'dhcpserver_certremove',
+                     'dhcpserver_psu_update'):
+            with self.subTest(name=name):
+                self.assertEqual(self.client.post(ui_url(name, self.b.pk), {'maintenance_mode': '1'}).status_code,
+                                 404)
+        self.b.refresh_from_db()
+        self.assertEqual((self.b.maintenance_mode, self.b.ca_cert), (False, 'pem'))
+
+    def test_test_connection_needs_change_on_that_server(self):
+        response = self.client.post(ui_url('dhcpserver_test_connection', self.b.pk), {'hostname': 'b'})
+        self.assertEqual(response.status_code, 403)
+
+    def test_failover_bulk_toggle_skips_unpermitted(self):
+        fo_a = make_failover(name='FA', primary=self.a, secondary=make_server(name='A2', hostname='a2'))
+        fo_b = make_failover(name='FB', primary=self.b, secondary=make_server(name='B2', hostname='b2'))
+        grant(self.user, DHCPFailover, ['change'], pk=fo_a.pk)
+        self.client.post(reverse('plugins:netbox_windows_dhcp:dhcpfailover_bulk_toggle_sync'),
+                         {'pk': [fo_a.pk, fo_b.pk]})
+        fo_a.refresh_from_db()
+        fo_b.refresh_from_db()
+        self.assertEqual((fo_a.sync_enabled, fo_b.sync_enabled), (False, True))
+
+
+class UnprivilegedAJAXTests(TestCase):
+
+    def test_cert_fetch_needs_add_or_change_on_servers(self):
+        with mock.patch('netbox_windows_dhcp.cert_utils.fetch_cert_info') as fetch:
+            response = self.client.post(reverse('plugins:netbox_windows_dhcp:dhcpserver_cert_fetch'),
+                                        {'hostname': 'x.example.com', 'port': '443'})
+        self.assertEqual(response.status_code, 403)
+        fetch.assert_not_called()
+
+    def test_test_connection_new_needs_add_or_change(self):
+        response = self.client.post(reverse('plugins:netbox_windows_dhcp:dhcpserver_test_connection_new'),
+                                    {'hostname': 'x.example.com'})
+        self.assertEqual(response.status_code, 403)
+
+
+class CertFetchAllowlistTests(TestCase):
+    """With restrict_allowlist on, Fetch Certificate only connects to hostnames marked allowed."""
+
+    def setUp(self):
+        super().setUp()
+        self.user.is_superuser = True
+        self.user.save()
+
+    def _fetch(self, hostname, plugin_config):
+        plugins_config = {**settings.PLUGINS_CONFIG, 'netbox_windows_dhcp': plugin_config}
+        cert = {'pem': 'PEM', 'not_after': None}
+        with override_settings(PLUGINS_CONFIG=plugins_config), \
+                mock.patch('netbox_windows_dhcp.cert_utils.fetch_cert_info', return_value=cert) as fetch:
+            response = self.client.post(reverse('plugins:netbox_windows_dhcp:dhcpserver_cert_fetch'),
+                                        {'hostname': hostname, 'port': '443'})
+        return response.json()['ok'], fetch.called
+
+    def test_which_hostnames_are_fetched(self):
+        restricted = {'restrict_allowlist': True,
+                      'server_overrides': {'dhcp01.example.com': {'allowed': True},
+                                           'dhcp02.example.com': {'api_key': 'x'}}}
+        cases = (
+            ('allowlist on, listed and allowed', 'dhcp01.example.com', restricted, True),
+            ('allowlist on, listed without allowed', 'dhcp02.example.com', restricted, False),
+            ('allowlist on, not listed', 'other.example.com', restricted, False),
+            ('allowlist off', 'other.example.com', {}, True),
+        )
+        for label, hostname, plugin_config, fetched in cases:
+            with self.subTest(label):
+                self.assertEqual(self._fetch(hostname, plugin_config), (fetched, fetched))
+
+
+class CurrentMaintenanceViewTests(TestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.a = make_server(name='A', hostname='a.example.com', maintenance_mode=True)
+        self.b = make_server(name='B', hostname='b.example.com', maintenance_mode=True)
+        grant(self.user, DHCPServer, ['view'], pk=self.a.pk)
+
+    def test_lists_only_viewable_items(self):
+        response = self.client.get(reverse('plugins:netbox_windows_dhcp:current_maintenance'))
+        self.assertEqual([i['object'] for i in response.context['items']], [self.a])
+
+    def test_bulk_disable_only_changes_permitted(self):
+        grant(self.user, DHCPServer, ['change'], pk=self.a.pk)
+        self.client.post(reverse('plugins:netbox_windows_dhcp:current_maintenance_bulk_disable'),
+                         {'selected': [f'server:{self.a.pk}', f'server:{self.b.pk}']})
+        self.a.refresh_from_db()
+        self.b.refresh_from_db()
+        self.assertEqual((self.a.maintenance_mode, self.b.maintenance_mode), (False, True))
+
+
+class DuplicateOptionCodeBulkEditTests(_OptionCodeFixtures, TestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.user.is_superuser = True
+        self.user.save()
+        self._fixtures()
+        self.scope.option_values.add(self.a)
+        self.other_scope = make_scope(name='Scope 2', server=self.scope.server, prefix=make_prefix('10.0.2.0/24'),
+                                      start_ip='10.0.2.10', end_ip='10.0.2.254')
+
+    def _bulk_edit(self, **data):
+        with mock.patch(SCOPE_PUSH):
+            return self.client.post(reverse('plugins:netbox_windows_dhcp:dhcpscope_bulk_edit'), {
+                'pk': [self.scope.pk, self.other_scope.pk], '_apply': '1', 'description': 'bulk', **data,
+            })
+
+    def test_bulk_add_refuses_whole_edit_and_saves_nothing(self):
+        self._bulk_edit(add_option_values=[self.b.pk])
+        self.assertEqual(list(self.scope.option_values.all()), [self.a])
+        self.assertEqual(self.other_scope.option_values.count(), 0)
+        self.scope.refresh_from_db()
+        self.assertNotEqual(self.scope.description, 'bulk')
+
+    def test_bulk_add_with_matching_remove_is_allowed(self):
+        self._bulk_edit(add_option_values=[self.b.pk], remove_option_values=[self.a.pk])
+        self.assertEqual(list(self.scope.option_values.all()), [self.b])
+        self.assertEqual(list(self.other_scope.option_values.all()), [self.b])
+
+
 class SettingsViewTests(TestCase):
     """SettingsView (superuser-gated + persists) and ScheduleSyncView."""
 
@@ -315,10 +576,16 @@ class SettingsViewTests(TestCase):
         self.user.is_superuser = True
         self.user.save()
 
-    def test_settings_get_superuser_ok(self):
-        with mock.patch(ENQUEUE_ONCE):
-            response = self.client.get(reverse('plugins:netbox_windows_dhcp:settings'))
-        self.assertHttpStatus(response, 200)
+    def test_settings_page_shows_every_setting_once_with_detail_popups(self):
+        from ..forms import _SETTINGS_HELP_DETAILS, PluginSettingsForm
+
+        response = self.client.get(reverse('plugins:netbox_windows_dhcp:settings'))
+        content = response.content.decode()
+        for name in PluginSettingsForm.Meta.fields:
+            self.assertEqual(content.count(f'id="id_{name}"'), 1, name)
+        for name in _SETTINGS_HELP_DETAILS:
+            self.assertIn(f'data-bs-target="#{name}_details"', content)
+            self.assertIn(f'id="{name}_details"', content)
 
     def test_settings_get_non_superuser_redirects(self):
         plain = get_user_model().objects.create_user('plain', password='x')
@@ -335,26 +602,116 @@ class SettingsViewTests(TestCase):
             'sync_interval': 120,
             'sync_queue': 'default',
             'sync_job_timeout': 300,
+            'sync_log_level': 'DEBUG',
         }
-        with mock.patch(ENQUEUE_ONCE):
-            response = self.client.post(reverse('plugins:netbox_windows_dhcp:settings'), data)
+        response = self.client.post(reverse('plugins:netbox_windows_dhcp:settings'), data)
         self.assertHttpStatus(response, 302)
         self.assertEqual(DHCPPluginSettings.load().sync_interval, 120)
 
-    def test_schedule_run_now_enqueues_immediately(self):
-        # Patch enqueue_once too: the settings singleton's post_save reschedules the
-        # recurring chain via enqueue_once, which itself calls enqueue.
-        with mock.patch(ENQUEUE_ONCE), \
-                mock.patch(SYNC_ENQUEUE, return_value=_job_mock()) as enq:
+    def test_reservation_placeholders_off_by_default_and_saves(self):
+        self.assertFalse(DHCPPluginSettings.load().reservation_placeholders)
+        data = {
+            'lease_status': 'active',
+            'reservation_status': 'reserved',
+            'sync_interval': 60,
+            'sync_queue': 'default',
+            'sync_job_timeout': 300,
+            'sync_log_level': 'DEBUG',
+            'reservation_placeholders': 'on',
+        }
+        response = self.client.post(reverse('plugins:netbox_windows_dhcp:settings'), data)
+        self.assertHttpStatus(response, 302)
+        self.assertTrue(DHCPPluginSettings.load().reservation_placeholders)
+
+    def test_schedule_page_holds_run_now_and_schedule(self):
+        response = self.client.get(reverse('plugins:netbox_windows_dhcp:schedule'))
+        self.assertHttpStatus(response, 200)
+        self.assertContains(response, 'Run Now')
+        self.assertContains(response, 'id="schedule-form"')
+        settings_page = self.client.get(reverse('plugins:netbox_windows_dhcp:settings'))
+        self.assertNotContains(settings_page, 'Run Now')
+
+    def test_schedule_page_non_superuser_redirects(self):
+        plain = get_user_model().objects.create_user('plain', password='x')
+        c = Client()
+        c.force_login(plain)
+        response = c.get(reverse('plugins:netbox_windows_dhcp:schedule'))
+        self.assertHttpStatus(response, 302)
+
+    def test_schedule_run_now_enqueues_one_off_via_schedule_job(self):
+        with mock.patch(SCHEDULE_JOB_ENQUEUE, return_value=job_mock()) as enq:
             self.client.post(reverse('plugins:netbox_windows_dhcp:schedule_sync'), {'action': 'run_now'})
         enq.assert_called_once()
-        self.assertIsNone(enq.call_args.kwargs.get('interval'))
+        self.assertEqual(enq.call_args.kwargs.get('user'), self.user)
+        self.assertFalse(enq.call_args.kwargs.get('recurring'))
 
-    def test_schedule_future_reschedules(self):
+    def test_schedule_future_reschedules_via_schedule_job(self):
         start_at = (timezone.now() + timedelta(days=1)).replace(microsecond=0)
-        with mock.patch(ENQUEUE_ONCE) as enq_once:
+        with mock.patch(SCHEDULE_JOB_ENQUEUE, return_value=job_mock()) as enq:
             self.client.post(reverse('plugins:netbox_windows_dhcp:schedule_sync'), {
                 'action': 'schedule', 'start_at': start_at.isoformat(),
             })
-        self.assertTrue(enq_once.called)
-        self.assertIn('schedule_at', enq_once.call_args.kwargs)
+        enq.assert_called_once()
+        self.assertEqual(enq.call_args.kwargs.get('user'), self.user)
+        self.assertTrue(enq.call_args.kwargs.get('recurring'))
+        self.assertEqual(enq.call_args.kwargs.get('sync_at'), start_at)
+
+
+class SettingsChangelogTests(TestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.user.is_superuser = True
+        self.user.save()
+        self.url = reverse('plugins:netbox_windows_dhcp:settings')
+        self.client.post(self.url, SETTINGS_FORM)  # a known starting point
+        changes_for(DHCPPluginSettings).delete()
+
+    def test_save_records_who_and_what_changed(self):
+        before = DHCPPluginSettings.load().sync_interval
+        response = self.client.post(self.url, {**SETTINGS_FORM, 'sync_interval': 120})
+        self.assertHttpStatus(response, 302)
+
+        change = changes_for(DHCPPluginSettings).get()
+        self.assertEqual(change.user, self.user)
+        self.assertEqual(change.action, 'update')
+        self.assertEqual(change.prechange_data['sync_interval'], before)
+        self.assertEqual(change.postchange_data['sync_interval'], 120)
+        self.assertEqual(DHCPPluginSettings.load().get_absolute_url(), self.url)
+
+    def test_save_with_no_changes_records_nothing(self):
+        self.client.post(self.url, SETTINGS_FORM)
+        self.assertFalse(changes_for(DHCPPluginSettings).exists())
+
+
+class IPAddressLeaseHostnameColumnTests(TestCase):
+    """The plugin registers an opt-in Lease Hostname column on the core IP Addresses table."""
+
+    def test_column_renders_lease_hostname(self):
+        from ipam.models import IPAddress
+        from ipam.tables import IPAddressTable
+
+        from ..models import DHCPLeaseInfo
+
+        with_info = IPAddress.objects.create(address='10.9.0.1/24')
+        IPAddress.objects.create(address='10.9.0.2/24')
+        DHCPLeaseInfo.objects.create(ip_address=with_info, lease_hostname='My Dock Name', active=True)
+
+        table = IPAddressTable(IPAddress.objects.filter(address__net_host_contained='10.9.0.0/24'))
+        self.assertIn('dhcp_lease_hostname', table.columns.names())
+        table.order_by = 'dhcp_lease_hostname'
+        values = {str(row.record.address): row.get_cell_value('dhcp_lease_hostname') for row in table.rows}
+        self.assertEqual(values['10.9.0.1/24'], 'My Dock Name')
+        self.assertIsNone(values['10.9.0.2/24'])
+
+
+class LeasePanelTimeZoneTests(TestCase):
+
+    def test_label_shows_time_zone(self):
+        self.user.is_superuser = True
+        self.user.save()
+        ip = IPAddress.objects.create(address='10.9.1.1/24', status='dhcp')
+        DHCPLeaseInfo.objects.create(ip_address=ip, lease_hostname='h', active=True)
+        from django.utils import timezone
+        response = self.client.get(ip.get_absolute_url())
+        self.assertContains(response, f'Lease Expiration ({timezone.get_current_timezone_name()})')

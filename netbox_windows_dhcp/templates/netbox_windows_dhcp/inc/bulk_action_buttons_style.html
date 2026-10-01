@@ -1,0 +1,15 @@
+<style>
+  /*
+    NetBox's htmx table refresh replaces .bulk-action-buttons' outerHTML wholesale on every
+    search/sort/page change, wiping any custom buttons placed inside it — so our custom
+    buttons live in .bulk-action-buttons-custom instead, with the core-rendered actions
+    nested inside as a child. That nesting keeps it as the sole flex item under NetBox's
+    own .btn-list wrapper (avoiding a stray wide gap at just that boundary), so we lay out
+    our own row here to match the narrow spacing NetBox uses between stock action buttons.
+  */
+  .bulk-action-buttons-custom {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .25rem;
+  }
+</style>

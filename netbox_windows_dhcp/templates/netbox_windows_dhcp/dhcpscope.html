@@ -5,7 +5,9 @@
 {% if not push_scope_info %}
 <div class="alert alert-warning d-flex align-items-center mb-3" role="alert">
   <i class="mdi mdi-lock me-2"></i>
-  <span>Scopes are <strong>read-only</strong> — enable <em>Push Scope Info</em> in
+  <span>Scope settings come from the DHCP server and are <strong>read-only</strong> — only a
+    scope's prefix, tags and custom fields can be edited, and deleting a scope only removes it
+    from NetBox. Enable <em>Push Scope Info</em> in
     <a href="{% url 'plugins:netbox_windows_dhcp:settings' %}">plugin settings</a>
     to allow edits.</span>
 </div>
@@ -21,8 +23,28 @@
             <td>{{ object.name }}</td>
           </tr>
           <tr>
+            <th scope="row">Active</th>
+            <td>{% checkmark object.active %}</td>
+          </tr>
+          <tr>
+            <th scope="row">Description</th>
+            <td>{{ object.description|placeholder }}</td>
+          </tr>
+          <tr>
+            <th scope="row">Network</th>
+            <td><code>{{ object.network }}/{{ object.prefix_length }}</code></td>
+          </tr>
+          <tr>
             <th scope="row">Prefix</th>
-            <td><a href="{{ object.prefix.get_absolute_url }}">{{ object.prefix }}</a></td>
+            <td>
+              {% if object.prefix %}
+                <a href="{{ object.prefix.get_absolute_url }}">{{ object.prefix }}</a>
+                {% if object.prefix.vrf %}<span class="text-muted ms-1">(VRF {{ object.prefix.vrf|linkify }})</span>{% endif %}
+              {% else %}
+                <span class="badge text-bg-warning">Unassigned</span>
+                <span class="text-muted ms-1">IP sync and reservations are skipped until a prefix is linked</span>
+              {% endif %}
+            </td>
           </tr>
           <tr>
             <th scope="row">Start IP</th>
@@ -78,10 +100,12 @@
     <div class="card mt-3">
       <h5 class="card-header d-flex justify-content-between align-items-center">
         Exclusion Ranges
+        {% if push_scope_info %}
         <a href="{% url 'plugins:netbox_windows_dhcp:dhcpexclusionrange_add' %}?scope={{ object.pk }}"
            class="btn btn-sm btn-primary">
           <i class="mdi mdi-plus-thick"></i> Add
         </a>
+        {% endif %}
       </h5>
       <div class="card-body">
         {% if exclusion_table.rows %}
@@ -97,6 +121,7 @@
   </div>
 </div>
 
+{% if ip_table %}
 <div class="row mb-3">
   <div class="col col-12">
     <div class="card">
@@ -114,5 +139,6 @@
     {% endif %}
   </div>
 </div>
+{% endif %}
 
 {% endblock %}

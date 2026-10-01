@@ -1,16 +1,15 @@
 """
-FilterSet tests.
+Finding things: the list filters (the same ones the API's query parameters use), the
+"Unassigned Scopes" saved filter, and global search.
 
-NOTE: we intentionally do NOT inherit NetBox's ChangeLoggedFilterSetTests. Its
-``test_filters_defined`` asserts that *every* model field has a corresponding
-filter; these filtersets deliberately expose only a curated subset (name,
-hostname, search, etc.), so the harness would report dozens of fields as
-"missing" by design. Instead we test the filters that exist — the custom
-``search`` (q) behavior and representative field filters — directly.
+NetBox's ChangeLoggedFilterSetTests isn't used: it expects a filter for every model
+field, and these filtersets offer a chosen few.
 """
 
 from django.test import TestCase
+from extras.models import SavedFilter
 
+from .. import _ensure_unassigned_scopes_filter
 from ..filtersets import (
     DHCPExclusionRangeFilterSet,
     DHCPFailoverFilterSet,
@@ -19,19 +18,29 @@ from ..filtersets import (
     DHCPScopeFilterSet,
     DHCPServerFilterSet,
 )
-from ..models import (
-    DHCPExclusionRange,
-    DHCPFailover,
-    DHCPOptionCodeDefinition,
-    DHCPOptionValue,
-    DHCPScope,
-    DHCPServer,
+from ..models import DHCPExclusionRange, DHCPOptionCodeDefinition, DHCPOptionValue, DHCPServer
+from ..search import DHCPScopeIndex
+from .base import (
+    clear_builtin_option_codes,
+    make_failover,
+    make_prefix,
+    make_scope,
+    make_server,
+    make_unassigned_scope,
 )
-from .base import clear_builtin_option_codes, make_failover, make_prefix, make_scope, make_server
 
 
-class DHCPServerFilterSetTests(TestCase):
-    queryset = DHCPServer.objects.all()
+class _FilterCases:
+    filterset = None
+
+    def assertFinds(self, cases):
+        queryset = self.filterset.Meta.model.objects.all()
+        for params, expected in cases:
+            with self.subTest(params=params):
+                self.assertEqual(self.filterset(params, queryset).qs.count(), expected)
+
+
+class ServerFilterTests(_FilterCases, TestCase):
     filterset = DHCPServerFilterSet
 
     @classmethod
@@ -39,50 +48,42 @@ class DHCPServerFilterSetTests(TestCase):
         make_server(name='Alpha DHCP', hostname='alpha.example.com', port=443)
         make_server(name='Bravo DHCP', hostname='bravo.example.com', port=8443)
         make_server(name='Charlie', hostname='charlie.example.com', port=443)
+        DHCPServer.objects.filter(name='Alpha DHCP').update(health_status='healthy', access_level='ro')
+        DHCPServer.objects.filter(name='Bravo DHCP').update(health_status='unreachable')
 
-    def test_q_matches_name(self):
-        self.assertEqual(self.filterset({'q': 'Alpha'}, self.queryset).qs.count(), 1)
+    def test_filters(self):
+        self.assertFinds((
+            ({'q': 'Alpha'}, 1),
+            ({'q': 'bravo.example'}, 1),
+            ({'name': 'dhcp'}, 2),
+            ({'port': [443]}, 2),
+            ({'health_status': ['healthy']}, 1),
+            ({'health_status': ['healthy', 'unreachable']}, 2),
+            ({'access_level': ['ro']}, 1),
+            ({'access_level': ['unknown']}, 2),
+        ))
 
-    def test_q_matches_hostname(self):
-        self.assertEqual(self.filterset({'q': 'bravo.example'}, self.queryset).qs.count(), 1)
 
-    def test_name_icontains(self):
-        self.assertEqual(self.filterset({'name': 'dhcp'}, self.queryset).qs.count(), 2)
-
-    def test_port(self):
-        self.assertEqual(self.filterset({'port': [443]}, self.queryset).qs.count(), 2)
-
-
-class DHCPFailoverFilterSetTests(TestCase):
-    queryset = DHCPFailover.objects.all()
+class FailoverFilterTests(_FilterCases, TestCase):
     filterset = DHCPFailoverFilterSet
 
     @classmethod
     def setUpTestData(cls):
         cls.p = make_server(name='P', hostname='p.example.com')
-        cls.s = make_server(name='S', hostname='s.example.com')
-        make_failover(name='FO Load', primary=cls.p, secondary=cls.s, mode='LoadBalance')
-        make_failover(
-            name='FO Hot',
-            primary=make_server(name='P2', hostname='p2.example.com'),
-            secondary=make_server(name='S2', hostname='s2.example.com'),
-            mode='HotStandby',
-        )
+        make_failover(name='FO Load', primary=cls.p, secondary=make_server(name='S', hostname='s.example.com'),
+                      mode='LoadBalance')
+        make_failover(name='FO Hot', primary=make_server(name='P2', hostname='p2.example.com'),
+                      secondary=make_server(name='S2', hostname='s2.example.com'), mode='HotStandby')
 
-    def test_q_matches_name(self):
-        self.assertEqual(self.filterset({'q': 'Load'}, self.queryset).qs.count(), 1)
-
-    def test_mode(self):
-        self.assertEqual(self.filterset({'mode': ['HotStandby']}, self.queryset).qs.count(), 1)
-
-    def test_primary_server_id(self):
-        self.assertEqual(
-            self.filterset({'primary_server_id': [self.p.pk]}, self.queryset).qs.count(), 1
-        )
+    def test_filters(self):
+        self.assertFinds((
+            ({'q': 'Load'}, 1),
+            ({'mode': ['HotStandby']}, 1),
+            ({'primary_server_id': [self.p.pk]}, 1),
+        ))
 
 
-class DHCPOptionCodeDefinitionFilterSetTests(TestCase):
-    queryset = DHCPOptionCodeDefinition.objects.all()
+class OptionCodeFilterTests(_FilterCases, TestCase):
     filterset = DHCPOptionCodeDefinitionFilterSet
 
     @classmethod
@@ -92,18 +93,15 @@ class DHCPOptionCodeDefinitionFilterSetTests(TestCase):
         DHCPOptionCodeDefinition.objects.create(code=201, name='ZZ-Bootfile', is_builtin=True)
         DHCPOptionCodeDefinition.objects.create(code=202, name='ZZ-Cisco', vendor_class='Cisco')
 
-    def test_q_matches_name(self):
-        self.assertEqual(self.filterset({'q': 'ZZ-TFTP'}, self.queryset).qs.count(), 1)
-
-    def test_q_matches_code_int(self):
-        self.assertEqual(self.filterset({'q': '200'}, self.queryset).qs.count(), 1)
-
-    def test_is_builtin(self):
-        self.assertEqual(self.filterset({'is_builtin': True}, self.queryset).qs.count(), 1)
+    def test_filters(self):
+        self.assertFinds((
+            ({'q': 'ZZ-TFTP'}, 1),
+            ({'q': '200'}, 1),
+            ({'is_builtin': True}, 1),
+        ))
 
 
-class DHCPOptionValueFilterSetTests(TestCase):
-    queryset = DHCPOptionValue.objects.all()
+class OptionValueFilterTests(_FilterCases, TestCase):
     filterset = DHCPOptionValueFilterSet
 
     @classmethod
@@ -112,19 +110,19 @@ class DHCPOptionValueFilterSetTests(TestCase):
         DHCPOptionValue.objects.create(option_definition=opt, value='10.0.0.1', friendly_name='Primary DNS')
         DHCPOptionValue.objects.create(option_definition=opt, value='10.0.0.2', friendly_name='Secondary DNS')
         DHCPOptionValue.objects.create(option_definition=opt, value='8.8.8.8', friendly_name='Public')
+        tftp = DHCPOptionCodeDefinition.objects.create(code=250, name='TFTP')
+        DHCPOptionValue.objects.create(option_definition=tftp, value='10.0.0.9')
 
-    def test_q_matches_friendly_name(self):
-        self.assertEqual(self.filterset({'q': 'Primary'}, self.queryset).qs.count(), 1)
+    def test_filters(self):
+        self.assertFinds((
+            ({'q': 'Primary'}, 1),
+            ({'q': '8.8.8.8'}, 1),
+            ({'q': '250'}, 1),  # the code alone finds its values
+            ({'value': '10.0.0'}, 3),
+        ))
 
-    def test_q_matches_value(self):
-        self.assertEqual(self.filterset({'q': '8.8.8.8'}, self.queryset).qs.count(), 1)
 
-    def test_value_icontains(self):
-        self.assertEqual(self.filterset({'value': '10.0.0'}, self.queryset).qs.count(), 2)
-
-
-class DHCPExclusionRangeFilterSetTests(TestCase):
-    queryset = DHCPExclusionRange.objects.all()
+class ExclusionRangeFilterTests(_FilterCases, TestCase):
     filterset = DHCPExclusionRangeFilterSet
 
     @classmethod
@@ -133,17 +131,14 @@ class DHCPExclusionRangeFilterSetTests(TestCase):
         DHCPExclusionRange.objects.create(scope=cls.scope, start_ip='10.0.1.50', end_ip='10.0.1.60')
         DHCPExclusionRange.objects.create(scope=cls.scope, start_ip='10.0.1.70', end_ip='10.0.1.80')
 
-    def test_scope_id(self):
-        self.assertEqual(
-            self.filterset({'scope_id': [self.scope.pk]}, self.queryset).qs.count(), 2
-        )
-
-    def test_q_matches_start_ip(self):
-        self.assertEqual(self.filterset({'q': '10.0.1.50'}, self.queryset).qs.count(), 1)
+    def test_filters(self):
+        self.assertFinds((
+            ({'scope_id': [self.scope.pk]}, 2),
+            ({'q': '10.0.1.50'}, 1),
+        ))
 
 
-class DHCPScopeFilterSetTests(TestCase):
-    queryset = DHCPScope.objects.all()
+class ScopeFilterTests(_FilterCases, TestCase):
     filterset = DHCPScopeFilterSet
 
     @classmethod
@@ -155,21 +150,45 @@ class DHCPScopeFilterSetTests(TestCase):
             server=make_server(name='Srv2', hostname='srv2.example.com'),
             start_ip='10.0.2.10', end_ip='10.0.2.254',
         )
+        make_unassigned_scope(name='Unassigned', network='10.0.3.0', server=cls.server,
+                              start_ip='10.0.3.10', end_ip='10.0.3.20')
 
-    def test_q_matches_name(self):
-        self.assertEqual(self.filterset({'q': 'Building A'}, self.queryset).qs.count(), 1)
+    def test_filters(self):
+        self.assertFinds((
+            ({'q': 'Building A'}, 1),
+            ({'server_id': [self.server.pk]}, 2),
+            ({'within_prefix': '10.0.0.0/16'}, 2),
+            ({'within_prefix': '10.0.1.0/24'}, 1),
+            ({'has_prefix': 'true'}, 2),
+            ({'has_prefix': 'false'}, 1),
+        ))
 
-    def test_server_id(self):
+
+class UnassignedScopesSavedFilterTests(TestCase):
+
+    def setUp(self):
+        SavedFilter.objects.filter(slug='unassigned-scopes').delete()
+
+    def test_created(self):
+        _ensure_unassigned_scopes_filter(sender=None)
+        saved_filter = SavedFilter.objects.get(slug='unassigned-scopes')
+        self.assertEqual(saved_filter.name, 'Unassigned Scopes')
+        self.assertEqual(saved_filter.parameters, {'has_prefix': ['false']})
+        self.assertTrue(saved_filter.shared)
         self.assertEqual(
-            self.filterset({'server_id': [self.server.pk]}, self.queryset).qs.count(), 1
+            list(saved_filter.object_types.values_list('app_label', 'model')),
+            [('netbox_windows_dhcp', 'dhcpscope')],
         )
 
-    def test_within_prefix(self):
-        # Both scopes are inside 10.0.0.0/16.
-        self.assertEqual(
-            self.filterset({'within_prefix': '10.0.0.0/16'}, self.queryset).qs.count(), 2
-        )
-        # Only Building A is inside 10.0.1.0/24.
-        self.assertEqual(
-            self.filterset({'within_prefix': '10.0.1.0/24'}, self.queryset).qs.count(), 1
-        )
+    def test_an_existing_filter_with_that_name_is_left_alone(self):
+        SavedFilter.objects.create(name='Unassigned Scopes', slug='my-own', parameters={'x': ['1']})
+        _ensure_unassigned_scopes_filter(sender=None)
+        self.assertEqual(SavedFilter.objects.filter(name='Unassigned Scopes').count(), 1)
+        self.assertEqual(SavedFilter.objects.get(name='Unassigned Scopes').parameters, {'x': ['1']})
+
+
+class SearchTests(TestCase):
+
+    def test_scopes_are_found_by_network(self):
+        scope = make_scope()  # prefix 10.0.1.0/24
+        self.assertEqual(DHCPScopeIndex.get_field_value(scope, 'prefix'), '10.0.1.0/24')

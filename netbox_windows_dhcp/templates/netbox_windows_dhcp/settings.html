@@ -4,124 +4,61 @@
 {% block title %}Windows DHCP — Settings{% endblock %}
 
 {% block content %}
-<div class="row">
-  <div class="col col-md-6">
+<form method="post">
+  {% csrf_token %}
+  {% if form.non_field_errors %}
+  <div class="alert alert-danger">{{ form.non_field_errors }}</div>
+  {% endif %}
 
-    <div class="card">
-      <h5 class="card-header">Plugin Settings</h5>
-      <div class="card-body">
-        {% if active_global_overrides %}
-        <div class="alert alert-info mb-3">
-          <i class="mdi mdi-information-outline"></i>
-          The following settings are overridden by
-          <code>PLUGINS_CONFIG['netbox_windows_dhcp']</code> in <code>configuration.py</code>
-          and are read-only here. Changes saved to these fields will not take effect while
-          the override is active.
-          <ul class="mb-0 mt-2">
-            {% for label, value in active_global_overrides %}
-            <li><strong>{{ label }}</strong>: {{ value }}</li>
-            {% endfor %}
-          </ul>
-        </div>
-        {% endif %}
-        <form method="post">
-          {% csrf_token %}
-          {% render_form form %}
-          <div class="mt-3">
-            <button type="submit" class="btn btn-primary">Save</button>
-            <a href="{% url 'plugins:netbox_windows_dhcp:dhcpserver_list' %}" class="btn btn-outline-secondary ms-2">Cancel</a>
-          </div>
-        </form>
-      </div>
-    </div>
-
-    <div class="card mt-3">
-      <h5 class="card-header">Scheduled Sync</h5>
-      <div class="card-body">
-
-        <table class="table table-borderless mb-3">
-          <tr>
-            <th style="width:160px">Next run at</th>
-            <td>
-              {% if next_sync_job %}
-                {% if next_sync_job.status == 'scheduled' and next_sync_job.scheduled %}
-                  {{ next_sync_job.scheduled|date:"N j, Y, g:i a" }}
-                  <span class="text-muted ms-1">({{ next_sync_job.scheduled|timeuntil }} from now)</span>
-                {% elif next_sync_job.status == 'pending' %}
-                  <span class="badge text-bg-warning">Queued — running shortly</span>
-                {% else %}
-                  <span class="text-muted">N/A</span>
-                {% endif %}
-              {% else %}
-                <span class="text-muted">N/A — no sync scheduled</span>
+  <div class="row">
+    {% for cards in form.columns %}
+    <div class="col-12 col-lg-6">
+      {% for title, description, groups in cards %}
+      <div class="card mb-3">
+        <h5 class="card-header">{{ title }}</h5>
+        <div class="card-body">
+          <p class="text-muted small">{{ description }}</p>
+          {% for heading, fields in groups %}
+            {% if heading %}
+            <div class="text-muted text-uppercase small fw-semibold border-bottom pb-1 mb-3{% if not forloop.first %} mt-4{% endif %}">{{ heading }}</div>
+            {% endif %}
+            {% for field, overridden in fields %}
+              {% if overridden %}
+              <div class="text-muted small mb-1">
+                <i class="mdi mdi-lock-outline"></i>
+                Locked by <code>PLUGINS_CONFIG['netbox_windows_dhcp']</code> in <code>configuration.py</code>;
+                changes here have no effect while the override is active.
+              </div>
               {% endif %}
-            </td>
-          </tr>
-          {% if next_sync_job and next_sync_job.interval %}
-          <tr>
-            <th>Repeats every</th>
-            <td>{{ next_sync_job.interval }} minute{{ next_sync_job.interval|pluralize }}</td>
-          </tr>
-          {% endif %}
-        </table>
-
-        <div class="d-flex flex-wrap gap-2 align-items-end">
-
-          <form method="post" action="{% url 'plugins:netbox_windows_dhcp:schedule_sync' %}">
-            {% csrf_token %}
-            <input type="hidden" name="action" value="run_now">
-            <button type="submit" class="btn btn-warning">
-              <i class="mdi mdi-play-circle-outline"></i> Run Now
-            </button>
-          </form>
-
-          {% if not next_sync_job or next_sync_job.status != 'pending' %}
-          <form id="schedule-form" method="post" action="{% url 'plugins:netbox_windows_dhcp:schedule_sync' %}" class="d-flex align-items-end gap-2">
-            {% csrf_token %}
-            <input type="hidden" name="action" value="schedule">
-            {# start_at_hidden is filled with the UTC ISO string by the script below before submit #}
-            <input type="hidden" name="start_at" id="start_at_hidden">
-            <div>
-              <label for="start_at_local" class="form-label mb-1 small text-muted">Start at (your local time)</label>
-              <input type="datetime-local" id="start_at_local" class="form-control form-control-sm" required
-                     style="width:220px">
-            </div>
-            <button type="submit" class="btn btn-outline-secondary">
-              <i class="mdi mdi-clock-outline"></i> Schedule
-            </button>
-          </form>
-          {% endif %}
-
+              {% render_field field %}
+            {% endfor %}
+          {% endfor %}
         </div>
-
-        <span class="text-muted d-block mt-2 small">
-          <i class="mdi mdi-information-outline"></i>
-          <strong>Run Now</strong> enqueues an immediate sync that then repeats on the configured interval.
-          <strong>Schedule</strong> runs the first sync at the chosen date/time, then repeats on the interval.
-          Saving a new interval above reschedules any existing job.
-        </span>
-
       </div>
+      {% endfor %}
     </div>
+    {% endfor %}
+  </div>
 
+  <div class="btn-float-group-right">
+    <a href="{% url 'plugins:netbox_windows_dhcp:dhcpserver_list' %}" class="btn btn-outline-secondary btn-float">Cancel</a>
+    <button type="submit" class="btn btn-primary">Save</button>
+  </div>
+</form>
+
+{# The full explanations behind the (?) after a setting's help text #}
+{% for name, label, details in form.help_details %}
+<div class="modal fade" id="{{ name }}_details" tabindex="-1" role="dialog">
+  <div class="modal-dialog" role="document">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">{{ label }}</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">{{ details }}</div>
+    </div>
   </div>
 </div>
-{% endblock %}
+{% endfor %}
 
-{% block javascript %}
-{{ block.super }}
-<script>
-(function () {
-  var form = document.getElementById('schedule-form');
-  if (!form) return;
-  form.addEventListener('submit', function (e) {
-    var localInput = document.getElementById('start_at_local');
-    var hiddenInput = document.getElementById('start_at_hidden');
-    if (!localInput.value) return;
-    // new Date() treats a datetime-local string (no tz suffix) as browser local time.
-    // toISOString() converts that to UTC so the server gets an unambiguous timestamp.
-    hiddenInput.value = new Date(localInput.value).toISOString();
-  });
-})();
-</script>
 {% endblock %}

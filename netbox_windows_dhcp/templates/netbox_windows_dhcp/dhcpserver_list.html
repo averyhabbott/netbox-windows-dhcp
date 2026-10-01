@@ -2,6 +2,7 @@
 {% load buttons %}
 
 {% block bulk_buttons %}
+{% include 'netbox_windows_dhcp/inc/bulk_action_buttons_style.html' %}
 <div class="bulk-action-buttons-custom">
   <button type="submit"
           formaction="{% url 'plugins:netbox_windows_dhcp:dhcpserver_bulk_maintenance' %}"
@@ -13,8 +14,8 @@
           class="btn btn-secondary">
     <i class="mdi mdi-upload-outline"></i> Update PSU Scripts
   </button>
-</div>
-<div class="bulk-action-buttons">
-  {% action_buttons actions model multi=True %}
+  <div class="bulk-action-buttons">
+    {% action_buttons actions model multi=True %}
+  </div>
 </div>
 {% endblock bulk_buttons %}

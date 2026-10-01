@@ -6,7 +6,7 @@ from django.contrib.auth.mixins import LoginRequiredMixin
 from django.http import JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.views import View
-from netbox.object_actions import BulkDelete, BulkExport, CloneObject, DeleteObject
+from netbox.object_actions import AddObject, BulkDelete, BulkExport, CloneObject, DeleteObject, EditObject
 from netbox.views import generic
 from utilities.permissions import get_permission_for_model
 from utilities.views import register_model_view
@@ -60,6 +60,51 @@ def _setting(name: str):
     return getattr(DHCPPluginSettings.load(), name)
 
 
+def _changeable(request, model):
+    """The `model` objects the user may change, honoring NetBox's per-object permissions."""
+    return model.objects.restrict(request.user, 'change')
+
+
+def _skipped_note(requested: int, done: int) -> str:
+    """A message suffix naming how many selected objects were skipped for lack of permission."""
+    skipped = requested - done
+    return f' Skipped {skipped} you don\'t have permission to change.' if skipped else ''
+
+
+class _ScopeInfoLockMixin:
+    """
+    For write views of scope-info models (exclusion ranges, option values): while
+    push_scope_info is off, redirect to `readonly_redirect` with `readonly_message`
+    instead — the DHCP server is the source of truth then.
+    """
+    readonly_message = ''
+    readonly_redirect = ''
+
+    def dispatch(self, request, *args, **kwargs):
+        if not _setting('push_scope_info'):
+            messages.error(request, self.readonly_message)
+            return redirect(self.readonly_redirect)
+        return super().dispatch(request, *args, **kwargs)
+
+
+class _ScopeInfoHideActionsMixin:
+    """
+    For list/detail views of scope-info models: while push_scope_info is off, hide the
+    write buttons except `push_off_actions` (deleting stays allowed then).
+    """
+    push_off_actions = (BulkExport, BulkDelete, DeleteObject)
+
+    def get_permitted_actions(self, user, model=None):
+        actions = super().get_permitted_actions(user, model=model)
+        if _setting('push_scope_info'):
+            return actions
+        return [action for action in actions if action in self.push_off_actions]
+
+    def get_extra_context(self, request, *args, **kwargs):
+        context = super().get_extra_context(request, *args, **kwargs)
+        return {**context, 'push_scope_info': _setting('push_scope_info')}
+
+
 def _cert_cn_from_pem(pem: str) -> str:
     """Extract subject CN from a PEM string. Returns '' on any failure."""
     if not pem:
@@ -88,6 +133,8 @@ class DHCPServerListView(generic.ObjectListView):
     filterset = DHCPServerFilterSet
     filterset_form = DHCPServerFilterForm
     template_name = 'netbox_windows_dhcp/dhcpserver_list.html'
+    # 'add' has a real view; no bulk_import, bulk_edit, or bulk_rename views exist for this model
+    actions = (AddObject, BulkExport, BulkDelete)
 
 
 @register_model_view(DHCPServer)
@@ -202,19 +249,13 @@ class DHCPServerBulkDeleteView(generic.BulkDeleteView):
 
 @register_model_view(DHCPServer, 'sync', path='sync')
 class DHCPServerSyncView(LoginRequiredMixin, View):
-    """Enqueues a background sync job for a single DHCP server."""
-
-    def get(self, request, pk):
-        return self._enqueue(request, pk)
+    """Enqueues a background sync job for a single DHCP server. POST only, so a link can't start a sync."""
 
     def post(self, request, pk):
-        return self._enqueue(request, pk)
-
-    def _enqueue(self, request, pk):
         if not request.user.has_perm(get_permission_for_model(DHCPServer, 'change')):
             messages.error(request, 'You do not have permission to sync DHCP servers.')
             return redirect('plugins:netbox_windows_dhcp:dhcpserver_list')
-        server = get_object_or_404(DHCPServer, pk=pk)
+        server = get_object_or_404(_changeable(request, DHCPServer), pk=pk)
         if server.maintenance_mode:
             messages.warning(
                 request,
@@ -245,7 +286,7 @@ class DHCPGlobalSyncView(LoginRequiredMixin, View):
         from .background_tasks import DHCPServerSyncJob
         from .models import DHCPPluginSettings
         cfg = DHCPPluginSettings.load()
-        servers = DHCPServer.objects.all()
+        servers = _changeable(request, DHCPServer)
         count = 0
         for server in servers:
             DHCPServerSyncJob.enqueue(
@@ -256,7 +297,11 @@ class DHCPGlobalSyncView(LoginRequiredMixin, View):
                 job_timeout=cfg.sync_job_timeout,
             )
             count += 1
-        messages.success(request, f'Queued sync job for {count} server(s). Check Operations → Jobs for progress.')
+        messages.success(
+            request,
+            f'Queued sync job for {count} server(s). Check Operations → Jobs for progress.'
+            + _skipped_note(DHCPServer.objects.count(), count),
+        )
         return redirect('plugins:netbox_windows_dhcp:dhcpserver_list')
 
 
@@ -275,13 +320,13 @@ class DHCPServerImportView(LoginRequiredMixin, View):
     def get(self, request, pk):
         if not self._check_permission(request):
             return redirect('plugins:netbox_windows_dhcp:dhcpserver_list')
-        server = get_object_or_404(DHCPServer, pk=pk)
+        server = get_object_or_404(_changeable(request, DHCPServer), pk=pk)
         return render(request, self.template_name, {'object': server})
 
     def post(self, request, pk):
         if not self._check_permission(request):
             return redirect('plugins:netbox_windows_dhcp:dhcpserver_list')
-        server = get_object_or_404(DHCPServer, pk=pk)
+        server = get_object_or_404(_changeable(request, DHCPServer), pk=pk)
         from .background_tasks import DHCPImportJob
         from .models import DHCPPluginSettings
         cfg = DHCPPluginSettings.load()
@@ -310,7 +355,7 @@ class DHCPServerCertImportView(LoginRequiredMixin, View):
     def get(self, request, pk):
         if not self._check_permission(request):
             return redirect('plugins:netbox_windows_dhcp:dhcpserver_list')
-        server = get_object_or_404(DHCPServer, pk=pk)
+        server = get_object_or_404(_changeable(request, DHCPServer), pk=pk)
         if not server.use_https:
             messages.error(request, 'Certificate import is only available for HTTPS servers.')
             return redirect(server.get_absolute_url())
@@ -332,7 +377,7 @@ class DHCPServerCertImportView(LoginRequiredMixin, View):
     def post(self, request, pk):
         if not self._check_permission(request):
             return redirect('plugins:netbox_windows_dhcp:dhcpserver_list')
-        server = get_object_or_404(DHCPServer, pk=pk)
+        server = get_object_or_404(_changeable(request, DHCPServer), pk=pk)
         import ssl
         from .cert_utils import fetch_cert_info
         try:
@@ -345,7 +390,7 @@ class DHCPServerCertImportView(LoginRequiredMixin, View):
             return redirect(server.get_absolute_url())
         server.ca_cert = cert_info['pem']
         server.ca_cert_expiry = cert_info['not_after']
-        server.save(update_fields=['ca_cert', 'ca_cert_expiry'])
+        server.save(update_fields=['ca_cert', 'ca_cert_expiry', 'last_updated'])
         messages.success(
             request,
             f'Certificate imported for {server.name} (expires {cert_info["not_after"].date()}).',
@@ -361,10 +406,10 @@ class DHCPServerCertRemoveView(LoginRequiredMixin, View):
         if not request.user.has_perm(get_permission_for_model(DHCPServer, 'change')):
             messages.error(request, 'You do not have permission to manage DHCP server certificates.')
             return redirect('plugins:netbox_windows_dhcp:dhcpserver_list')
-        server = get_object_or_404(DHCPServer, pk=pk)
+        server = get_object_or_404(_changeable(request, DHCPServer), pk=pk)
         server.ca_cert = ''
         server.ca_cert_expiry = None
-        server.save(update_fields=['ca_cert', 'ca_cert_expiry'])
+        server.save(update_fields=['ca_cert', 'ca_cert_expiry', 'last_updated'])
         messages.success(request, f'Certificate removed from {server.name}.')
         return redirect(server.get_absolute_url())
 
@@ -380,14 +425,16 @@ class DHCPFailoverListView(generic.ObjectListView):
     filterset = DHCPFailoverFilterSet
     filterset_form = DHCPFailoverFilterForm
     template_name = 'netbox_windows_dhcp/dhcpfailover_list.html'
-    # No add or bulk_edit — failovers are import-only; sync is toggled via dedicated action
+    # No add or bulk_edit — failovers are import-only; sync is toggled via dedicated action.
+    # Rows have an edit button for the NetBox-only fields (see DHCPFailoverForm).
     actions = (BulkExport, BulkDelete)
 
 
 @register_model_view(DHCPFailover)
 class DHCPFailoverView(generic.ObjectView):
-    queryset = DHCPFailover.objects.select_related('primary_server', 'secondary_server')
-    actions = (DeleteObject,)
+    queryset = DHCPFailover.objects.select_related('primary_server', 'secondary_server', 'default_scope_vrf')
+    # Edit only changes the NetBox-only fields (Default Scope VRF, description, tags).
+    actions = (EditObject, DeleteObject)
 
     def get_extra_context(self, request, instance):
         scope_table = DHCPScopeTable(instance.scopes.all())
@@ -433,9 +480,9 @@ class DHCPFailoverToggleSyncView(LoginRequiredMixin, View):
         if not request.user.has_perm(get_permission_for_model(DHCPFailover, 'change')):
             messages.error(request, 'You do not have permission to modify failover sync settings.')
             return redirect('plugins:netbox_windows_dhcp:dhcpfailover_list')
-        failover = get_object_or_404(DHCPFailover, pk=pk)
+        failover = get_object_or_404(_changeable(request, DHCPFailover), pk=pk)
         failover.sync_enabled = not failover.sync_enabled
-        failover.save(update_fields=['sync_enabled'])
+        failover.save(update_fields=['sync_enabled', 'last_updated'])
         state = 'enabled' if failover.sync_enabled else 'disabled'
         messages.success(request, f'Sync {state} for failover "{failover}".')
         return redirect(request.META.get('HTTP_REFERER', 'plugins:netbox_windows_dhcp:dhcpfailover_list'))
@@ -454,12 +501,16 @@ class DHCPFailoverBulkToggleSyncView(LoginRequiredMixin, View):
             messages.warning(request, 'No failover relationships selected.')
             return redirect('plugins:netbox_windows_dhcp:dhcpfailover_list')
 
-        failovers = DHCPFailover.objects.filter(pk__in=pk_list)
+        failovers = list(_changeable(request, DHCPFailover).filter(pk__in=pk_list))
         for failover in failovers:
             failover.sync_enabled = not failover.sync_enabled
-            failover.save(update_fields=['sync_enabled'])
+            failover.save(update_fields=['sync_enabled', 'last_updated'])
 
-        messages.success(request, f'Toggled sync for {failovers.count()} failover relationship(s).')
+        messages.success(
+            request,
+            f'Toggled sync for {len(failovers)} failover relationship(s).'
+            + _skipped_note(DHCPFailover.objects.filter(pk__in=pk_list).count(), len(failovers)),
+        )
         return redirect(request.POST.get('return_url', 'plugins:netbox_windows_dhcp:dhcpfailover_list'))
 
 
@@ -473,6 +524,8 @@ class DHCPOptionCodeDefinitionListView(generic.ObjectListView):
     table = DHCPOptionCodeDefinitionTable
     filterset = DHCPOptionCodeDefinitionFilterSet
     filterset_form = DHCPOptionCodeDefinitionFilterForm
+    # No bulk_import, bulk_edit, or bulk_rename views exist for this model
+    actions = (AddObject, BulkExport, BulkDelete)
 
 
 @register_model_view(DHCPOptionCodeDefinition)
@@ -512,36 +565,51 @@ class DHCPOptionCodeDefinitionBulkDeleteView(generic.BulkDeleteView):
 # DHCPOptionValue views
 # ---------------------------------------------------------------------------
 
+_OPTION_VALUE_READONLY_MSG = (
+    'DHCP Option Values are read-only when "Push Scope Info" is disabled. '
+    'Enable it in plugin settings to manage them from NetBox.'
+)
+
+
+class _OptionValueLockMixin(_ScopeInfoLockMixin):
+    readonly_message = _OPTION_VALUE_READONLY_MSG
+    readonly_redirect = 'plugins:netbox_windows_dhcp:dhcpoptionvalue_list'
+
+
 @register_model_view(DHCPOptionValue, 'list', path='', detail=False)
-class DHCPOptionValueListView(generic.ObjectListView):
+class DHCPOptionValueListView(_ScopeInfoHideActionsMixin, generic.ObjectListView):
     queryset = DHCPOptionValue.objects.select_related('option_definition')
     table = DHCPOptionValueTable
     filterset = DHCPOptionValueFilterSet
     filterset_form = DHCPOptionValueFilterForm
+    # No bulk_import, bulk_edit, or bulk_rename views exist for this model
+    actions = (AddObject, BulkExport, BulkDelete)
 
 
 @register_model_view(DHCPOptionValue)
-class DHCPOptionValueView(generic.ObjectView):
+class DHCPOptionValueView(_ScopeInfoHideActionsMixin, generic.ObjectView):
     queryset = DHCPOptionValue.objects.select_related('option_definition')
 
     def get_extra_context(self, request, instance):
         scope_table = DHCPScopeTable(instance.scopes.all())
         scope_table.configure(request)
-        return {'scope_table': scope_table}
+        return {**super().get_extra_context(request, instance), 'scope_table': scope_table}
 
 
 @register_model_view(DHCPOptionValue, 'add', detail=False)
-class DHCPOptionValueCreateView(generic.ObjectEditView):
+class DHCPOptionValueCreateView(_OptionValueLockMixin, generic.ObjectEditView):
     queryset = DHCPOptionValue.objects.all()
     form = DHCPOptionValueForm
 
 
 @register_model_view(DHCPOptionValue, 'edit')
-class DHCPOptionValueEditView(generic.ObjectEditView):
+class DHCPOptionValueEditView(_OptionValueLockMixin, generic.ObjectEditView):
     queryset = DHCPOptionValue.objects.all()
     form = DHCPOptionValueForm
 
 
+# Deleting stays allowed while push_scope_info is off; an option value a scope still
+# uses can't be deleted in either mode (DHCPOptionValue.delete()).
 @register_model_view(DHCPOptionValue, 'delete')
 class DHCPOptionValueDeleteView(generic.ObjectDeleteView):
     queryset = DHCPOptionValue.objects.all()
@@ -588,26 +656,29 @@ class DHCPScopeView(generic.ObjectView):
         exclusion_table = DHCPExclusionRangeTable(instance.exclusion_ranges.all())
         exclusion_table.configure(request)
 
-        # IPs in the dynamic range (start_ip–end_ip) OR within the prefix with dhcp-* status.
+        # IPs in the dynamic range (start_ip–end_ip) OR within the prefix with dhcp-* status,
+        # limited to the prefix's VRF. A scope with no prefix has no IPs (None → no panel).
         # The range condition uses a RawSQL annotation because Django has no built-in inet
         # range lookup; host(address)::inet strips the prefix length for a pure IP comparison.
-        prefix_cidr = str(instance.prefix.prefix)
-        from .models import DHCPPluginSettings
-        _s = DHCPPluginSettings.load()
-        ip_qs = IPAddress.objects.annotate(
-            _in_dynamic_range=RawSQL(
-                "host(address)::inet >= %s::inet AND host(address)::inet <= %s::inet",
-                (instance.start_ip, instance.end_ip),
-                output_field=BooleanField(),
-            )
-        ).filter(
-            Q(_in_dynamic_range=True)
-            | Q(address__net_contained_or_equal=prefix_cidr, status=_s.lease_status)
-            | Q(address__net_contained_or_equal=prefix_cidr, status=_s.reservation_status,
-                dhcp_lease_info__isnull=False)
-        ).order_by('address')
-        ip_table = IPAddressTable(ip_qs)
-        ip_table.configure(request)
+        ip_table = None
+        if instance.prefix_id:
+            prefix_cidr = str(instance.prefix.prefix)
+            from .models import DHCPPluginSettings
+            _s = DHCPPluginSettings.load()
+            ip_qs = IPAddress.objects.annotate(
+                _in_dynamic_range=RawSQL(
+                    "host(address)::inet >= %s::inet AND host(address)::inet <= %s::inet",
+                    (instance.start_ip, instance.end_ip),
+                    output_field=BooleanField(),
+                )
+            ).filter(
+                Q(_in_dynamic_range=True)
+                | Q(address__net_contained_or_equal=prefix_cidr, status=_s.lease_status)
+                | Q(address__net_contained_or_equal=prefix_cidr, status=_s.reservation_status,
+                    dhcp_lease_info__isnull=False)
+            ).filter(vrf_id=instance.prefix.vrf_id).order_by('address')
+            ip_table = IPAddressTable(ip_qs)
+            ip_table.configure(request)
 
         return {
             'option_table': option_table,
@@ -621,6 +692,11 @@ _SCOPE_READONLY_MSG = (
     'DHCP Scopes are read-only when "Push Scope Info" is disabled. '
     'Enable it in plugin settings to manage scopes from NetBox.'
 )
+
+# The edit page of a scope or exclusion range while push_scope_info is off: it shows a
+# banner, and the form (see DHCPScopeForm / DHCPExclusionRangeForm) shows the fields
+# the server owns read-only.
+_SCOPE_INFO_EDIT_TEMPLATE = 'netbox_windows_dhcp/scopeinfo_edit.html'
 
 
 @register_model_view(DHCPScope, 'add', detail=False)
@@ -639,23 +715,18 @@ class DHCPScopeCreateView(generic.ObjectEditView):
 class DHCPScopeEditView(generic.ObjectEditView):
     queryset = DHCPScope.objects.all()
     form = DHCPScopeForm
+    template_name = _SCOPE_INFO_EDIT_TEMPLATE
 
-    def dispatch(self, request, *args, **kwargs):
-        if not _setting('push_scope_info'):
-            messages.error(request, _SCOPE_READONLY_MSG)
-            return redirect('plugins:netbox_windows_dhcp:dhcpscope_list')
-        return super().dispatch(request, *args, **kwargs)
+    def get_extra_context(self, request, instance):
+        return {'push_scope_info': _setting('push_scope_info')}
 
 
+# Deleting a scope stays allowed while push_scope_info is off: nothing reaches the
+# server then (the delete signal only queues a job with push on), and the next sync
+# imports the scope again if it's still there.
 @register_model_view(DHCPScope, 'delete')
 class DHCPScopeDeleteView(generic.ObjectDeleteView):
     queryset = DHCPScope.objects.all()
-
-    def dispatch(self, request, *args, **kwargs):
-        if not _setting('push_scope_info'):
-            messages.error(request, _SCOPE_READONLY_MSG)
-            return redirect('plugins:netbox_windows_dhcp:dhcpscope_list')
-        return super().dispatch(request, *args, **kwargs)
 
 
 @register_model_view(DHCPScope, 'bulk_edit', path='edit', detail=False)
@@ -671,25 +742,60 @@ class DHCPScopeBulkEditView(generic.BulkEditView):
             return redirect('plugins:netbox_windows_dhcp:dhcpscope_list')
         return super().dispatch(request, *args, **kwargs)
 
+    def _option_changes(self, request):
+        """(pk_list, add, remove) from a submitted bulk edit, or None if there's nothing to apply."""
+        if '_apply' not in request.POST:
+            return None
+        pk_list = [int(pk) for pk in request.POST.getlist('pk') if str(pk).isdigit()]
+        form = self.form(data=request.POST, initial={'pk': pk_list})
+        if not form.is_valid():
+            return None
+        add_opts = list(form.cleaned_data.get('add_option_values') or [])
+        remove_opts = list(form.cleaned_data.get('remove_option_values') or [])
+        if not add_opts and not remove_opts:
+            return None
+        return pk_list, add_opts, remove_opts
+
     def post(self, request, *args, **kwargs):
+        from django.core.exceptions import ValidationError
+        from django.http import HttpResponseRedirect
+
+        from .locks import check_option_codes
+
+        changes = self._option_changes(request)
+
+        # Refuse the whole edit, before anything is saved, if it would leave any scope
+        # with two values for the same option code.
+        if changes:
+            pk_list, add_opts, remove_opts = changes
+            remove_pks = {ov.pk for ov in remove_opts}
+            problems = []
+            for scope in DHCPScope.objects.filter(pk__in=pk_list).prefetch_related(
+                'option_values__option_definition'
+            ).order_by('name'):
+                result = {ov.pk: ov for ov in scope.option_values.all()}
+                result.update({ov.pk: ov for ov in add_opts})
+                for pk in remove_pks:
+                    result.pop(pk, None)
+                try:
+                    check_option_codes(result.values())
+                except ValidationError as exc:
+                    problems.append(f'"{scope.name}": {exc.messages[0]}')
+            if problems:
+                messages.error(request, 'Nothing was changed. ' + ' '.join(problems))
+                return redirect(self.get_return_url(request))
+
         response = super().post(request, *args, **kwargs)
 
         # After the parent saves scalar fields and tags, apply M2M option_values.
-        # Only do this when the form was submitted (_apply) and the parent succeeded (redirect).
-        if '_apply' in request.POST:
-            from django.http import HttpResponseRedirect
-            if isinstance(response, HttpResponseRedirect):
-                pk_list = [int(pk) for pk in request.POST.getlist('pk') if str(pk).isdigit()]
-                form = self.form(data=request.POST, initial={'pk': pk_list})
-                if form.is_valid():
-                    add_opts = form.cleaned_data.get('add_option_values') or []
-                    remove_opts = form.cleaned_data.get('remove_option_values') or []
-                    if add_opts or remove_opts:
-                        for obj in DHCPScope.objects.filter(pk__in=pk_list):
-                            if add_opts:
-                                obj.option_values.add(*add_opts)
-                            if remove_opts:
-                                obj.option_values.remove(*remove_opts)
+        # Only do this when the parent succeeded (redirect), and only to scopes the user may change.
+        if changes and isinstance(response, HttpResponseRedirect):
+            pk_list, add_opts, remove_opts = changes
+            for obj in _changeable(request, DHCPScope).filter(pk__in=pk_list):
+                if add_opts:
+                    obj.option_values.add(*add_opts)
+                if remove_opts:
+                    obj.option_values.remove(*remove_opts)
 
         return response
 
@@ -699,31 +805,38 @@ class DHCPScopeBulkDeleteView(generic.BulkDeleteView):
     queryset = DHCPScope.objects.all()
     table = DHCPScopeTable
 
-    def dispatch(self, request, *args, **kwargs):
-        if not _setting('push_scope_info'):
-            messages.error(request, _SCOPE_READONLY_MSG)
-            return redirect('plugins:netbox_windows_dhcp:dhcpscope_list')
-        return super().dispatch(request, *args, **kwargs)
-
 
 # ---------------------------------------------------------------------------
 # DHCPExclusionRange views
 # ---------------------------------------------------------------------------
 
+_EXCLUSION_READONLY_MSG = (
+    'DHCP Exclusion Ranges are read-only when "Push Scope Info" is disabled. '
+    'Enable it in plugin settings to manage them from NetBox.'
+)
+
+
+class _ExclusionLockMixin(_ScopeInfoLockMixin):
+    readonly_message = _EXCLUSION_READONLY_MSG
+    readonly_redirect = 'plugins:netbox_windows_dhcp:dhcpexclusionrange_list'
+
+
 @register_model_view(DHCPExclusionRange, 'list', path='', detail=False)
-class DHCPExclusionRangeListView(generic.ObjectListView):
+class DHCPExclusionRangeListView(_ScopeInfoHideActionsMixin, generic.ObjectListView):
     queryset = DHCPExclusionRange.objects.select_related('scope__prefix')
     table = DHCPExclusionRangeTable
     filterset = DHCPExclusionRangeFilterSet
 
 
 @register_model_view(DHCPExclusionRange)
-class DHCPExclusionRangeView(generic.ObjectView):
+class DHCPExclusionRangeView(_ScopeInfoHideActionsMixin, generic.ObjectView):
     queryset = DHCPExclusionRange.objects.select_related('scope__prefix')
+    # The edit page stays open with push_scope_info off (for the NetBox-only fields).
+    push_off_actions = (BulkExport, BulkDelete, EditObject, DeleteObject)
 
 
 @register_model_view(DHCPExclusionRange, 'add', detail=False)
-class DHCPExclusionRangeCreateView(generic.ObjectEditView):
+class DHCPExclusionRangeCreateView(_ExclusionLockMixin, generic.ObjectEditView):
     queryset = DHCPExclusionRange.objects.all()
     form = DHCPExclusionRangeForm
 
@@ -736,11 +849,23 @@ class DHCPExclusionRangeCreateView(generic.ObjectEditView):
 class DHCPExclusionRangeEditView(generic.ObjectEditView):
     queryset = DHCPExclusionRange.objects.all()
     form = DHCPExclusionRangeForm
+    template_name = _SCOPE_INFO_EDIT_TEMPLATE
+
+    def get_extra_context(self, request, instance):
+        return {'push_scope_info': _setting('push_scope_info')}
 
 
+# Deleting stays allowed while push_scope_info is off (the next sync puts back anything
+# still on the server). The range guard in DHCPExclusionRange.delete() still applies.
 @register_model_view(DHCPExclusionRange, 'delete')
 class DHCPExclusionRangeDeleteView(generic.ObjectDeleteView):
     queryset = DHCPExclusionRange.objects.all()
+
+
+@register_model_view(DHCPExclusionRange, 'bulk_delete', path='delete', detail=False)
+class DHCPExclusionRangeBulkDeleteView(generic.BulkDeleteView):
+    queryset = DHCPExclusionRange.objects.select_related('scope__prefix')
+    table = DHCPExclusionRangeTable
 
 
 # ---------------------------------------------------------------------------
@@ -748,20 +873,10 @@ class DHCPExclusionRangeDeleteView(generic.ObjectDeleteView):
 # ---------------------------------------------------------------------------
 
 def _apply_maintenance(obj, enabled: bool, notes: str, user):
-    from django.utils import timezone
-    obj.maintenance_mode = enabled
-    if enabled:
-        obj.maintenance_notes = notes
-        obj.maintenance_enabled_at = timezone.now()
-        obj.maintenance_enabled_by = user
-    else:
-        obj.maintenance_notes = ''
-        obj.maintenance_enabled_at = None
-        obj.maintenance_enabled_by = None
-    obj.save(update_fields=[
-        'maintenance_mode', 'maintenance_notes',
-        'maintenance_enabled_at', 'maintenance_enabled_by',
-    ])
+    from .utils import MAINTENANCE_FIELDS, maintenance_fields
+    for field, value in maintenance_fields(enabled, notes, user).items():
+        setattr(obj, field, value)
+    obj.save(update_fields=[*MAINTENANCE_FIELDS, 'last_updated'])
 
 
 # ---------------------------------------------------------------------------
@@ -783,7 +898,7 @@ class DHCPServerMaintenanceView(LoginRequiredMixin, View):
         if not request.user.has_perm(get_permission_for_model(DHCPServer, 'change')):
             messages.error(request, 'You do not have permission to modify server maintenance settings.')
             return redirect('plugins:netbox_windows_dhcp:dhcpserver_list')
-        server = get_object_or_404(DHCPServer, pk=pk)
+        server = get_object_or_404(_changeable(request, DHCPServer), pk=pk)
         enabled = request.POST.get('maintenance_mode') == '1'
         notes = request.POST.get('maintenance_notes', '')
         _apply_maintenance(server, enabled, notes, request.user)
@@ -807,7 +922,7 @@ class DHCPFailoverMaintenanceView(LoginRequiredMixin, View):
         if not request.user.has_perm(get_permission_for_model(DHCPFailover, 'change')):
             messages.error(request, 'You do not have permission to modify failover maintenance settings.')
             return redirect('plugins:netbox_windows_dhcp:dhcpfailover_list')
-        failover = get_object_or_404(DHCPFailover, pk=pk)
+        failover = get_object_or_404(_changeable(request, DHCPFailover), pk=pk)
         enabled = request.POST.get('maintenance_mode') == '1'
         notes = request.POST.get('maintenance_notes', '')
         _apply_maintenance(failover, enabled, notes, request.user)
@@ -831,7 +946,7 @@ class DHCPScopeMaintenanceView(LoginRequiredMixin, View):
         if not request.user.has_perm(get_permission_for_model(DHCPScope, 'change')):
             messages.error(request, 'You do not have permission to modify scope maintenance settings.')
             return redirect('plugins:netbox_windows_dhcp:dhcpscope_list')
-        scope = get_object_or_404(DHCPScope, pk=pk)
+        scope = get_object_or_404(_changeable(request, DHCPScope), pk=pk)
         enabled = request.POST.get('maintenance_mode') == '1'
         notes = request.POST.get('maintenance_notes', '')
         _apply_maintenance(scope, enabled, notes, request.user)
@@ -857,12 +972,15 @@ class DHCPServerBulkMaintenanceView(LoginRequiredMixin, View):
         if request.POST.get('confirm'):
             enabled = request.POST.get('maintenance_mode') == '1'
             notes = request.POST.get('maintenance_notes', '')
-            objs = DHCPServer.objects.filter(pk__in=pk_list)
-            count = objs.count()
+            objs = list(_changeable(request, DHCPServer).filter(pk__in=pk_list))
             for obj in objs:
                 _apply_maintenance(obj, enabled, notes, request.user)
             action = 'enabled' if enabled else 'disabled'
-            messages.success(request, f'Maintenance mode {action} for {count} server(s).')
+            messages.success(
+                request,
+                f'Maintenance mode {action} for {len(objs)} server(s).'
+                + _skipped_note(DHCPServer.objects.filter(pk__in=pk_list).count(), len(objs)),
+            )
             return redirect('plugins:netbox_windows_dhcp:dhcpserver_list')
         from django.urls import reverse
         return render(request, 'netbox_windows_dhcp/dhcpmaintenance_bulk.html', {
@@ -886,12 +1004,15 @@ class DHCPFailoverBulkMaintenanceView(LoginRequiredMixin, View):
         if request.POST.get('confirm'):
             enabled = request.POST.get('maintenance_mode') == '1'
             notes = request.POST.get('maintenance_notes', '')
-            objs = DHCPFailover.objects.filter(pk__in=pk_list)
-            count = objs.count()
+            objs = list(_changeable(request, DHCPFailover).filter(pk__in=pk_list))
             for obj in objs:
                 _apply_maintenance(obj, enabled, notes, request.user)
             action = 'enabled' if enabled else 'disabled'
-            messages.success(request, f'Maintenance mode {action} for {count} failover relationship(s).')
+            messages.success(
+                request,
+                f'Maintenance mode {action} for {len(objs)} failover relationship(s).'
+                + _skipped_note(DHCPFailover.objects.filter(pk__in=pk_list).count(), len(objs)),
+            )
             return redirect('plugins:netbox_windows_dhcp:dhcpfailover_list')
         from django.urls import reverse
         return render(request, 'netbox_windows_dhcp/dhcpmaintenance_bulk.html', {
@@ -915,12 +1036,15 @@ class DHCPScopeBulkMaintenanceView(LoginRequiredMixin, View):
         if request.POST.get('confirm'):
             enabled = request.POST.get('maintenance_mode') == '1'
             notes = request.POST.get('maintenance_notes', '')
-            objs = DHCPScope.objects.filter(pk__in=pk_list)
-            count = objs.count()
+            objs = list(_changeable(request, DHCPScope).filter(pk__in=pk_list))
             for obj in objs:
                 _apply_maintenance(obj, enabled, notes, request.user)
             action = 'enabled' if enabled else 'disabled'
-            messages.success(request, f'Maintenance mode {action} for {count} scope(s).')
+            messages.success(
+                request,
+                f'Maintenance mode {action} for {len(objs)} scope(s).'
+                + _skipped_note(DHCPScope.objects.filter(pk__in=pk_list).count(), len(objs)),
+            )
             return redirect('plugins:netbox_windows_dhcp:dhcpscope_list')
         from django.urls import reverse
         return render(request, 'netbox_windows_dhcp/dhcpmaintenance_bulk.html', {
@@ -944,7 +1068,7 @@ class DHCPCurrentMaintenanceView(LoginRequiredMixin, View):
         items = []
 
         if filter_type in ('all', 'server'):
-            for server in DHCPServer.objects.filter(maintenance_mode=True).select_related(
+            for server in DHCPServer.objects.restrict(request.user, 'view').filter(maintenance_mode=True).select_related(
                 'maintenance_enabled_by'
             ):
                 items.append({
@@ -963,7 +1087,7 @@ class DHCPCurrentMaintenanceView(LoginRequiredMixin, View):
                 })
 
         if filter_type in ('all', 'failover'):
-            for fo in DHCPFailover.objects.filter(maintenance_mode=True).select_related(
+            for fo in DHCPFailover.objects.restrict(request.user, 'view').filter(maintenance_mode=True).select_related(
                 'maintenance_enabled_by', 'primary_server', 'secondary_server'
             ):
                 items.append({
@@ -979,7 +1103,7 @@ class DHCPCurrentMaintenanceView(LoginRequiredMixin, View):
                 })
 
         if filter_type in ('all', 'scope'):
-            for scope in DHCPScope.objects.filter(maintenance_mode=True).select_related(
+            for scope in DHCPScope.objects.restrict(request.user, 'view').filter(maintenance_mode=True).select_related(
                 'maintenance_enabled_by', 'prefix', 'server', 'failover'
             ):
                 items.append({
@@ -1016,6 +1140,7 @@ class DHCPCurrentMaintenanceBulkDisableView(LoginRequiredMixin, View):
         }
 
         disabled = 0
+        skipped = 0
         for item_id in selected:
             try:
                 type_name, pk = item_id.split(':', 1)
@@ -1025,12 +1150,17 @@ class DHCPCurrentMaintenanceBulkDisableView(LoginRequiredMixin, View):
             if not request.user.has_perm(get_permission_for_model(model_cls, 'change')):
                 messages.error(request, f'You do not have permission to modify {type_name} maintenance settings.')
                 continue
-            obj = get_object_or_404(model_cls, pk=pk)
+            obj = _changeable(request, model_cls).filter(pk=pk).first()
+            if obj is None:
+                skipped += 1
+                continue
             _apply_maintenance(obj, enabled=False, notes='', user=request.user)
             disabled += 1
 
         if disabled:
             messages.success(request, f'Maintenance disabled for {disabled} item(s).')
+        if skipped:
+            messages.warning(request, f'Skipped {skipped} item(s) you don\'t have permission to change.')
         return redirect('plugins:netbox_windows_dhcp:current_maintenance')
 
 
@@ -1056,25 +1186,6 @@ def _get_next_sync_job():
 # Settings view
 # ---------------------------------------------------------------------------
 
-_SETTINGS_OVERRIDE_LABELS = {
-    'sync_ips_from_dhcp': 'Sync IP Addresses from Leases & Reservations',
-    'push_reservations': 'Push Reservations to DHCP Server',
-    'push_scope_info': 'Push Scope Info to DHCP Server',
-}
-
-
-def _get_active_settings_overrides():
-    """Return list of (label, value) tuples for any active PLUGINS_CONFIG boolean overrides."""
-    from django.conf import settings as django_settings
-    plugin_cfg = getattr(django_settings, 'PLUGINS_CONFIG', {}).get('netbox_windows_dhcp', {})
-    result = []
-    for cfg_key, label in _SETTINGS_OVERRIDE_LABELS.items():
-        val = plugin_cfg.get(cfg_key)
-        if val is not None:
-            result.append((label, val))
-    return result
-
-
 class SettingsView(LoginRequiredMixin, View):
     """View/edit plugin-wide settings. Superuser only."""
 
@@ -1087,11 +1198,7 @@ class SettingsView(LoginRequiredMixin, View):
 
         from .models import DHCPPluginSettings
         form = PluginSettingsForm(instance=DHCPPluginSettings.load())
-        return render(request, self.template_name, {
-            'form': form,
-            'next_sync_job': _get_next_sync_job(),
-            'active_global_overrides': _get_active_settings_overrides(),
-        })
+        return render(request, self.template_name, {'form': form})
 
     def post(self, request):
         if not request.user.is_superuser:
@@ -1099,72 +1206,67 @@ class SettingsView(LoginRequiredMixin, View):
             return redirect('plugins:netbox_windows_dhcp:dhcpserver_list')
 
         from .models import DHCPPluginSettings
-        form = PluginSettingsForm(request.POST, instance=DHCPPluginSettings.load())
+        cfg = DHCPPluginSettings.load()
+        cfg.snapshot()  # so the changelog entry shows what changed
+        form = PluginSettingsForm(request.POST, instance=cfg)
         if form.is_valid():
             form.save()
-            # The post_save signal on DHCPPluginSettings reschedules the
-            # recurring DHCPSyncJob via enqueue_once() — no manual call needed.
             messages.success(request, 'Settings saved.')
             return redirect('plugins:netbox_windows_dhcp:settings')
 
-        return render(request, self.template_name, {
-            'form': form,
-            'next_sync_job': _get_next_sync_job(),
-            'active_global_overrides': _get_active_settings_overrides(),
-        })
+        return render(request, self.template_name, {'form': form})
+
+
+class ScheduleView(LoginRequiredMixin, View):
+    """Shows the next scheduled sync, with Run Now and Schedule. Superuser only."""
+
+    template_name = 'netbox_windows_dhcp/schedule.html'
+
+    def get(self, request):
+        if not request.user.is_superuser:
+            messages.error(request, 'Only superusers can manage the sync schedule.')
+            return redirect('plugins:netbox_windows_dhcp:dhcpserver_list')
+        return render(request, self.template_name, {'next_sync_job': _get_next_sync_job()})
 
 
 class ScheduleSyncView(LoginRequiredMixin, View):
     """
-    Handle 'Run Now' and 'Schedule' actions for the recurring DHCPSyncJob.
-
-    POST action=run_now  — enqueue a one-off immediate run (interval=None, so
-                           it does not itself reschedule). Does NOT cancel or
-                           otherwise affect the existing recurring chain.
-    POST action=schedule — replace the recurring chain's next entry with one
-                           starting at the user-supplied start_at datetime.
-                           Collapses any duplicate scheduled/pending
-                           "Windows DHCP Sync" jobs down to one via
-                           DHCPSyncJob.converge_schedule() before applying
-                           the new schedule.
+    Handle 'Run Now' and 'Schedule' by enqueuing SetDHCPSyncScheduleJob,
+    which runs as the requesting user and does the actual enqueue/reschedule
+    of "Windows DHCP Sync" (always DHCP-Sync-Service; see
+    DHCPSyncJob.enqueue()) — see SetDHCPSyncScheduleJob for recurring=True/False
+    semantics.
     """
 
     def post(self, request):
         if not request.user.is_superuser:
             messages.error(request, 'Superuser access required.')
-            return redirect('plugins:netbox_windows_dhcp:settings')
+            return redirect('plugins:netbox_windows_dhcp:schedule')
 
         from django.utils import timezone
 
-        from .background_tasks import DHCPSyncJob
+        from .background_tasks import SetDHCPSyncScheduleJob
         from .models import DHCPPluginSettings
 
         cfg = DHCPPluginSettings.load()
         action = request.POST.get('action', 'schedule')
 
         if action == 'run_now':
-            # One-off immediate run alongside the recurring chain. Pass
-            # interval=None so this single run doesn't auto-reschedule a
-            # successor — the recurring chain already owns that.
-            job = DHCPSyncJob.enqueue(user=request.user, interval=None)
+            job = SetDHCPSyncScheduleJob.enqueue(user=request.user, recurring=False)
             messages.success(
                 request,
                 'Sync enqueued — it will run shortly. The recurring schedule is unaffected.',
             )
             return redirect(job.get_absolute_url())
 
-        # action == 'schedule' — replace the recurring chain's next entry with
-        # one starting at the user-supplied time. converge_schedule() collapses
-        # any duplicate scheduled/pending jobs down to one (advisory-locked,
-        # per-instance delete so the Redis entry is canceled too) before
-        # applying the new schedule via enqueue_once() semantics.
+        # action == 'schedule'
         from django.utils.dateparse import parse_datetime
 
         raw = request.POST.get('start_at', '').strip()
         scheduled_at = parse_datetime(raw)
         if not scheduled_at:
             messages.error(request, 'Please enter a valid start date/time.')
-            return redirect('plugins:netbox_windows_dhcp:settings')
+            return redirect('plugins:netbox_windows_dhcp:schedule')
 
         # datetime-local inputs are naive (no tz); treat as server local time
         if timezone.is_naive(scheduled_at):
@@ -1172,19 +1274,15 @@ class ScheduleSyncView(LoginRequiredMixin, View):
 
         if scheduled_at <= timezone.now():
             messages.error(request, 'Start time must be in the future.')
-            return redirect('plugins:netbox_windows_dhcp:settings')
+            return redirect('plugins:netbox_windows_dhcp:schedule')
 
-        DHCPSyncJob.converge_schedule(
-            schedule_at=scheduled_at,
-            interval=cfg.sync_interval,
-            user=request.user,
-        )
+        SetDHCPSyncScheduleJob.enqueue(user=request.user, recurring=True, sync_at=scheduled_at)
         messages.success(
             request,
             f'Sync scheduled to start at {scheduled_at.strftime("%b %-d, %Y %-I:%M %p")}, '
             f'then every {cfg.sync_interval} minute(s) thereafter.',
         )
-        return redirect('plugins:netbox_windows_dhcp:settings')
+        return redirect('plugins:netbox_windows_dhcp:schedule')
 
 
 # ---------------------------------------------------------------------------
@@ -1197,6 +1295,16 @@ class DHCPServerCertFetchView(LoginRequiredMixin, View):
     def post(self, request):
         from .cert_utils import fetch_cert_info
 
+        # Runs from the add/edit form by hostname, not for one saved server, so it needs
+        # permission to add or change servers in general.
+        if not any(
+            request.user.has_perm(get_permission_for_model(DHCPServer, action)) for action in ('add', 'change')
+        ):
+            return JsonResponse(
+                {'ok': False, 'message': 'You do not have permission to add or edit DHCP servers.'},
+                status=403,
+            )
+
         hostname = request.POST.get('hostname', '').strip()
         port_str = request.POST.get('port', '443').strip()
         use_https = request.POST.get('use_https', 'true').lower() in ('1', 'true', 'on')
@@ -1205,6 +1313,13 @@ class DHCPServerCertFetchView(LoginRequiredMixin, View):
             return JsonResponse({'ok': False, 'message': 'Hostname is required'})
         if not use_https:
             return JsonResponse({'ok': False, 'message': 'Certificate fetch requires HTTPS to be enabled'})
+
+        from django.conf import settings as django_settings
+        plugin_cfg = getattr(django_settings, 'PLUGINS_CONFIG', {}).get('netbox_windows_dhcp', {})
+        if plugin_cfg.get('restrict_allowlist', False):
+            overrides = plugin_cfg.get('server_overrides', {})
+            if not overrides.get(hostname, {}).get('allowed', False):
+                return JsonResponse({'ok': False, 'message': f'{hostname} is not in the configured allowlist'})
 
         try:
             port = int(port_str)
@@ -1242,6 +1357,20 @@ class DHCPServerTestConnectionView(LoginRequiredMixin, View):
 
     def post(self, request, pk=None):
         from .api_client import PSUClient, PSUClientError
+
+        # It can use a saved server's token, so it needs change permission on that server
+        # (or permission to add or change servers, from the add form).
+        if pk:
+            allowed = _changeable(request, DHCPServer).filter(pk=pk).exists()
+        else:
+            allowed = any(
+                request.user.has_perm(get_permission_for_model(DHCPServer, action)) for action in ('add', 'change')
+            )
+        if not allowed:
+            return JsonResponse(
+                {'ok': False, 'message': 'You do not have permission to test this DHCP server.'},
+                status=403,
+            )
 
         hostname = request.POST.get('hostname', '').strip()
         port_str = request.POST.get('port', '443').strip()
@@ -1337,7 +1466,7 @@ class DHCPServerPSUUpdateView(LoginRequiredMixin, View):
         if not request.user.has_perm(get_permission_for_model(DHCPServer, 'change')):
             messages.error(request, 'You do not have permission to update PSU scripts.')
             return redirect('plugins:netbox_windows_dhcp:dhcpserver_list')
-        server = get_object_or_404(DHCPServer, pk=pk)
+        server = get_object_or_404(_changeable(request, DHCPServer), pk=pk)
         from .background_tasks import DHCPPSUUpdateJob
         from .models import DHCPPluginSettings
         cfg = DHCPPluginSettings.load()
@@ -1367,7 +1496,7 @@ class DHCPServerBulkPSUUpdateView(LoginRequiredMixin, View):
         from .models import DHCPPluginSettings
         cfg = DHCPPluginSettings.load()
         count = 0
-        for server in DHCPServer.objects.filter(pk__in=pk_list):
+        for server in _changeable(request, DHCPServer).filter(pk__in=pk_list):
             DHCPPSUUpdateJob.enqueue(
                 name=f'PSU Script Update: {server.name}',
                 user=request.user,
@@ -1375,5 +1504,9 @@ class DHCPServerBulkPSUUpdateView(LoginRequiredMixin, View):
                 queue_name=cfg.sync_queue,
             )
             count += 1
-        messages.success(request, f'PSU script update jobs queued for {count} server(s). Check Operations → Jobs for progress.')
+        messages.success(
+            request,
+            f'PSU script update jobs queued for {count} server(s). Check Operations → Jobs for progress.'
+            + _skipped_note(DHCPServer.objects.filter(pk__in=pk_list).count(), count),
+        )
         return redirect('plugins:netbox_windows_dhcp:dhcpserver_list')

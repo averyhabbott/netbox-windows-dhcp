@@ -2,15 +2,16 @@
 {% load buttons %}
 
 {% block bulk_buttons %}
+{% include 'netbox_windows_dhcp/inc/bulk_action_buttons_style.html' %}
 <div class="bulk-action-buttons-custom">
   <button type="submit"
           formaction="{% url 'plugins:netbox_windows_dhcp:dhcpscope_bulk_maintenance' %}"
           class="btn btn-warning">
     <i class="mdi mdi-pause-circle-outline"></i> Bulk Maintenance Mode
   </button>
-</div>
-<div class="bulk-action-buttons">
-  {% action_buttons actions model multi=True %}
+  <div class="bulk-action-buttons">
+    {% action_buttons actions model multi=True %}
+  </div>
 </div>
 {% endblock bulk_buttons %}
 
@@ -18,7 +19,9 @@
 {% if not push_scope_info %}
 <div class="alert alert-warning d-flex align-items-center mb-3" role="alert">
   <i class="mdi mdi-lock me-2"></i>
-  <span>Scopes are <strong>read-only</strong> — enable <em>Push Scope Info</em> in
+  <span>Scope settings come from the DHCP server and are <strong>read-only</strong> — only a
+    scope's prefix, tags and custom fields can be edited, and deleting a scope only removes it
+    from NetBox. Enable <em>Push Scope Info</em> in
     <a href="{% url 'plugins:netbox_windows_dhcp:settings' %}">plugin settings</a>
     to allow edits.</span>
 </div>

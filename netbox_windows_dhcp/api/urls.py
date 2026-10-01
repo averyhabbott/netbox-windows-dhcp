@@ -10,5 +10,6 @@ router.register('option-codes', views.DHCPOptionCodeDefinitionViewSet)
 router.register('option-values', views.DHCPOptionValueViewSet)
 router.register('scopes', views.DHCPScopeViewSet)
 router.register('exclusion-ranges', views.DHCPExclusionRangeViewSet)
+router.register('lease-info', views.DHCPLeaseInfoViewSet)
 
 urlpatterns = router.urls

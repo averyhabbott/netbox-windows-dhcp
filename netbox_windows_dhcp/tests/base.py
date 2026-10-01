@@ -1,22 +1,29 @@
 """
-Shared fixtures and helpers for the netbox-windows-dhcp test suite.
+Shared helpers for the netbox-windows-dhcp test suite.
 
-Two kinds of helper live here:
-
-1. Model fixture builders (``make_server`` etc.) used by ``setUpTestData`` across
-   the model/api/view/filterset tests.
-2. A ``FakePSUClient`` plus canned PSU payloads, used by the import and sync tests
-   so that **no test ever opens a network connection or talks to a real PSU
-   server**. The plugin's import/sync helpers accept a ``client`` argument, so the
-   fake is simply passed in.
+Builders for NetBox rows (``make_server`` etc.), ``run_sync`` for a whole server
+sync, and small helpers for URLs, jobs, IPs and the messages a page shows. The fake
+PSU server and its sample replies are in ``fixtures.py``.
 """
 
+import contextlib
 import logging
+import uuid
+from unittest import mock
 
-from ipam.models import Prefix
+from core.choices import JobStatusChoices
+from core.models import Job
+from django.contrib.messages import constants as message_levels
+from django.contrib.messages import get_messages
+from django.urls import reverse
+from ipam.models import IPAddress, Prefix
+from utilities.testing import api as netbox_api_testing
+from utilities.testing import views as netbox_view_testing
+
 
 from ..models import (
     DHCPFailover,
+    DHCPLeaseInfo,
     DHCPOptionCodeDefinition,
     DHCPOptionValue,
     DHCPPluginSettings,
@@ -28,10 +35,27 @@ from ..models import (
 NULL_LOGGER = logging.getLogger('netbox_windows_dhcp.tests')
 NULL_LOGGER.addHandler(logging.NullHandler())
 
+PSU_CLIENT = 'netbox_windows_dhcp.api_client.PSUClient'
+
 
 # ---------------------------------------------------------------------------
 # Namespace mixins for the NetBox test harness
 # ---------------------------------------------------------------------------
+
+def _skip_query_counts(test_case):
+    """
+    NetBox 4.6+ fails a list test whose number of database queries differs from a stored
+    count. The count changes with NetBox releases while the page still works, so the
+    plugin doesn't check it.
+    """
+    for module in (netbox_api_testing, netbox_view_testing):
+        if hasattr(module, 'assert_expected_query_count'):
+            patcher = mock.patch.object(
+                module, 'assert_expected_query_count', lambda *args, **kwargs: contextlib.nullcontext(),
+            )
+            patcher.start()
+            test_case.addCleanup(patcher.stop)
+
 
 class PluginAPIViewTestMixin:
     """
@@ -44,9 +68,17 @@ class PluginAPIViewTestMixin:
 
     view_namespace = 'plugins-api:netbox_windows_dhcp'
 
+    def setUp(self):
+        super().setUp()
+        _skip_query_counts(self)
+
 
 class PluginViewTestMixin:
     """Point the NetBox ViewTestCases harness at the plugin's UI URL namespace."""
+
+    def setUp(self):
+        super().setUp()
+        _skip_query_counts(self)
 
     def _get_base_url(self):
         return f'plugins:{self.model._meta.app_label}:{self.model._meta.model_name}_{{}}'
@@ -81,8 +113,8 @@ def set_plugin_settings(**kwargs):
 # Model fixture builders
 # ---------------------------------------------------------------------------
 
-def make_prefix(cidr='10.0.1.0/24', **kwargs):
-    obj, _ = Prefix.objects.get_or_create(prefix=cidr, defaults={'status': 'active', **kwargs})
+def make_prefix(cidr='10.0.1.0/24', vrf=None, **kwargs):
+    obj, _ = Prefix.objects.get_or_create(prefix=cidr, vrf=vrf, defaults={'status': 'active', **kwargs})
     # Reload so .prefix is a netaddr IPNetwork (the field is only coerced on load,
     # not on a freshly-created in-memory instance) — sync helpers call .prefixlen.
     obj.refresh_from_db()
@@ -114,6 +146,13 @@ def make_scope(name='Scope 1', prefix=None, server=None, failover=None,
     )
 
 
+def make_unassigned_scope(name='Unassigned', network='10.0.1.0', prefix_length=24, **kwargs):
+    """A scope with no prefix: it stores its own network. Pass a server or a failover."""
+    kwargs.setdefault('start_ip', '10.0.1.10')
+    kwargs.setdefault('end_ip', '10.0.1.254')
+    return DHCPScope.objects.create(name=name, network=network, prefix_length=prefix_length, **kwargs)
+
+
 # Codes 200–248 (plus 250, 251, 253, 254) are NOT seeded by migration 0002, so
 # they are safe for fixtures that create option-code definitions without colliding
 # with the built-in Windows DHCP options.
@@ -129,160 +168,100 @@ def make_option_value(option_definition=None, value='10.0.0.1', **kwargs):
 
 
 # ---------------------------------------------------------------------------
-# Fake PSU client + canned payloads (offline — no network)
+# URLs, jobs and messages
 # ---------------------------------------------------------------------------
 
-class FakePSUClient:
-    """
-    Stand-in for ``api_client.PSUClient`` that returns pre-seeded data and records
-    the writes it was asked to make. Construct with whatever the test needs:
-
-        client = FakePSUClient(
-            scopes=[...], leases={scope_id: [...]}, reservations={scope_id: [...]},
-            exclusions={scope_id: [...]}, scope_options={scope_id: [...]},
-            failover=[...],
-        )
-
-    Recorded writes are available on ``created_reservations``,
-    ``created_exclusions``, ``deleted_exclusions``, ``created_scopes``,
-    ``updated_scopes``, ``deleted_scopes``, ``replicated_failover_calls`` for
-    assertions.
-    ``list_scopes_calls`` records the ``active_only`` argument passed on each
-    ``list_scopes()`` call.
-    """
-
-    def __init__(self, scopes=None, leases=None, reservations=None,
-                 exclusions=None, scope_options=None, failover=None,
-                 health=None):
-        self._scopes = scopes or []
-        self._leases = leases or {}
-        self._reservations = reservations or {}
-        self._exclusions = exclusions or {}
-        self._scope_options = scope_options or {}
-        self._failover = failover or []
-        self._health = health or {'version': '1.0.2'}
-
-        self.created_reservations = []
-        self.updated_reservations = []
-        self.deleted_reservations = []
-        self.created_exclusions = []
-        self.deleted_exclusions = []
-        self.created_scopes = []
-        self.updated_scopes = []
-        self.deleted_scopes = []
-        self.list_scopes_calls = []
-        self.replicated_failover_calls = []
-
-    # --- reads ---
-    def ping_read(self):
-        return self._health
-
-    def ping_write(self):
-        return True
-
-    def list_scopes(self, active_only=False):
-        self.list_scopes_calls.append(active_only)
-        return list(self._scopes)
-
-    def get_scope(self, scope_id):
-        from ..api_client import PSUClientError
-        for s in self._scopes:
-            sid = s.get('scope_id') or s.get('ScopeId') or s.get('network_address')
-            if sid == scope_id:
-                return s
-        raise PSUClientError(f'Scope {scope_id} not found', status_code=404)
-
-    def list_leases(self, scope_id=None):
-        return list(self._leases.get(scope_id, []))
-
-    def list_reservations(self, scope_id=None):
-        return list(self._reservations.get(scope_id, []))
-
-    def list_exclusions(self, scope_id):
-        return list(self._exclusions.get(scope_id, []))
-
-    def list_scope_options(self, scope_id):
-        return list(self._scope_options.get(scope_id, []))
-
-    def list_failover(self):
-        return list(self._failover)
-
-    # --- writes (recorded) ---
-    def create_reservation(self, payload):
-        self.created_reservations.append(payload)
-        return payload
-
-    def update_reservation(self, client_id, payload):
-        self.updated_reservations.append((client_id, payload))
-        return payload
-
-    def delete_reservation(self, client_id):
-        self.deleted_reservations.append(client_id)
-
-    def create_exclusion(self, payload):
-        self.created_exclusions.append(payload)
-        return payload
-
-    def delete_exclusion(self, payload):
-        self.deleted_exclusions.append(payload)
-
-    def create_scope(self, payload):
-        self.created_scopes.append(payload)
-        return payload
-
-    def update_scope(self, scope_id, payload):
-        self.updated_scopes.append((scope_id, payload))
-        return payload
-
-    def delete_scope(self, scope_id):
-        self.deleted_scopes.append(scope_id)
-
-    def replicate_failover(self, scope_ids):
-        self.replicated_failover_calls.append(list(scope_ids))
-        return {'replicated': list(scope_ids)}
+def ui_url(name, *args):
+    return reverse(f'plugins:netbox_windows_dhcp:{name}', args=args)
 
 
-# Canned PSU response payloads (snake_case, the primary contract documented in
-# api_client.py). PascalCase variants are produced inline by the dual-format test.
-FAKE_SCOPE_SNAKE = {
-    'scope_id': '10.0.1.0',
-    'name': 'Building A',
-    'start_ip': '10.0.1.10',
-    'end_ip': '10.0.1.254',
-    'subnet_mask': '255.255.255.0',
-    'router': '10.0.1.1',
-    'lease_duration_seconds': 86400,
-}
+def api_url(model, pk=None):
+    if pk is None:
+        return reverse(f'plugins-api:netbox_windows_dhcp-api:{model}-list')
+    return reverse(f'plugins-api:netbox_windows_dhcp-api:{model}-detail', kwargs={'pk': pk})
 
-FAKE_SCOPE_PASCAL = {
-    'ScopeId': '10.0.1.0',
-    'Name': 'Building A',
-    'StartRange': '10.0.1.10',
-    'EndRange': '10.0.1.254',
-    'SubnetMask': '255.255.255.0',
-    'Router': '10.0.1.1',
-    'LeaseDuration': 86400,
-}
 
-FAKE_LEASE = {
-    'ip_address': '10.0.1.50',
-    'client_id': '00-11-22-33-44-55',
-    'hostname': 'desktop-abc',
-    'scope_id': '10.0.1.0',
-    'lease_expiry': '2030-01-01T00:00:00Z',
-    'address_state': 'Active',
-}
+def job_mock():
+    """A stand-in for an enqueued job; the views redirect to its page."""
+    job = mock.Mock()
+    job.get_absolute_url.return_value = '/core/jobs/1/'
+    return job
 
-FAKE_RESERVATION = {
-    'ip_address': '10.0.1.100',
-    'client_id': 'aa-bb-cc-dd-ee-ff',
-    'name': 'printer-01',
-    'description': '',
-    'type': 'Dhcp',
-}
 
-FAKE_EXCLUSION = {
-    'scope_id': '10.0.1.0',
-    'start_ip': '10.0.1.200',
-    'end_ip': '10.0.1.210',
-}
+def make_job(name):
+    """A running Job row, for calling a JobRunner's run() directly."""
+    return Job.objects.create(
+        name=name, status=JobStatusChoices.STATUS_RUNNING, job_id=uuid.uuid4(), queue_name='default',
+    )
+
+
+def error_messages(response):
+    """The warnings and errors a page queued for the user (pass a response that wasn't followed)."""
+    return [str(m) for m in get_messages(response.wsgi_request) if m.level >= message_levels.WARNING]
+
+
+def fresh_results():
+    """An empty results dict, as the import functions expect."""
+    return {
+        'failovers':        {'created': [], 'skipped': [], 'errors': []},
+        'scopes':           {'created': [], 'skipped': [], 'errors': []},
+        'option_values':    {'created': [], 'skipped': [], 'errors': []},
+        'exclusion_ranges': {'created': [], 'skipped': [], 'errors': []},
+    }
+
+
+# ---------------------------------------------------------------------------
+# IP addresses
+# ---------------------------------------------------------------------------
+
+def _with_length(address):
+    return address if '/' in address else f'{address}/24'
+
+
+def get_ip(address, **filters):
+    return IPAddress.objects.filter(address__net_host=address, **filters).first()
+
+
+def managed_ip(address, status='dhcp', **fields):
+    """An IP the sync made: it has DHCP lease info."""
+    ip = IPAddress.objects.create(address=_with_length(address), status=status, **fields)
+    DHCPLeaseInfo.objects.create(ip_address=ip, lease_hostname='x', active=True)
+    return ip
+
+
+def reserved_ip(address, client_id='aa-bb-cc-dd-ee-01', status='reserved', **fields):
+    """A hand-made reservation in NetBox (saved once, so it queues at most one push)."""
+    ip = IPAddress(address=_with_length(address), status=status, **fields)
+    if client_id:
+        ip.custom_field_data['dhcp_client_id'] = client_id
+    ip.save()
+    return ip
+def run_sync(server, fake, logger=NULL_LOGGER, **options):
+    """Run a full sync of `server` against `fake`. Every sync setting is off unless passed."""
+    from ..background_tasks import _sync_server
+
+    settings = dict(sync_ip_addresses=False, push_reservations=False, push_scope_info=False)
+    settings.update(options)
+    with mock.patch(PSU_CLIENT, return_value=fake):
+        return _sync_server(logger, server, **settings)
+
+
+def changes_for(model):
+    """Change-log entries for `model`."""
+    from core.models import ObjectChange, ObjectType
+
+    return ObjectChange.objects.filter(changed_object_type=ObjectType.objects.get_for_model(model))
+
+
+def grant(user, model, actions, **constraints):
+    """Give `user` a NetBox object permission on `model`, limited by `constraints`."""
+    from core.models import ObjectType
+    from users.models import ObjectPermission
+
+    perm = ObjectPermission.objects.create(
+        name=f'{model.__name__} {"/".join(actions)} {constraints}', actions=actions,
+        constraints=constraints or None,
+    )
+    perm.object_types.add(ObjectType.objects.get_for_model(model))
+    perm.users.add(user)
+    return perm

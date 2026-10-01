@@ -2,19 +2,23 @@
 One-time import from a Windows DHCP server via PSU API.
 
 Imports:
-  1. Failover relationships  (matched to existing DHCPServer objects by hostname)
-  2. Scopes                  (NetBox Prefix is created if it doesn't exist)
+  1. Failover relationships  (matched to existing DHCPServer objects by hostname;
+                              a new one copies the importing server's Default Scope VRF)
+  2. Scopes                  (the prefix is looked for in the scope's default VRF — the
+                              failover's, or the server's for a standalone scope — and
+                              created there if missing and "Create Missing Prefixes on
+                              Import" is on; otherwise the scope gets no prefix)
   3. Scope-level option values (DHCPOptionCodeDefinition created for unknown codes)
 """
 import logging
-from typing import Dict
+from typing import Dict, Optional
 
 from netaddr import AddrFormatError, IPNetwork
 
 logger = logging.getLogger('netbox_windows_dhcp')
 
 
-def run_import(server, active_only: bool = False) -> Dict:
+def run_import(server) -> Dict:
     """
     Connect to *server* and import failovers, scopes, and scope options.
     Returns a results dict suitable for template rendering.
@@ -39,28 +43,37 @@ def run_import(server, active_only: bool = False) -> Dict:
         results['failovers']['errors'].append(f'Could not fetch failover list: {exc}')
         remote_failovers = []
 
+    # Failovers created in this run: their scopes are skipped until the user has checked
+    # the failover's Default Scope VRF and taken it out of maintenance mode.
+    new_failover_ids = set()
     for rf in remote_failovers:
         try:
-            _import_failover(rf, results)
+            failover = _import_failover(rf, results, server=server)
+            if failover is not None:
+                new_failover_ids.add(failover.pk)
         except Exception as exc:
             name = rf.get('name') or rf.get('Name') or '(unknown)'
             results['failovers']['errors'].append(f'{name}: {exc}')
+            from django.db import connection
+            connection.close()  # reset a connection possibly corrupted by a mid-query job timeout
 
     # ------------------------------------------------------------------ #
     # 2. Scopes (+ scope-level option values)
     # ------------------------------------------------------------------ #
     try:
-        remote_scopes = client.list_scopes(active_only=active_only)
+        remote_scopes = client.list_scopes(include_router=False)
     except PSUClientError as exc:
         results['scopes']['errors'].append(f'Could not fetch scope list: {exc}')
         remote_scopes = []
 
     for rs in remote_scopes:
         try:
-            _import_scope(client, rs, results, server=server)
+            _import_scope(client, rs, results, server=server, new_failover_ids=new_failover_ids)
         except Exception as exc:
             scope_id = rs.get('scope_id') or rs.get('ScopeId') or '(unknown)'
             results['scopes']['errors'].append(f'{scope_id}: {exc}')
+            from django.db import connection
+            connection.close()  # reset a connection possibly corrupted by a mid-query job timeout
 
     return results
 
@@ -69,8 +82,21 @@ def run_import(server, active_only: bool = False) -> Dict:
 # Failover helper
 # ---------------------------------------------------------------------- #
 
-def _import_failover(rf: Dict, results: Dict):
+NEW_FAILOVER_MAINTENANCE_NOTE = (
+    'Created by Import from Server. Check its Default Scope VRF, take it out of '
+    'maintenance mode, then re-run Import from Server to import its scopes.'
+)
+
+
+def _import_failover(rf: Dict, results: Dict, server=None):
+    """
+    Create the failover `rf` unless it's already in NetBox. "Already in NetBox" means a
+    failover with this name that the importing `server` is a partner of — names are
+    only unique per server. A new failover copies `server`'s Default Scope VRF and
+    starts in maintenance mode. Returns the new failover, or None when none was created.
+    """
     from .models import DHCPServer, DHCPFailover
+    from .utils import AmbiguousFailover, find_failover
 
     name               = rf.get('name')               or rf.get('Name')              or ''
     primary_hostname   = rf.get('primary_server')     or rf.get('PrimaryServer')     or ''
@@ -86,8 +112,19 @@ def _import_failover(rf: Dict, results: Dict):
         results['failovers']['errors'].append('Failover record has no name — skipped.')
         return
 
-    if DHCPFailover.objects.filter(name=name).exists():
-        results['failovers']['skipped'].append(f'{name} (already exists)')
+    def _skip_existing(partner) -> bool:
+        """True (and recorded) if `partner` already has a failover with this name."""
+        try:
+            found = find_failover(name, partner)
+        except AmbiguousFailover as exc:
+            results['failovers']['errors'].append(f'{name}: {exc} — skipped.')
+            return True
+        if found is not None:
+            results['failovers']['skipped'].append(f'{name} (already exists)')
+            return True
+        return False
+
+    if server is not None and _skip_existing(server):
         return
 
     # Resolve primary server
@@ -114,7 +151,14 @@ def _import_failover(rf: Dict, results: Dict):
     except DHCPServer.MultipleObjectsReturned:
         secondary = DHCPServer.objects.filter(hostname=secondary_hostname).first()
 
-    DHCPFailover.objects.create(
+    if server is None and _skip_existing(primary):
+        return
+
+    # A new failover starts in maintenance mode, so its scopes wait until someone has
+    # checked its Default Scope VRF (see run_import).
+    from django.utils import timezone
+    from .background_tasks import _service_user
+    failover = DHCPFailover.objects.create(
         name=name,
         primary_server=primary,
         secondary_server=secondary,
@@ -123,17 +167,60 @@ def _import_failover(rf: Dict, results: Dict):
         max_response_delay=mrd,
         state_switchover_interval=ssi,
         enable_auth=enable_auth,
+        default_scope_vrf_id=server.default_scope_vrf_id if server is not None else None,
+        maintenance_mode=True,
+        maintenance_enabled_at=timezone.now(),
+        maintenance_enabled_by=_service_user(),
+        maintenance_notes=NEW_FAILOVER_MAINTENANCE_NOTE,
     )
     results['failovers']['created'].append(name)
+    results['failovers'].setdefault('maintenance', []).append(
+        f'{name}: in maintenance mode, its scopes were not imported. {NEW_FAILOVER_MAINTENANCE_NOTE}'
+    )
+    return failover
 
 
 # ---------------------------------------------------------------------- #
 # Scope helper
 # ---------------------------------------------------------------------- #
 
-def _import_scope(client, rs: Dict, results: Dict, server=None):
-    from .models import DHCPFailover, DHCPScope
+def _scope_prefix(cidr: str, vrf, create: bool):
+    """
+    (prefix, reason) for a learned scope with subnet `cidr`, looking only in `vrf`
+    (None = global). One scope per prefix: when the prefix already belongs to another
+    scope, or the VRF holds two prefixes with this network, the scope gets no prefix and
+    `reason` says why. A missing prefix is created in `vrf` when `create` is on.
+    """
     from ipam.models import Prefix
+
+    from .models import DHCPScope
+
+    vrf_label = f'VRF {vrf}' if vrf is not None else 'the global VRF'
+    vrf_id = vrf.pk if vrf is not None else None
+    found = list(Prefix.objects.filter(prefix=cidr, vrf_id=vrf_id)[:2])
+    if len(found) > 1:
+        return None, f'more than one prefix {cidr} exists in {vrf_label}'
+    if found:
+        owner = DHCPScope.objects.filter(prefix=found[0]).first()
+        if owner is not None:
+            return None, f'prefix {cidr} in {vrf_label} already belongs to scope "{owner.name}"'
+        return found[0], ''
+    if create:
+        return Prefix.objects.create(prefix=cidr, vrf_id=vrf_id, status='active'), ''
+    return None, f'no prefix {cidr} in {vrf_label}, and "Create Missing Prefixes on Import" is off'
+
+
+def _import_scope(client, rs: Dict, results: Dict, server=None, new_failover_ids=frozenset()):
+    """
+    Create the NetBox scope for server scope `rs`, unless `server` already has one with
+    this network. Returns the new or existing DHCPScope, or None when skipped.
+
+    Skipped with an error: a scope in a failover NetBox doesn't have (it's never imported
+    as a standalone scope). Skipped: a scope in a failover created in this run
+    (`new_failover_ids`), which waits until its Default Scope VRF has been checked.
+    """
+    from .models import DHCPPluginSettings, DHCPScope
+    from .utils import AmbiguousFailover, find_failover, scopes_for_server
 
     scope_id    = rs.get('scope_id')    or rs.get('ScopeId')    or ''
     name        = rs.get('name')        or rs.get('Name')        or scope_id
@@ -142,6 +229,9 @@ def _import_scope(client, rs: Dict, results: Dict, server=None):
     subnet_mask = rs.get('subnet_mask') or rs.get('SubnetMask')  or ''
     router_raw  = rs.get('router')      or rs.get('Router')      or ''
     lease_secs  = int(rs.get('lease_duration_seconds') or rs.get('LeaseDuration') or 86400)
+    description = (rs.get('description') or rs.get('Description') or '')[:200]
+    state       = rs.get('state')       or rs.get('State')
+    active      = state is None or str(state).strip().lower() == 'active'
 
     router = router_raw if router_raw not in ('', '0.0.0.0') else None
 
@@ -159,28 +249,44 @@ def _import_scope(client, rs: Dict, results: Dict, server=None):
         )
         return None
 
-    # Find or create the NetBox Prefix
-    from .models import DHCPPluginSettings
-    if DHCPPluginSettings.load().create_missing_prefixes:
-        prefix_obj, _ = Prefix.objects.get_or_create(
-            prefix=cidr,
-            defaults={'status': 'active'},
-        )
-    else:
+    net = IPNetwork(cidr)
+    network = str(net.network)
+
+    # The failover the server says the scope is in — by name and partner server,
+    # since failover names are only unique per server.
+    failover = None
+    failover_name = rs.get('failover_name') or rs.get('FailoverName') or rs.get('FailoverRelationshipName') or ''
+    if failover_name:
         try:
-            prefix_obj = Prefix.objects.get(prefix=cidr)
-        except Prefix.DoesNotExist:
+            failover = find_failover(failover_name, server)
+        except AmbiguousFailover as exc:
+            results['scopes']['errors'].append(f'{scope_id}: {exc} — skipped.')
+            return None
+        if failover is None:
             results['scopes']['errors'].append(
-                f'{scope_id}: prefix {cidr} does not exist in NetBox and '
-                f'"Create Missing Prefixes on Import" is disabled — skipped.'
+                f'{scope_id}: the server reports failover {failover_name!r}, which isn\'t in NetBox '
+                f'— skipped. Re-run Import from Server (both of the failover\'s servers must be '
+                f'in NetBox first).'
+            )
+            return None
+        if failover.pk in new_failover_ids:
+            results['scopes']['skipped'].append(
+                f'{name} ({cidr}): failover {failover_name!r} was just created and is in maintenance mode'
             )
             return None
 
-    # Skip if a scope with this name + prefix already exists, but still import
-    # exclusion ranges in case they were added after the scope was first imported.
-    existing = DHCPScope.objects.filter(prefix=prefix_obj, name=name).first()
-    if existing:
-        results['scopes']['skipped'].append(f'{name} ({cidr})')
+    # Already in NetBox? Match on this server + network, not the name, so a scope renamed
+    # on Windows isn't imported a second time. Exclusion ranges are still imported, in
+    # case they were added after the scope was first imported.
+    matches = list(scopes_for_server(server).filter(network=network)[:2])
+    if len(matches) > 1:
+        results['scopes']['errors'].append(
+            f'{scope_id}: more than one NetBox scope uses network {network} on {server} — skipped.'
+        )
+        return None
+    if matches:
+        existing = matches[0]
+        results['scopes']['skipped'].append(f'{existing.name} ({cidr})')
         from .api_client import PSUClientError
         try:
             remote_exclusions = client.list_exclusions(scope_id)
@@ -192,33 +298,63 @@ def _import_scope(client, rs: Dict, results: Dict, server=None):
             )
         return existing
 
-    # Optionally link a failover if the API tells us the failover name
-    failover = None
-    failover_name = rs.get('failover_name') or rs.get('FailoverName') or rs.get('FailoverRelationshipName') or ''
-    if failover_name:
-        failover = DHCPFailover.objects.filter(name=failover_name).first()
+    # The prefix comes from the failover's default VRF, or the server's for a standalone
+    # scope (blank = global).
+    if failover is not None:
+        vrf = failover.default_scope_vrf
+    else:
+        vrf = server.default_scope_vrf if server is not None else None
+    # Read the scope's options before creating it: newer PSU scripts leave the router
+    # out of the scope list, so it comes from Option 3 here. If they can't be read and
+    # the scope list didn't carry the router, skip the scope rather than import it
+    # with its router missing.
+    from .api_client import PSUClientError
+    try:
+        remote_opts = client.list_scope_options(scope_id)
+        opts_error = None
+    except PSUClientError as exc:
+        remote_opts = []
+        opts_error = exc
+    if not remote_has_router(rs):
+        if opts_error is not None:
+            results['scopes']['errors'].append(
+                f'{scope_id}: could not fetch options (needed for the router): {opts_error} '
+                f'— skipped. Re-run Import from Server.'
+            )
+            return None
+        router = router_from_options(remote_opts)
+
+    prefix_obj, no_prefix_reason = _scope_prefix(
+        cidr, vrf, create=DHCPPluginSettings.load().create_missing_prefixes,
+    )
 
     scope = DHCPScope.objects.create(
         name=name,
+        description=description,
         prefix=prefix_obj,
+        network=network,
+        prefix_length=net.prefixlen,
         start_ip=start_ip,
         end_ip=end_ip,
         router=router,
         lease_lifetime=lease_secs,
+        active=active,
         failover=failover,
         server=server if failover is None else None,
     )
-    results['scopes']['created'].append(f'{name} ({cidr})')
+    label = f'{name} ({cidr})'
+    results['scopes']['created'].append(label)
+    if no_prefix_reason:
+        # Lands on the Unassigned Scopes list.
+        results['scopes'].setdefault('unassigned', []).append(f'{label}: no prefix — {no_prefix_reason}')
 
     # Import scope-level option values
-    from .api_client import PSUClientError
-    try:
-        remote_opts = client.list_scope_options(scope_id)
+    if opts_error is None:
         for ro in remote_opts:
             _import_option_value(scope, ro, results)
-    except PSUClientError as exc:
+    else:
         results['option_values']['errors'].append(
-            f'Scope {name}: could not fetch options: {exc}'
+            f'Scope {name}: could not fetch options: {opts_error}'
         )
 
     # Import exclusion ranges
@@ -268,6 +404,28 @@ def normalize_option_value(ro: Dict):
         value = str(value_raw)
 
     return code, value, opt_name, vendor_class
+
+
+def router_from_options(options) -> Optional[str]:
+    """
+    The router IP (Option 3, no vendor class) from a scope's raw PSU option list,
+    or None when the scope has no router. With several routers, the first one.
+    """
+    for ro in options:
+        parsed = normalize_option_value(ro)
+        if parsed is None:
+            continue
+        code, value, _name, vendor_class = parsed
+        if code == 3 and not vendor_class:
+            first = value.split(', ')[0].strip()
+            return first if first not in ('', '0.0.0.0') else None
+    return None
+
+
+def remote_has_router(remote: Dict) -> bool:
+    """True if a scope-list record carries the router itself (older PSU scripts, or
+    include_router left on); False means it has to come from the scope's options."""
+    return 'router' in remote or 'Router' in remote
 
 
 def denormalize_option_value(value: str):

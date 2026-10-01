@@ -1,0 +1,19 @@
+{% extends 'generic/object_edit.html' %}
+
+{% comment %}
+Edit page for scopes and exclusion ranges. While Push Scope Info is off the DHCP server
+owns their settings: the form shows those fields read-only, and this banner says why.
+{% endcomment %}
+
+{% block content %}
+{% if object.pk and not push_scope_info %}
+<div class="alert alert-warning d-flex align-items-center mb-3" role="alert">
+  <i class="mdi mdi-lock me-2"></i>
+  <span><em>Push Scope Info</em> is disabled, so the settings that come from the DHCP server
+    are <strong>read-only</strong>. Only the NetBox-only fields can be changed. Enable it in
+    <a href="{% url 'plugins:netbox_windows_dhcp:settings' %}">plugin settings</a>
+    to edit everything.</span>
+</div>
+{% endif %}
+{{ block.super }}
+{% endblock %}

@@ -22,13 +22,6 @@ menu = PluginMenu(
                     link='plugins:netbox_windows_dhcp:dhcpfailover_list',
                     link_text='Failover',
                     permissions=['netbox_windows_dhcp.view_dhcpfailover'],
-                    buttons=(
-                        PluginMenuButton(
-                            link='plugins:netbox_windows_dhcp:dhcpfailover_add',
-                            title='Add Failover',
-                            icon_class='mdi mdi-plus-thick',
-                        ),
-                    ),
                 ),
             ),
         ),
@@ -84,6 +77,11 @@ menu = PluginMenu(
                 PluginMenuItem(
                     link='plugins:netbox_windows_dhcp:current_maintenance',
                     link_text='Current Maintenance',
+                    permissions=['netbox_windows_dhcp.view_dhcpserver'],
+                ),
+                PluginMenuItem(
+                    link='plugins:netbox_windows_dhcp:schedule',
+                    link_text='Schedule',
                     permissions=['netbox_windows_dhcp.view_dhcpserver'],
                 ),
                 PluginMenuItem(

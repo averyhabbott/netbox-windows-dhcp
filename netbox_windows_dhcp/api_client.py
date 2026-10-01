@@ -19,10 +19,24 @@ import requests
 import requests.adapters
 from requests.exceptions import RequestException
 
+from .constants import PSU_SCRIPT_VERSION
+
 logger = logging.getLogger('netbox_windows_dhcp')
 
 # Default timeout (seconds) for PSU API calls
 REQUEST_TIMEOUT = 30
+
+# Items per bulk reservation call — keeps each call well inside REQUEST_TIMEOUT.
+RESERVATION_BATCH_SIZE = 100
+
+
+def _batch_error(item: Dict, message: str) -> Dict:
+    return {
+        'scope_id': item.get('scope_id', ''),
+        'ip_address': item.get('ip_address', ''),
+        'status': 'error',
+        'error': message,
+    }
 
 
 class _SSLContextAdapter(requests.adapters.HTTPAdapter):
@@ -197,10 +211,21 @@ class PSUClient:
     # Scopes
     # ------------------------------------------------------------------
 
-    def list_scopes(self, active_only: bool = False) -> List[Dict]:
-        """Return all DHCP scopes on this server."""
-        params = {'active_only': 'true'} if active_only else None
-        return self._get_list('scopes', params=params)
+    def list_scopes(self, active_only: bool = False, include_router: bool = True) -> List[Dict]:
+        """
+        Return all DHCP scopes on this server.
+
+        include_router=False asks the PSU script to leave out each scope's "router"
+        (one Windows call per scope saved); the caller reads Option 3 from the options
+        data instead. Older scripts ignore it and still send "router", so a reply
+        without the key means the router has to come from the options.
+        """
+        params = {}
+        if active_only:
+            params['active_only'] = 'true'
+        if not include_router:
+            params['include_router'] = 'false'
+        return self._get_list('scopes', params=params or None)
 
     def get_scope(self, scope_id: str) -> Dict:
         return self._get(f'scopes/{scope_id}')
@@ -231,42 +256,45 @@ class PSUClient:
     # Leases
     # ------------------------------------------------------------------
 
-    def list_leases(self, scope_id: Optional[str] = None) -> List[Dict]:
+    def list_leases(self, scope_id: Optional[str] = None):
         """
-        Return active DHCP leases.  Filter by scope_id if provided.
+        Return active DHCP leases.
 
-        Each lease dict:
-            {
-              "ip_address": "10.0.1.50",
-              "client_id": "00-11-22-33-44-55",
-              "hostname": "DESKTOP-ABC123",
-              "scope_id": "10.0.1.0",
-              "lease_expiry": "2026-04-12T00:00:00Z",
-              "address_state": "Active"
-            }
+        With scope_id: returns List[Dict] (flat list for that scope).
+        Without scope_id: passes ?format=grouped and returns Dict[str, List[Dict]]
+        keyed by scope_id — one bulk call instead of one per scope.
         """
-        params = {'scope_id': scope_id} if scope_id else {}
-        return self._get_list('leases', params=params)
+        if scope_id:
+            return self._get_list('leases', params={'scope_id': scope_id})
+        result = self._get('leases', params={'format': 'grouped'})
+        if isinstance(result, list) and result:
+            raise PSUClientError(
+                'Bulk leases fetch returned a flat list — PSU script may be too old to support '
+                f'?format=grouped; run Update PSU Scripts to install PSU script v{PSU_SCRIPT_VERSION}'
+            )
+        return result if isinstance(result, dict) else {}
 
     # ------------------------------------------------------------------
     # Reservations
     # ------------------------------------------------------------------
 
-    def list_reservations(self, scope_id: Optional[str] = None) -> List[Dict]:
+    def list_reservations(self, scope_id: Optional[str] = None):
         """
         Return DHCP reservations.
 
-        Each reservation dict:
-            {
-              "ip_address": "10.0.1.100",
-              "client_id": "00-11-22-33-44-55",
-              "name": "printer-01",
-              "description": "",
-              "type": "Dhcp"
-            }
+        With scope_id: returns List[Dict] (flat list for that scope).
+        Without scope_id: passes ?format=grouped and returns Dict[str, List[Dict]]
+        keyed by scope_id — one bulk call instead of one per scope.
         """
-        params = {'scope_id': scope_id} if scope_id else {}
-        return self._get_list('reservations', params=params)
+        if scope_id:
+            return self._get_list('reservations', params={'scope_id': scope_id})
+        result = self._get('reservations', params={'format': 'grouped'})
+        if isinstance(result, list) and result:
+            raise PSUClientError(
+                'Bulk reservations fetch returned a flat list — PSU script may be too old to support '
+                f'?format=grouped; run Update PSU Scripts to install PSU script v{PSU_SCRIPT_VERSION}'
+            )
+        return result if isinstance(result, dict) else {}
 
     def create_reservation(self, payload: Dict) -> Dict:
         """
@@ -282,11 +310,58 @@ class PSUClient:
         """
         return self._post('reservations', payload)
 
-    def update_reservation(self, client_id: str, payload: Dict) -> Dict:
-        return self._put(f'reservations/{client_id}', payload)
+    def create_reservations(self, items: List[Dict]) -> List[Dict]:
+        """
+        Bulk create. Each item has the same keys as create_reservation().
+        Returns one result per item, in order (see _reservation_batch).
+        """
+        return self._reservation_batch('POST', items)
 
-    def delete_reservation(self, client_id: str) -> None:
-        self._delete(f'reservations/{client_id}')
+    def update_reservations(self, items: List[Dict]) -> List[Dict]:
+        """
+        Bulk update, each reservation found by scope_id + ip_address.
+        Item keys: scope_id, ip_address (required); client_id, name,
+        description, type (optional — only the keys sent are changed).
+        Returns one result per item, in order (see _reservation_batch).
+        """
+        return self._reservation_batch('PUT', items)
+
+    def delete_reservations(self, items: List[Dict]) -> List[Dict]:
+        """
+        Bulk delete. Items: {"scope_id": ..., "ip_address": ...}.
+        Returns one result per item, in order (see _reservation_batch).
+        """
+        return self._reservation_batch('DELETE', items)
+
+    def _reservation_batch(self, method: str, items: List[Dict]) -> List[Dict]:
+        """
+        Send items to /reservations in chunks of RESERVATION_BATCH_SIZE, one call per chunk.
+
+        Returns one result per item, in order:
+            {"scope_id", "ip_address", "status": "ok" | "not_found" | "error",
+             "error"?, "reservation"?}
+        Never raises for a failed call: that chunk and every later one are returned
+        as 'error' results carrying the failure, so the caller still gets a result
+        for every item and can log each one.
+        """
+        results = []
+        for start in range(0, len(items), RESERVATION_BATCH_SIZE):
+            chunk = items[start:start + RESERVATION_BATCH_SIZE]
+            try:
+                response = self._request(method, 'reservations', json=chunk)
+                if not isinstance(response, dict) or not isinstance(response.get('results'), list):
+                    raise PSUClientError(
+                        f'{method} reservations returned an unexpected response — PSU script '
+                        f'may be too old to support bulk reservation calls'
+                    )
+                chunk_results = response['results'][:len(chunk)]
+                for item in chunk[len(chunk_results):]:
+                    chunk_results.append(_batch_error(item, 'No result returned for this item'))
+                results.extend(chunk_results)
+            except PSUClientError as exc:
+                results.extend(_batch_error(item, str(exc)) for item in items[start:])
+                break
+        return results
 
     # ------------------------------------------------------------------
     # Failover
@@ -341,16 +416,32 @@ class PSUClient:
 
     def list_exclusions(self, scope_id: str) -> List[Dict]:
         """
-        Return exclusion ranges for the given scope.
-
-        Each exclusion dict:
-            {
-              "scope_id": "10.0.1.0",
-              "start_ip": "10.0.1.50",
-              "end_ip":   "10.0.1.59"
-            }
+        Return exclusion ranges for the given scope (flat list).
+        Used by the push path (_sync_exclusions) — scope_id is required.
         """
         return self._get_list('exclusions', params={'scope_id': scope_id})
+
+    def list_all_exclusions(self) -> Dict:
+        """
+        Bulk fetch all exclusion ranges across every scope.
+        Returns Dict[str, List[Dict]] keyed by scope_id.
+        Used by the pull path — one call instead of one per scope.
+        """
+        result = self._get('exclusions')
+        return result if isinstance(result, dict) else {}
+
+    def list_all_scope_options(self) -> Dict:
+        """
+        Bulk fetch all scope-level option values across every scope.
+        Returns Dict[str, List[Dict]] keyed by scope_id (the scope_options
+        key from the GET /api/dhcp/options envelope).
+        Used by the pull path — one call instead of one per scope.
+        """
+        result = self._get('options')
+        if not isinstance(result, dict):
+            return {}
+        scope_options = result.get('scope_options', {})
+        return scope_options if isinstance(scope_options, dict) else {}
 
     def create_exclusion(self, payload: Dict) -> Dict:
         """

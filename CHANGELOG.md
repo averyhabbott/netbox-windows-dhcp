@@ -2,6 +2,180 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.0.0] - 2026-09-30
+
+> ⚠️ **WARNING:** This version makes significant changes to how the plugin behaves. Do not upgrade without following the upgrade checklist below. Skipping steps can cause data loss.
+
+2.0.0 makes the two push settings mean what they say. With **Push Scope Info** on, NetBox is the source of truth for scopes; with it off, the DHCP server is. With **Push Reservations** on, NetBox is the source of truth for reservations; with it off, the DHCP server is. Leases always come from the server. Before this release the server quietly won in several places even with push on, and cleanup left behind things the server no longer had. Because the rules are now enforced, **the first syncs after upgrading can delete data on both sides.**
+
+### Security notice
+
+> ⚠️ **Earlier versions exposed DHCP server App Tokens.** Every time a DHCP server was created or edited, its PSU App Token was saved in plain text in NetBox's changelog, and sent in the payload of any webhook or event rule on DHCP servers.
+>
+> - **Who could see them:** anyone allowed to view NetBox's changelog, in the UI or through the REST API, and any system receiving those webhooks.
+> - **Fixed in 2.0.0:** the changelog and webhooks now show `********` in place of the token.
+> - **Not fixed by upgrading:** changelog entries saved by earlier versions still hold the tokens, and webhook receivers may have kept copies. **Replace the App Tokens** on your DHCP servers (in PSU, then on each server in NetBox), so the exposed ones stop working.
+
+### Requirements
+
+- **NetBox 4.5 or 4.6.** NetBox 4.6 runs on Django 6.0.
+- **Python 3.12 or later** is now required (was 3.10). pip won't install 2.0.0 on older Python.
+
+### Upgrade checklist
+
+Do these in order. The warnings sit on the steps they belong to.
+
+1. **Stop the scheduled sync.** In NetBox's Jobs list, delete any scheduled **Windows DHCP Sync** jobs. After the upgrade, restarting the workers no longer creates a schedule, so it stays stopped until you start it again in step 12.
+2. **Turn off Push Scope Info and Push Reservations** in the plugin's Settings, while still on the old version.
+   > ⚠️ **Why this matters:** every scope already in NetBox is marked Active by the upgrade, and NetBox has no scope descriptions yet. A sync with push on, before a read-only sync, would switch on scopes that are off on the server (for example a staged migration copy) and wipe every scope description on the server.
+3. **Install the new version** (`pip install --upgrade netbox-windows-dhcp`, or however you install plugins). Python 3.12 or later is required.
+4. **Run `python manage.py migrate`, then restart NetBox and the RQ workers.**
+5. **Click Update PSU Scripts on every DHCP server** (server page, or the bulk action on the Servers list). This needs an App Token with the DHCPWriter role. A server NetBox only reaches with a read-only token has to be updated from a NetBox that has a writer token.
+   - Until a server runs PSU script 2.0.0, most of its sync is skipped (IPs, exclusions, options), reservation push is create-only, and scope active/inactive state is never pushed. The Servers list shows the version mismatch.
+   - Plugin 1.3.7 keeps working against the 2.0.0 script, so another NetBox that shares the same PSU server can upgrade later.
+6. **Run the one-time fixes.** The first two take `--dry-run`; check its output first.
+   - `python manage.py dhcp_fix_ip_vrf`: **required.** The sync now only looks at IPs in the scope prefix's VRF. IPs created by older versions have no VRF; without this step, the sync would stop seeing them and create duplicates in the right VRF.
+   - `python manage.py dhcp_apply_prefix_tenant`: *optional.* Gives existing sync-managed IPs their prefix's tenant. Run it after `dhcp_fix_ip_vrf`, since it only finds IPs in the prefix's VRF.
+   - `python manage.py reindex netbox_windows_dhcp`: lets global search find scopes by network.
+7. **Review the new Default Scope VRF setting** on each server and failover. Scopes the sync or Import learns from now on go into that VRF (blank means Global).
+8. **Run one read-only sync** (**Run Now** on the Schedule page, or **Sync Now** on each server). With both push settings off, this sync is "server wins" everywhere:
+   > ⚠️ **It deletes IPs.** Inside each scope's start/end range (outside exclusions), every IP the server doesn't have a lease or reservation for is deleted, whatever its status. That includes hand-made IPs, IPs assigned to devices, and reserved IPs that exist only in NetBox. Protected IPs (the Sync-Protected Tag on the IP or its prefix) are never touched. Tag anything you need to keep **before** this step, and check the Settings page to make sure the Sync-Protected Tag is set to the tag you use.
+
+   It also:
+   - pulls each scope's active/inactive state and description from the server;
+   - overwrites the description of every reserved IP with the server reservation's description, including blank ones;
+   - blanks stale DNS names (the server reports no hostname) and invalid ones (they get the `invalid-client-hostname` tag);
+   - **fires your event rules** (webhooks, scripts, notifications) once per IP it creates, updates or deletes. A first sync on a large server can send many at once.
+9. **Check the result before turning push back on.** Read the job log, then look for:
+   - **Unassigned Scopes** (a saved filter on the Scopes list): scopes learned with no prefix. The log says why.
+   - **New failovers in maintenance mode** (Import only): check their Default Scope VRF, take them out of maintenance, and run Import from Server again to bring in their scopes.
+   - **"NetBox scopes … all use network …"** warnings: the sync skips both until one moves.
+   - **Scopes assigned to the wrong server.** The sync now matches a server's scopes only against NetBox scopes tied to that server (standalone on it, or in a failover it belongs to). A NetBox scope pointing at the wrong server looks missing on the right one.
+10. **Turn the push settings back on**, if you use them. The read-only sync in step 8 limits the risk here: by now, NetBox should match your DHCP servers.
+    > ⚠️ **Push Scope Info on:** a server scope with no NetBox scope tied to that server is **deleted from Windows** on the next sync, including inactive scopes. Fix any wrong-server scopes from step 9 first.
+    >
+    > ⚠️ **Push Reservations on:** server reservations with no reserved IP in NetBox are **deleted from the server**, even inside protected prefixes (the Sync-Protected Tag only stops the sync writing to NetBox, never a push). Every existing reservation is changed to type Both, a one-time update per reservation.
+11. **If you monitor for Failed jobs:** a sync, scope push or reservation push now ends as **Failed** when any reservation change fails, and keeps failing on every run until it's fixed in NetBox.
+12. **Click Schedule** on the Schedule page (Admin → Schedule) to start the recurring sync again.
+13. **Note:** if PSU sits behind a reverse proxy or gateway, check its response size limit: the sync now fetches leases, reservations, exclusions and options for a whole server in one call each.
+
+### Sync rules (what each push setting means now)
+
+| | Push Reservations **off** | Push Reservations **on** |
+|---|---|---|
+| **Push Scope Info off** | The server wins for everything. | The server wins for scopes and leases; NetBox wins for reservations. |
+| **Push Scope Info on** | NetBox wins for scopes; the server wins for leases and reservations. | NetBox wins for scopes and reservations; the server wins for leases. |
+
+- **Server wins for IPs:** inside a scope's start/end range (outside exclusions), only IPs the server has a lease or reservation for survive. Outside the range, only IPs the sync created are cleaned up; hand-made ones are left alone.
+- **NetBox wins for reservations:** every reserved IP with a client ID is created or updated on the server, and server reservations NetBox doesn't have are deleted.
+- **NetBox wins for scopes:** everything about the scope (name, description, range, router, lease time, active state, failover, options, exclusions) is pushed. NetBox-only scopes are created on the server; server-only scopes are deleted from it.
+- **Always:** the Sync-Protected Tag wins over the sync, and a failed read from the server never deletes anything.
+- **A read-only API key overrides both push settings for that server:** the server always wins, deletes included. Use this on purpose, for example a test NetBox that mirrors production DHCP without changing it.
+
+### Added
+
+- **Full reservation push** (Push Reservations on): creates, updates and deletes reservations on the server, and replicates them to the failover partner. Saving or deleting a reserved IP pushes right away (a new **Windows DHCP Reservation Push** job). With both push settings on, pushing a scope also pushes its reservations.
+- **Placeholder Reservations** setting (off by default). A reserved IP inside a scope's range with no MAC gets a made-up client ID (`ba-dc-0d-ed-…`), so the server stops handing that IP out. Entering a real MAC later replaces it.
+- **Scope active/inactive state is synced**, with a new **Active** column on the Scopes list.
+- **Scope descriptions are synced.** Before, every push wiped the server's description.
+- **Scopes without a prefix.** A scope stores its own network, and the prefix is optional. A scope with no prefix still syncs its settings, options and exclusions, but nothing IP-related. An **Unassigned Scopes** saved filter on the Scopes list finds them.
+- **Default Scope VRF** on servers and failovers: where learned scopes go.
+- **Immediate push on exclusion save and delete** (Push Scope Info on).
+- **Descriptions on exclusion ranges and failovers**, and a failover **Edit** page for its NetBox-only fields.
+- **Schedule page** (Admin → Schedule): **Schedule** starts the recurring sync; **Run Now** runs one sync without changing the schedule.
+- **Management commands** `dhcp_fix_ip_vrf` and `dhcp_apply_prefix_tenant` (see step 6).
+- **New IPs inherit their prefix's tenant** when the sync creates them.
+- **`invalid-client-hostname` tag** and a **Lease Hostname** column on IP Addresses, for clients that report hostnames NetBox won't accept as DNS names.
+- **Settings changes are recorded in NetBox's changelog:** who saved them, when, and what changed.
+- **Sync Job Log Level** setting, a **Writable** column on the Servers list (read-only vs read-write API key), and `[TIMING]` summary lines in the sync log.
+
+### Changed
+
+**Sync**
+- **IP cleanup follows the scope's range, not the IP's status** (see "Sync rules").
+- **VRF-aware:** the sync only touches IPs in the scope prefix's VRF. Before, it could change or delete a same-address IP in another VRF.
+- **Per-server scope matching:** a server's scopes are only matched against NetBox scopes tied to that server, so dev and prod can run the same network with separate NetBox scopes. Each prefix can have only one scope.
+- **Inactive scopes are synced like any other** (see "Removed").
+- **Safer scope handling:** creating or deleting scopes that exist on only one side now respects maintenance mode, failover sync, primary-only and Sync Standalone Scopes, both in the sync and in its auto-import.
+- **The lease "Active" mark** now means the server has a lease on that IP right now. It used to stay ✓ forever.
+- **DNS names use NetBox's own validation.** Invalid hostnames are blanked and tagged, never "fixed".
+- **Much faster syncs:** leases, reservations, exclusions and options are fetched once per server instead of once per scope, and the router comes with the options.
+- **More fail-safe:** a failed bulk read skips that step for the server, and one failing item no longer stops the rest of the job.
+
+**Import**
+- **Import uses the Default Scope VRF**, and matches existing scopes by server and network (a scope renamed on Windows isn't imported twice).
+- **New failovers from Import start in maintenance mode** and their scopes are skipped that run. Check the VRF, take the failover out of maintenance and import again.
+- **A scope whose failover isn't in NetBox is skipped with an error** instead of being imported as standalone.
+
+**Editing rules**
+- **IPs inside a scope's range** can only be created or edited if the sync would keep them (DHCP-managed IPs, plus reserved IPs with Push Reservations on). Protected IPs are exempt. Scope and exclusion changes that would pull disallowed IPs into a range are refused.
+- **With Push Scope Info off,** you can't create scopes, exclusions or option values, but you can delete them (NetBox only; the next sync re-imports anything still on the server). Scope and exclusion edit pages open with only the NetBox-only fields editable.
+- **An option value a scope still uses can't be deleted**, and duplicate option codes on one scope are refused.
+- **Buttons and bulk actions honor NetBox's per-object permissions**, and the Current Maintenance page lists only what you may view.
+- **Every rule applies to the REST API too.**
+
+**Jobs and UI**
+- **Saving settings never touches the sync schedule,** and worker restarts no longer create or reset it.
+- **"Windows DHCP Sync" always runs as DHCP-Sync-Service.** The new **Set DHCP Sync Schedule** job shows who clicked Schedule or Run Now.
+- **Push jobs are listed under the user whose change started them** (they had no user before), and run on the Sync Job Queue.
+- **The health check tests write access**, and push jobs skip read-only servers quietly.
+- **Update PSU Scripts ends as Failed** when a call to the server fails.
+- **Settings page** is rearranged into two columns with help popups and per-field `PLUGINS_CONFIG` override notes.
+- **"Add Failover" and other dead buttons removed.**
+
+### Fixed
+
+- **Removing an exclusion from the server never worked** (since v1.3.0).
+- **PSU reads returned an empty result when Windows failed,** so the plugin could act on missing data. They now return an error, and the sync skips that step.
+- **A failed failover read made every scope look standalone.**
+- **Bad IP addresses sent to PSU got a generic server error** instead of a 400.
+- **A scope in maintenance mode could still be auto-imported** by a pull-only sync.
+- **A cancelled scope save could leave later scope pushes stuck.**
+- **Sync changes never fired NetBox event rules** (see step 8).
+- **"Last updated" and changelog "before" values** were wrong for changes the sync made.
+- **Pushing option values could silently fail,** or report a misleading "Scope not found".
+- **Scheduling bugs:** scheduled syncs showed the wrong user, "Run Now" could cancel the next scheduled sync, and worker restarts disrupted the schedule.
+- **App Tokens were copied into NetBox's changelog and webhook payloads** in plain text (security fix; see [Security notice](#security-notice)).
+- **Sync Now could be started just by opening a link** (security fix). It now needs the button.
+- **Certificate Fetch ignored `restrict_allowlist` and `server_overrides[host].allowed`** (security fix).
+- **Deleting a built-in option code** gave a server error instead of a clear "protected" message.
+- **Searching option values by code number** (for example `150` in a scope's Option Values field) found nothing.
+
+### Removed
+
+- **Sync Active Scopes Only setting.** If you had it on, the first sync picks up the inactive scopes it used to ignore, and with Push Scope Info on, inactive server-only scopes are deleted.
+- **Unique failover names.** Two server pairs can use the same failover name.
+
+### Database migrations
+
+- **0009:** Sync Job Log Level setting and the server's Writable field.
+- **0010:** new scope fields (description, active, network, prefix length) filled in from each scope's prefix; optional scope prefix; exclusion and failover descriptions; Default Scope VRF; Placeholder Reservations; failover names no longer unique; Sync Active Scopes Only removed; created and last-updated dates on the plugin settings, for the changelog.
+
+### REST API changes
+
+**Could break existing API clients**
+- **With Push Scope Info off:** creating scopes, exclusions or option values, and editing option values, return **403**. Changing a server-owned field on a scope or exclusion returns **400**.
+- **Failovers** (`/api/plugins/windows-dhcp/failover/`): creating one returns **403**, changing a Windows-owned field returns **400**, and `shared_secret` is gone.
+- **Scope `prefix` can be null.**
+- **`is_builtin` on option codes is read-only.**
+- **Per-object permissions** now limit what an API user can change.
+
+**Added**
+- New fields and filters for everything above: scope `description`, `active`, `network`, `prefix_length`; exclusion and failover `description`; `default_scope_vrf`; failover `sync_enabled` (now changeable).
+- **Servers:** read-only status fields (`health_status`, `access_level`, `last_sync_at`, `psu_script_version` and others) and certificate status (`has_ca_cert`, `ca_cert_expiry`).
+- **Maintenance mode** on servers, failovers and scopes can be read and changed.
+- **New read-only `lease-info` endpoint** with each IP's lease hostname, active mark and expiration.
+
+### PSU script 2.0.0
+
+Installed with **Update PSU Scripts**. Existing endpoints keep their shape, except as noted.
+
+- **Removed:** `PUT` and `DELETE /api/dhcp/reservations/:client_id` (by MAC). No plugin version ever called them; this only matters if you called them yourself.
+- **Reservations:** `POST`, `PUT` and `DELETE /api/dhcp/reservations` take a list of items found by scope and IP, with a result per item. A single-object `POST` works as before.
+- **Scopes:** `POST` and `PUT` take an optional `state` (`Active`/`InActive`). `GET /api/dhcp/scopes` takes an optional `include_router=false`.
+- **Bulk reads:** new `GET /api/dhcp/options`; `GET /api/dhcp/exclusions` without `scope_id` returns every scope; `GET /api/dhcp/leases` and `/reservations` accept `?format=grouped`.
+- **Errors:** reads return an error when Windows fails instead of an empty result, and bad IPs get a 400 naming the field.
+
 ## [1.3.7] - 2026-09-10
 
 ### Fixed
