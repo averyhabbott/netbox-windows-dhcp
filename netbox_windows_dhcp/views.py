@@ -14,6 +14,7 @@ from utilities.views import register_model_view
 from .filtersets import (
     DHCPExclusionRangeFilterSet,
     DHCPFailoverFilterSet,
+    DHCPLeaseFilterSet,
     DHCPOptionCodeDefinitionFilterSet,
     DHCPOptionValueFilterSet,
     DHCPScopeFilterSet,
@@ -23,6 +24,7 @@ from .forms import (
     DHCPExclusionRangeForm,
     DHCPFailoverFilterForm,
     DHCPFailoverForm,
+    DHCPLeaseFilterForm,
     DHCPOptionCodeDefinitionFilterForm,
     DHCPOptionCodeDefinitionForm,
     DHCPOptionValueFilterForm,
@@ -37,6 +39,7 @@ from .forms import (
 from .models import (
     DHCPExclusionRange,
     DHCPFailover,
+    DHCPLeaseInfo,
     DHCPOptionCodeDefinition,
     DHCPOptionValue,
     DHCPScope,
@@ -45,11 +48,13 @@ from .models import (
 from .tables import (
     DHCPExclusionRangeTable,
     DHCPFailoverTable,
+    DHCPLeaseTable,
     DHCPOptionCodeDefinitionTable,
     DHCPOptionValueTable,
     DHCPScopeTable,
     DHCPServerTable,
 )
+from .utils import with_scope
 
 logger = logging.getLogger('netbox_windows_dhcp')
 
@@ -622,12 +627,42 @@ class DHCPOptionValueBulkDeleteView(generic.BulkDeleteView):
 
 
 # ---------------------------------------------------------------------------
+# Leases view
+# ---------------------------------------------------------------------------
+
+@register_model_view(DHCPLeaseInfo, 'list', path='', detail=False)
+class DHCPLeaseListView(generic.ObjectListView):
+    """
+    Read-only list of the sync's lease details. Like the REST API, it has no permissions of
+    its own: a signed-in user sees the rows whose IP Address they may view.
+    """
+    queryset = with_scope(
+        DHCPLeaseInfo.objects.select_related('ip_address', 'ip_address__vrf', 'ip_address__tenant')
+        .prefetch_related('ip_address__tags')
+    ).order_by('ip_address__address', 'pk')
+    table = DHCPLeaseTable
+    filterset = DHCPLeaseFilterSet
+    filterset_form = DHCPLeaseFilterForm
+    actions = (BulkExport,)
+
+    def has_permission(self):
+        from ipam.models import IPAddress
+        viewable = IPAddress.objects.restrict(self.request.user, 'view')
+        self.queryset = self.queryset.filter(ip_address__in=viewable)
+        return True
+
+    def get_permitted_actions(self, user, model=None):
+        return list(self.actions)
+
+
 # DHCPScope views
 # ---------------------------------------------------------------------------
 
 @register_model_view(DHCPScope, 'list', path='', detail=False)
 class DHCPScopeListView(generic.ObjectListView):
-    queryset = DHCPScope.objects.select_related('prefix', 'server', 'failover')
+    queryset = DHCPScope.objects.select_related(
+        'prefix', 'prefix__vrf', 'prefix__tenant', 'prefix___site', 'prefix___location', 'server', 'failover',
+    )
     table = DHCPScopeTable
     filterset = DHCPScopeFilterSet
     filterset_form = DHCPScopeFilterForm

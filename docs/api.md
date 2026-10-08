@@ -12,7 +12,7 @@ This page covers the plugin's NetBox API. The API on each DHCP server, which Net
 | `/exclusion-ranges/` | Exclusion ranges |
 | `/option-values/` | Option values |
 | `/option-codes/` | Option code definitions |
-| `/lease-info/` | Lease details for IP Addresses (read-only) |
+| `/lease-info/` | Lease details for IP Addresses (read-only). Filters include `active`, and `state_changed_after` / `state_changed_before` on Active/Inactive Since |
 
 **Turning the API off:** with **API Enabled** off on the Settings page, every endpoint returns 503 Service Unavailable.
 

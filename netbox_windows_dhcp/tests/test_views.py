@@ -24,6 +24,7 @@ from django.test import Client, override_settings
 from django.urls import reverse
 from django.utils import timezone
 from ipam.models import IPAddress, Prefix, VRF
+from tenancy.models import Tenant
 from utilities.testing import TestCase, ViewTestCases
 
 from ..models import (
@@ -715,3 +716,215 @@ class LeasePanelTimeZoneTests(TestCase):
         from django.utils import timezone
         response = self.client.get(ip.get_absolute_url())
         self.assertContains(response, f'Lease Expiration ({timezone.get_current_timezone_name()})')
+
+
+class LeasesViewTests(TestCase):
+    """The Leases page: one row per IP the sync tracks, filterable on every column."""
+
+    @classmethod
+    def setUpTestData(cls):
+        from extras.models import Tag
+
+        cls.server = make_server(name='Srv A', hostname='a.example.com')
+        cls.failover = make_failover(name='FO 1')
+        cls.prefix = make_prefix('10.60.0.0/24')
+        cls.scope = make_scope(name='Scope A', prefix=cls.prefix, server=cls.server)
+        cls.fo_prefix = make_prefix('10.61.0.0/24')
+        cls.fo_scope = make_scope(
+            name='Scope FO', prefix=cls.fo_prefix, failover=cls.failover,
+            start_ip='10.61.0.10', end_ip='10.61.0.20',
+        )
+        cls.tag = Tag.objects.create(name='Keep', slug='keep')
+        cls.tenant = Tenant.objects.create(name='Tenant A', slug='tenant-a')
+        cls.vrf = VRF.objects.create(name='Lease VRF')
+
+        now = timezone.now()
+        cls.res = IPAddress.objects.create(
+            address='10.60.0.5/24', status='reserved', dns_name='res.example.com', description='Printer',
+            custom_field_data={'dhcp_client_id': 'aa-bb-cc-dd-ee-01'},
+        )
+        cls.res.tags.add(cls.tag)
+        DHCPLeaseInfo.objects.create(
+            ip_address=cls.res, lease_hostname='PRINTER-1', active=False,
+            state_changed=now - timedelta(days=30),
+        )
+        cls.lease = IPAddress.objects.create(address='10.60.0.6/24', status='dhcp', dns_name='pc.example.com')
+        DHCPLeaseInfo.objects.create(
+            ip_address=cls.lease, lease_hostname='LAPTOP-2', active=True,
+            lease_expiration=now + timedelta(days=2), state_changed=now - timedelta(days=1),
+        )
+        cls.fo_ip = IPAddress.objects.create(address='10.61.0.7/24', status='reserved')
+        DHCPLeaseInfo.objects.create(
+            ip_address=cls.fo_ip, lease_hostname='fo-host', active=True, state_changed=now,
+        )
+        cls.stray = IPAddress.objects.create(address='10.99.0.1/24', status='dhcp', vrf=cls.vrf, tenant=cls.tenant)
+        DHCPLeaseInfo.objects.create(ip_address=cls.stray, lease_hostname='stray', active=True)
+
+    def setUp(self):
+        super().setUp()
+        self.user.is_superuser = True
+        self.user.save()
+        self.url = ui_url('dhcpleaseinfo_list')
+
+    def rows(self, **params):
+        """The addresses the page lists for these filters."""
+        response = self.client.get(self.url, params)
+        self.assertEqual(response.status_code, 200)
+        return {str(row.record.ip_address.address.ip) for row in response.context['table'].rows}
+
+    def test_every_tracked_ip_is_listed(self):
+        self.assertEqual(self.rows(), {'10.60.0.5', '10.60.0.6', '10.61.0.7', '10.99.0.1'})
+
+    def test_filters(self):
+        now = timezone.now()
+        cases = {
+            'active': ({'active': 'true'}, {'10.60.0.6', '10.61.0.7', '10.99.0.1'}),
+            'inactive': ({'active': 'false'}, {'10.60.0.5'}),
+            'status': ({'status': 'reserved'}, {'10.60.0.5', '10.61.0.7'}),
+            'scope': ({'scope_id': self.scope.pk}, {'10.60.0.5', '10.60.0.6'}),
+            'parent prefix': ({'parent': '10.61.0.0/24'}, {'10.61.0.7'}),
+            'parent prefix is a wider net': ({'parent': '10.60.0.0/15'}, {'10.60.0.5', '10.60.0.6', '10.61.0.7'}),
+            'parent prefix not a prefix': ({'parent': 'nonsense'}, set()),
+            'server': ({'server_id': self.server.pk}, {'10.60.0.5', '10.60.0.6'}),
+            'server is not': ({'server_id__n': self.server.pk}, {'10.61.0.7', '10.99.0.1'}),
+            'failover': ({'failover_id': self.failover.pk}, {'10.61.0.7'}),
+            'failover is not': ({'failover_id__n': self.failover.pk}, {'10.60.0.5', '10.60.0.6', '10.99.0.1'}),
+            'lease hostname is': ({'lease_hostname': 'LAPTOP-2'}, {'10.60.0.6'}),
+            'lease hostname is not': ({'lease_hostname__n': 'LAPTOP-2'}, {'10.60.0.5', '10.61.0.7', '10.99.0.1'}),
+            'lease hostname contains': ({'lease_hostname__ic': 'laptop'}, {'10.60.0.6'}),
+            'lease hostname starts with': ({'lease_hostname__isw': 'fo-'}, {'10.61.0.7'}),
+            'dns name is': ({'dns_name': 'res.example.com'}, {'10.60.0.5'}),
+            'dns name is not': ({'dns_name__n': 'res.example.com'}, {'10.60.0.6', '10.61.0.7', '10.99.0.1'}),
+            'dns name contains': ({'dns_name__ic': 'res.'}, {'10.60.0.5'}),
+            'dns name ends with': ({'dns_name__iew': 'pc.example.com'}, {'10.60.0.6'}),
+            'description': ({'description': 'print'}, {'10.60.0.5'}),
+            'client id': ({'client_id': 'EE-01'}, {'10.60.0.5'}),
+            'tag': ({'tag': 'keep'}, {'10.60.0.5'}),
+            'vrf': ({'vrf_id': self.vrf.pk}, {'10.99.0.1'}),
+            'vrf is not': ({'vrf_id__n': self.vrf.pk}, {'10.60.0.5', '10.60.0.6', '10.61.0.7'}),
+            'vrf global': ({'vrf_id': 'null'}, {'10.60.0.5', '10.60.0.6', '10.61.0.7'}),
+            'tenant': ({'tenant_id': self.tenant.pk}, {'10.99.0.1'}),
+            'tenant none': ({'tenant_id': 'null'}, {'10.60.0.5', '10.60.0.6', '10.61.0.7'}),
+            'search hostname': ({'q': 'stray'}, {'10.99.0.1'}),
+            'search scope name': ({'q': 'Scope FO'}, {'10.61.0.7'}),
+            'expiration after': ({'expiration_after': (now + timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S')},
+                                 {'10.60.0.6'}),
+            'expiration before': ({'expiration_before': (now + timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S')},
+                                  set()),
+            'state since after': ({'state_changed_after': (now - timedelta(days=10)).strftime('%Y-%m-%d %H:%M:%S')},
+                                  {'10.60.0.6', '10.61.0.7'}),
+            'state since before': ({'state_changed_before': (now - timedelta(days=10)).strftime('%Y-%m-%d %H:%M:%S')},
+                                   {'10.60.0.5'}),
+        }
+        for name, (params, expected) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(self.rows(**params), expected)
+
+    def test_filter_form_lists_statuses_and_offers_modifiers(self):
+        response = self.client.get(self.url)
+        content = response.content.decode()
+        for status in ('reserved', 'dhcp'):
+            with self.subTest(status=status):
+                self.assertIn(f'value="{status}"', content)
+        for field in ('lease_hostname', 'dns_name', 'server_id', 'failover_id', 'vrf_id', 'tenant_id'):
+            with self.subTest(modifiers=field):
+                self.assertIn(f'data-field="{field}"', content)   # the is / is not / contains dropdown
+        self.assertNotIn('name="address"', content)
+
+    def test_window_filter_combines_after_and_before(self):
+        now = timezone.now()
+        window = {
+            'state_changed_after': (now - timedelta(days=40)).strftime('%Y-%m-%d %H:%M:%S'),
+            'state_changed_before': (now - timedelta(days=10)).strftime('%Y-%m-%d %H:%M:%S'),
+        }
+        self.assertEqual(self.rows(**window), {'10.60.0.5'})
+
+    def test_scope_is_the_one_whose_prefix_and_vrf_hold_the_ip(self):
+        vrf = VRF.objects.create(name='Other')
+        in_vrf = IPAddress.objects.create(address='10.60.0.8/24', vrf=vrf, status='dhcp')
+        DHCPLeaseInfo.objects.create(ip_address=in_vrf, active=True)
+        narrow = make_scope(
+            name='Narrow', prefix=make_prefix('10.60.0.4/31'), server=make_server(name='Srv N', hostname='n.example.com'),
+            start_ip='10.60.0.4', end_ip='10.60.0.5',
+        )
+        response = self.client.get(self.url)
+        names = dict(DHCPScope.objects.values_list('pk', 'name'))
+        scopes = {
+            str(row.record.ip_address.address.ip): names.get(row.record.scope_pk)
+            for row in response.context['table'].rows
+        }
+        self.assertEqual(scopes['10.60.0.5'], 'Narrow')   # nested scopes: the narrowest wins
+        self.assertEqual(scopes['10.60.0.6'], 'Scope A')
+        self.assertIsNone(scopes['10.60.0.8'])            # another VRF: not this scope's IP
+        self.assertIsNone(scopes['10.99.0.1'])            # no scope at all
+        self.assertEqual(narrow.name, 'Narrow')
+
+    def test_list_sorts_by_scope_name(self):
+        for direction in ('', '-'):
+            with self.subTest(direction=direction):
+                response = self.client.get(self.url, {'sort': f'{direction}scope'})
+                self.assertEqual(response.status_code, 200)
+                names = [
+                    DHCPScope.objects.get(pk=row.record.scope_pk).name
+                    for row in response.context['table'].rows if row.record.scope_pk
+                ]
+                self.assertEqual(names, sorted(names, reverse=bool(direction)))
+                self.assertGreater(len(set(names)), 1)
+
+    def test_every_column_renders_and_the_table_exports(self):
+        from ..tables import DHCPLeaseTable
+        from ..utils import with_scope
+
+        table = DHCPLeaseTable(with_scope(DHCPLeaseInfo.objects.all()))
+        for name in DHCPLeaseTable.Meta.fields:
+            table.columns.show(name)
+        for row in table.rows:
+            for name in DHCPLeaseTable.Meta.fields:
+                with self.subTest(column=name):
+                    self.assertIsNotNone(row.get_cell(name))
+
+        response = self.client.get(self.url, {'export': 'table'})
+        self.assertEqual(response.status_code, 200)
+        body = response.content.decode()
+        for ip in ('10.60.0.5', '10.60.0.6', '10.61.0.7', '10.99.0.1'):
+            self.assertIn(ip, body)
+
+    def test_sees_only_ips_the_user_may_view(self):
+        self.user.is_superuser = False
+        self.user.save()
+        self.assertEqual(self.rows(), set())
+        grant(self.user, IPAddress, ['view'], address__net_host='10.60.0.6')
+        self.assertEqual(self.rows(), {'10.60.0.6'})
+
+
+class ScopeTableColumnTests(TestCase):
+    """Every column of the Scopes list renders, including the ones that come from the prefix."""
+
+    def test_every_column_renders(self):
+        from dcim.models import Site
+        from tenancy.models import Tenant
+
+        from ..tables import DHCPScopeTable
+
+        site = Site.objects.create(name='Col Site', slug='col-site')
+        tenant = Tenant.objects.create(name='Col Tenant', slug='col-tenant')
+        make_scope(
+            name='With Prefix', prefix=make_prefix('10.70.0.0/24', tenant=tenant, scope=site),
+            server=make_server(name='Col Srv', hostname='col.example.com'),
+        )
+        make_unassigned_scope(
+            name='No Prefix', network='10.71.0.0', server=DHCPServer.objects.get(name='Col Srv'),
+            start_ip='10.71.0.10', end_ip='10.71.0.20',
+        )
+        table = DHCPScopeTable(DHCPScope.objects.select_related('prefix'))
+        for name in DHCPScopeTable.Meta.fields:
+            table.columns.show(name)
+        cells = {}
+        for row in table.rows:
+            for name in DHCPScopeTable.Meta.fields:
+                with self.subTest(scope=row.record.name, column=name):
+                    cells[(row.record.name, name)] = str(row.get_cell(name))
+        self.assertIn('Col Site', cells[('With Prefix', 'site')])
+        self.assertIn('Col Tenant', cells[('With Prefix', 'tenant')])
+        self.assertIn('Global', cells[('With Prefix', 'vrf')])
+        self.assertNotIn('Global', cells[('No Prefix', 'vrf')])

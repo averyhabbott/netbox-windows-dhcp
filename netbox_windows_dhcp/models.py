@@ -902,6 +902,16 @@ class DHCPLeaseInfo(models.Model):
         verbose_name='Lease Expiration',
         help_text='When this lease expires. Null for reservations (they do not expire).',
     )
+    state_changed = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name='Active/Inactive Since',
+        help_text=(
+            'When the current state began: set when the row is first recorded, and reset '
+            'whenever Active flips or the IP\'s DHCP client ID changes (whether the sync '
+            'or someone in NetBox changed it). Precision is the sync interval.'
+        ),
+    )
 
     class Meta:
         verbose_name = 'DHCP Lease Info'

@@ -26,8 +26,13 @@ menu = PluginMenu(
             ),
         ),
         (
-            'Scopes',
+            'Scopes & Leases',
             (
+                PluginMenuItem(
+                    link='plugins:netbox_windows_dhcp:dhcpleaseinfo_list',
+                    link_text='Leases',
+                    permissions=['ipam.view_ipaddress'],
+                ),
                 PluginMenuItem(
                     link='plugins:netbox_windows_dhcp:dhcpscope_list',
                     link_text='Scopes',

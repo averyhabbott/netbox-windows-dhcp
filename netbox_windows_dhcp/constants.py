@@ -1,4 +1,4 @@
-PSU_SCRIPT_VERSION = '2.0.0'
+PSU_SCRIPT_VERSION = '2.0.1'
 
 # Lowest PSU script version that has the reservation update/delete-by-scope-and-IP
 # endpoints. Servers running an older script get create-only reservation pushes.

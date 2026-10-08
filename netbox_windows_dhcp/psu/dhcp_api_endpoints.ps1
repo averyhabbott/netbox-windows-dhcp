@@ -63,7 +63,7 @@ if ($PSVersionTable.PSEdition -eq 'Core') {
     Import-Module DhcpServer -ErrorAction Stop
 }
 
-$PSU_SCRIPT_VERSION = '2.0.0'
+$PSU_SCRIPT_VERSION = '2.0.1'
 
 function ConvertTo-ScopeObject {
     param([Microsoft.Management.Infrastructure.CimInstance]$Scope)
@@ -151,8 +151,78 @@ function ConvertTo-ExclusionRangeObject {
     }
 }
 
+function Get-ErrorCodes {
+    # " code=<native> hresult=<hex>" for an error that carries them (e.g. a CIM/WMI failure), else ''.
+    param($ErrorRecord)
+    $e = if ($ErrorRecord) { $ErrorRecord.Exception } else { $null }
+    $out = ''
+    if ($e -and $e.PSObject.Properties['NativeErrorCode']) { $out += " code=$($e.NativeErrorCode)" }
+    if ($e -and $e.HResult) { $out += (' hresult=0x{0:X8}' -f [int]$e.HResult) }
+    $out
+}
+
+function Write-DhcpLog {
+    # One line in Platform > Logging, as [Level] [DHCP-<resource>] step=... scope=... ip=... <detail>.
+    # $LogResource is set at the top of each endpoint ('/api/dhcp/<path>:<METHOD>'). Logging
+    # never throws: it must not break a request. If the log call fails, Write-Host says so.
+    # Never pass tokens or request bodies in $Detail.
+    param(
+        [ValidateSet('Error', 'Warning', 'Information', 'Debug')][string]$Level,
+        [string]$Step,
+        [string]$ScopeId,
+        [string]$IPAddress,
+        [string]$Detail
+    )
+    try {
+        $parts = @("step=$Step")
+        if ($ScopeId)   { $parts += "scope=$ScopeId" }
+        if ($IPAddress) { $parts += "ip=$IPAddress" }
+        if ($Detail)    { $parts += ($Detail -replace '\s+', ' ').Trim() }
+        $params = @{
+            Level   = $Level
+            Feature = 'DHCP'
+            Message = $parts -join ' '
+        }
+        $params['Resource'] = if ($LogResource) { $LogResource } else { '/api/dhcp' }
+        Write-PSULog @params | Out-Null
+    }
+    catch {
+        # The log call itself failed. Say so in the endpoint's live log rather than nowhere.
+        try { Write-Host "Write-DhcpLog failed ($Level $Step): $($_.Exception.Message)" } catch { }
+    }
+}
+
+function Get-ErrorCause {
+    # " cause=<real message>" when the error record's message differs from the one we report
+    # (e.g. a WMI failure reported as 'Scope not found.'), else ''.
+    param($ErrorRecord, [string]$Message)
+    $m = if ($ErrorRecord -and $ErrorRecord.Exception) { ($ErrorRecord.Exception.Message -replace '\s+', ' ').Trim() } else { '' }
+    $reported = ($Message -replace '\s+', ' ').Trim()
+    if ($m -and $m -ne $reported) { " cause=$m" } else { '' }
+}
+
+function Write-DhcpStepResult {
+    # For a step run with -ErrorAction SilentlyContinue -ErrorVariable: log a failure that would
+    # otherwise vanish. The response is unchanged (the step stays best-effort).
+    param([string]$Step, [string]$ScopeId, $StepError)
+    if ($StepError) {
+        Write-DhcpLog -Level Warning -Step $Step -ScopeId $ScopeId -Detail "error=$(@($StepError)[0].Exception.Message)$(Get-ErrorCodes @($StepError)[0])"
+    }
+}
+
+function Write-DhcpTiming {
+    # Debug line for a bulk read: how many scopes and items it covered and how long it took.
+    param([string]$Step, $Stopwatch, $Scopes, $Items)
+    Write-DhcpLog -Level Debug -Step $Step -Detail "scopes=$Scopes items=$Items ms=$([int]$Stopwatch.ElapsedMilliseconds)"
+}
+
 function Write-ApiError {
-    param([string]$Message, [int]$StatusCode = 500)
+    param([string]$Message, [int]$StatusCode = 500, $ErrorRecord)
+    # Every error response passes through here, so this is where failures get logged:
+    # 5xx are Error, 4xx (bad input, not found) are Warning.
+    $level = if ($StatusCode -ge 500) { 'Error' } else { 'Warning' }
+    Write-DhcpLog -Level $level -Step 'request' -ScopeId ([string]$scope_id) `
+        -Detail "status=$StatusCode error=$Message$(Get-ErrorCause $ErrorRecord $Message)$(Get-ErrorCodes $ErrorRecord)"
     New-PSUApiResponse -StatusCode $StatusCode `
         -Body (@{ error = $Message } | ConvertTo-Json -Compress) `
         -ContentType 'application/json'
@@ -230,13 +300,19 @@ function Test-ReservationItem {
 }
 
 function New-BatchResult {
-    param($Item, [string]$Status, [string]$Message)
+    param($Item, [string]$Status, [string]$Message, $ErrorRecord)
     $result = [ordered]@{
         scope_id   = [string]$Item.scope_id
         ip_address = [string]$Item.ip_address
         status     = $Status
     }
     if ($Message) { $result['error'] = $Message }
+    # A failed or skipped item is still a 200 for the whole batch, so log it here.
+    if ($Status -ne 'ok') {
+        $level = if ($Status -eq 'error') { 'Error' } else { 'Warning' }
+        Write-DhcpLog -Level $level -Step 'batch-item' -ScopeId $result.scope_id -IPAddress $result.ip_address `
+            -Detail "status=$Status error=$Message$(Get-ErrorCause $ErrorRecord $Message)$(Get-ErrorCodes $ErrorRecord)"
+    }
     $result
 }
 
@@ -252,6 +328,7 @@ function Get-ScopeReservations {
         }
         catch [Microsoft.Management.Infrastructure.CimException] {
             $entry.Error = "Scope $ScopeId not found."
+            $entry.ErrorRecord = $_
         }
         $Cache[$ScopeId] = $entry
     }
@@ -262,7 +339,50 @@ function Get-ReservationAt {
     # The reservation at this IP, or $null when there isn't one.
     param([string]$IPAddress)
     try { Get-DhcpServerv4Reservation -IPAddress $IPAddress -ErrorAction Stop }
-    catch { $null }
+    catch {
+        # Most often "no reservation here", but a WMI failure looks the same: leave a trace.
+        Write-DhcpLog -Level Warning -Step 'read-reservation' -IPAddress $IPAddress -Detail "error=$($_.Exception.Message)$(Get-ErrorCodes $_)"
+        $null
+    }
+}
+
+function Get-LeaseAt {
+    # The lease at this IP, or $null when there isn't one (the normal case for a new reservation).
+    # A failed read looks the same, so it leaves a Debug line: the create goes ahead either way.
+    # -ScopeId and -IPAddress can't be combined on this cmdlet (ambiguous parameter set), so
+    # the lookup is by IP alone.
+    param([string]$ScopeId, [string]$IPAddress)
+    try { Get-DhcpServerv4Lease -IPAddress $IPAddress -ErrorAction Stop }
+    catch {
+        Write-DhcpLog -Level Debug -Step 'read-lease' -ScopeId $ScopeId -IPAddress $IPAddress -Detail "error=$($_.Exception.Message)$(Get-ErrorCodes $_)"
+        $null
+    }
+}
+
+function Set-LeaseActiveReservation {
+    # Like the DHCP snap-in's "Add to Reservation": when the IP had an active lease held by this
+    # client, mark the lease ActiveReservation. Add-DhcpServerv4Reservation alone leaves it
+    # InactiveReservation. Only ever adds: removing the lease record would drop the device's lease.
+    # No LeaseExpiryTime (Windows ignores it for a reservation). Best-effort: the reservation
+    # already exists, so a failure here is a Warning, not an error.
+    param($Lease, [string]$ScopeId, [string]$IPAddress, [string]$ClientId)
+    if (-not $Lease -or [string]$Lease.AddressState -ne 'Active') { return }
+    if ((ConvertTo-WindowsClientId ([string]$Lease.ClientId)) -ne $ClientId) { return }
+    try {
+        $leaseParams = @{
+            ScopeId      = $ScopeId
+            IPAddress    = $IPAddress
+            ClientId     = $ClientId
+            AddressState = 'ActiveReservation'
+            ErrorAction  = 'Stop'
+        }
+        if ($Lease.HostName) { $leaseParams['HostName'] = $Lease.HostName }
+        Add-DhcpServerv4Lease @leaseParams -WarningAction SilentlyContinue | Out-Null
+        Write-DhcpLog -Level Information -Step 'activate-reservation' -ScopeId $ScopeId -IPAddress $IPAddress
+    }
+    catch {
+        Write-DhcpLog -Level Warning -Step 'activate-reservation' -ScopeId $ScopeId -IPAddress $IPAddress -Detail "error=$($_.Exception.Message)$(Get-ErrorCodes $_)"
+    }
 }
 
 function Add-BatchReservationDetails {
@@ -298,6 +418,7 @@ function Write-BatchResults {
 # detect PSU script version mismatches. Accessible to DHCPReader + DHCPWriter.
 # ---------------------------------------------------------------------------
 New-PSUEndpoint -Url '/api/dhcp/health' -Method GET @_epRead -Endpoint ([scriptblock]::Create($H + {
+    $LogResource = '/api/dhcp/health:GET'
     New-PSUApiResponse -StatusCode 200 `
         -Body (@{ status = 'ok'; version = $PSU_SCRIPT_VERSION } | ConvertTo-Json -Compress) `
         -ContentType 'application/json'
@@ -309,6 +430,7 @@ New-PSUEndpoint -Url '/api/dhcp/health' -Method GET @_epRead -Endpoint ([scriptb
 # configured token has write (DHCPWriter) permissions. DHCPWriter role only.
 # ---------------------------------------------------------------------------
 New-PSUEndpoint -Url '/api/dhcp/health' -Method POST @_epWrite -Endpoint ([scriptblock]::Create($H + {
+    $LogResource = '/api/dhcp/health:POST'
     New-PSUApiResponse -StatusCode 200 `
         -Body (@{ status = 'ok' } | ConvertTo-Json -Compress) `
         -ContentType 'application/json'
@@ -327,6 +449,8 @@ New-PSUEndpoint -Url '/api/dhcp/health' -Method POST @_epWrite -Endpoint ([scrip
 # rather than failing the whole response.
 # ---------------------------------------------------------------------------
 New-PSUEndpoint -Url '/api/dhcp/metrics' -Method GET @_epRead -Endpoint ([scriptblock]::Create($H + {
+    $LogResource = '/api/dhcp/metrics:GET'
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
     try {
         $now = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
 
@@ -339,7 +463,7 @@ New-PSUEndpoint -Url '/api/dhcp/metrics' -Method GET @_epRead -Endpoint ([script
                 if ($sc.State -eq 'Active') { $activeCount++ }
             }
         } catch {
-            Write-Verbose "Could not enumerate scopes: $_"
+            Write-DhcpLog -Level Error -Step 'metrics-enumerate-scopes' -Detail "error=$($_.Exception.Message)$(Get-ErrorCodes $_)"
         }
 
         # --- Server statistics -------------------------------------------------
@@ -369,7 +493,7 @@ New-PSUEndpoint -Url '/api/dhcp/metrics' -Method GET @_epRead -Endpoint ([script
                 }
             }
         } catch {
-            Write-Verbose "Could not read server statistics: $_"
+            Write-DhcpLog -Level Error -Step 'metrics-read-server-statistics' -Detail "error=$($_.Exception.Message)$(Get-ErrorCodes $_)"
         }
 
         # --- Per-scope utilization --------------------------------------------
@@ -394,7 +518,7 @@ New-PSUEndpoint -Url '/api/dhcp/metrics' -Method GET @_epRead -Endpoint ([script
             }
             $exclOk = $true
         } catch {
-            Write-Verbose "Could not read exclusion ranges: $_"
+            Write-DhcpLog -Level Error -Step 'metrics-read-exclusion-ranges' -Detail "error=$($_.Exception.Message)$(Get-ErrorCodes $_)"
         }
 
         $scopes = @()
@@ -429,7 +553,7 @@ New-PSUEndpoint -Url '/api/dhcp/metrics' -Method GET @_epRead -Endpoint ([script
                         }
                         $enumerated = $true
                     } catch {
-                        Write-Verbose "Could not enumerate leases for ${sid}: $_"
+                        Write-DhcpLog -Level Error -Step 'metrics-enumerate-leases' -ScopeId $sid -Detail "error=$($_.Exception.Message)$(Get-ErrorCodes $_)"
                     }
                 }
                 # Scopes not enumerated above still need a (server-side filtered)
@@ -438,7 +562,7 @@ New-PSUEndpoint -Url '/api/dhcp/metrics' -Method GET @_epRead -Endpoint ([script
                     try {
                         $badCount = @(Get-DhcpServerv4Lease -ScopeId $sid -BadLeases -ErrorAction Stop).Count
                     } catch {
-                        Write-Verbose "Could not read bad leases for ${sid}: $_"
+                        Write-DhcpLog -Level Error -Step 'metrics-read-bad-leases' -ScopeId $sid -Detail "error=$($_.Exception.Message)$(Get-ErrorCodes $_)"
                     }
                 }
 
@@ -458,7 +582,7 @@ New-PSUEndpoint -Url '/api/dhcp/metrics' -Method GET @_epRead -Endpoint ([script
                 }
             }
         } catch {
-            Write-Verbose "Could not read scope statistics: $_"
+            Write-DhcpLog -Level Error -Step 'metrics-read-scope-statistics' -Detail "error=$($_.Exception.Message)$(Get-ErrorCodes $_)"
         }
 
         # --- Failover relationships -------------------------------------------
@@ -479,7 +603,7 @@ New-PSUEndpoint -Url '/api/dhcp/metrics' -Method GET @_epRead -Endpoint ([script
                 }
             }
         } catch {
-            Write-Verbose "Could not read failover relationships: $_"
+            Write-DhcpLog -Level Error -Step 'metrics-read-failover-relationships' -Detail "error=$($_.Exception.Message)$(Get-ErrorCodes $_)"
         }
 
         # --- Database / backup health -----------------------------------------
@@ -492,7 +616,7 @@ New-PSUEndpoint -Url '/api/dhcp/metrics' -Method GET @_epRead -Endpoint ([script
                 cleanup_interval_minutes = [int]$db.CleanupInterval.TotalMinutes
             }
         } catch {
-            Write-Verbose "Could not read database settings: $_"
+            Write-DhcpLog -Level Error -Step 'metrics-read-database-settings' -Detail "error=$($_.Exception.Message)$(Get-ErrorCodes $_)"
         }
 
         $payload = [ordered]@{
@@ -504,12 +628,14 @@ New-PSUEndpoint -Url '/api/dhcp/metrics' -Method GET @_epRead -Endpoint ([script
             database       = $database
         }
 
+        Write-DhcpTiming 'metrics' $sw @($scopeInfo.Keys).Count @($scopes).Count
+
         New-PSUApiResponse -StatusCode 200 `
             -Body ($payload | ConvertTo-Json -Depth 5 -Compress) `
             -ContentType 'application/json'
     }
     catch {
-        Write-ApiError -Message $_.Exception.Message -StatusCode 500
+        Write-ApiError -Message $_.Exception.Message -StatusCode 500 -ErrorRecord $_
     }
 }.ToString()))
 
@@ -530,6 +656,8 @@ New-PSUEndpoint -Url '/api/dhcp/metrics' -Method GET @_epRead -Endpoint ([script
 # error is never mistaken for "no failover" or "no router".
 # ---------------------------------------------------------------------------
 New-PSUEndpoint -Url '/api/dhcp/scopes' -Method GET @_epRead -Endpoint ([scriptblock]::Create($H + {
+    $LogResource = '/api/dhcp/scopes:GET'
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
     try {
         $scopes = Get-DhcpServerv4Scope -ErrorAction Stop
         if ($active_only -eq 'true') {
@@ -567,10 +695,11 @@ New-PSUEndpoint -Url '/api/dhcp/scopes' -Method GET @_epRead -Endpoint ([scriptb
                 $obj
             }
         )
+        Write-DhcpTiming 'list-scopes' $sw @($scopes).Count @($result).Count
         ConvertTo-Json -InputObject $result -Depth 4 -Compress
     }
     catch {
-        Write-ApiError -Message $_.Exception.Message -StatusCode 500
+        Write-ApiError -Message $_.Exception.Message -StatusCode 500 -ErrorRecord $_
     }
 }.ToString()))
 
@@ -580,16 +709,17 @@ New-PSUEndpoint -Url '/api/dhcp/scopes' -Method GET @_epRead -Endpoint ([scriptb
 # Returns a single scope by its network address (e.g. "10.0.1.0").
 # ---------------------------------------------------------------------------
 New-PSUEndpoint -Url '/api/dhcp/scopes/:scope_id' -Method GET @_epRead -Endpoint ([scriptblock]::Create($H + {
+    $LogResource = '/api/dhcp/scopes/:scope_id:GET'
     if (-not (Test-IPv4 $scope_id)) { Write-InvalidIPv4 'scope_id'; return }
     try {
         $scope = Get-DhcpServerv4Scope -ScopeId $scope_id -ErrorAction Stop
         ConvertTo-ScopeObject $scope | ConvertTo-Json -Depth 4 -Compress
     }
     catch [Microsoft.Management.Infrastructure.CimException] {
-        Write-ApiError -Message 'Scope not found.' -StatusCode 404
+        Write-ApiError -Message 'Scope not found.' -StatusCode 404 -ErrorRecord $_
     }
     catch {
-        Write-ApiError -Message $_.Exception.Message -StatusCode 500
+        Write-ApiError -Message $_.Exception.Message -StatusCode 500 -ErrorRecord $_
     }
 }.ToString()))
 
@@ -617,13 +747,12 @@ New-PSUEndpoint -Url '/api/dhcp/scopes/:scope_id' -Method GET @_epRead -Endpoint
 #   }
 # ---------------------------------------------------------------------------
 New-PSUEndpoint -Url '/api/dhcp/scopes' -Method POST @_epWrite -Endpoint ([scriptblock]::Create($H + {
+    $LogResource = '/api/dhcp/scopes:POST'
     try {
         $body = $Body | ConvertFrom-Json
 
         if (-not $body.scope_id -or -not $body.start_ip -or -not $body.end_ip -or -not $body.subnet_mask) {
-            New-PSUApiResponse -StatusCode 400 `
-                -Body (@{ error = 'scope_id, start_ip, end_ip, and subnet_mask are required.' } | ConvertTo-Json -Compress) `
-                -ContentType 'application/json'
+            Write-ApiError -Message 'scope_id, start_ip, end_ip, and subnet_mask are required.' -StatusCode 400
             return
         }
         if (-not (Test-IPv4 $body.scope_id))   { Write-InvalidIPv4 'scope_id'; return }
@@ -648,19 +777,22 @@ New-PSUEndpoint -Url '/api/dhcp/scopes' -Method POST @_epWrite -Endpoint ([scrip
         if ($state) { $addParams['State'] = $state }
 
         Add-DhcpServerv4Scope @addParams
+        Write-DhcpLog -Level Information -Step 'add-scope' -ScopeId $body.scope_id
 
         # Set lease duration if provided
         if ($body.lease_duration_seconds -and $body.lease_duration_seconds -gt 0) {
             Set-DhcpServerv4Scope -ScopeId $body.scope_id `
                 -LeaseDuration ([TimeSpan]::FromSeconds([int]$body.lease_duration_seconds)) `
-                -ErrorAction SilentlyContinue
+                -ErrorAction SilentlyContinue -ErrorVariable stepErr
+            Write-DhcpStepResult 'set-lease-duration' $body.scope_id $stepErr
         }
 
         # Set router (Option 3) if provided
         if ($body.router) {
             Set-DhcpServerv4OptionValue -ScopeId $body.scope_id `
                 -OptionId 3 -Value @($body.router) `
-                -ErrorAction SilentlyContinue
+                -ErrorAction SilentlyContinue -ErrorVariable stepErr
+            Write-DhcpStepResult 'set-router' $body.scope_id $stepErr
         }
 
         # Set additional option values, if provided (excludes Option 3/51, which
@@ -673,7 +805,8 @@ New-PSUEndpoint -Url '/api/dhcp/scopes' -Method POST @_epWrite -Endpoint ([scrip
             foreach ($opt in $body.options.set) {
                 Set-DhcpServerv4OptionValue -ScopeId $body.scope_id `
                     -OptionId ([int]$opt.code) -Value @($opt.value) `
-                    -Force -ErrorAction SilentlyContinue
+                    -Force -ErrorAction SilentlyContinue -ErrorVariable stepErr
+                Write-DhcpStepResult "set-option-$([int]$opt.code)" $body.scope_id $stepErr
             }
         }
 
@@ -684,6 +817,7 @@ New-PSUEndpoint -Url '/api/dhcp/scopes' -Method POST @_epWrite -Endpoint ([scrip
         # for creating a brand new relationship (always requires -PartnerServer).
         if ($body.failover -and $body.failover.enroll) {
             Add-DhcpServerv4FailoverScope -ScopeId $body.scope_id -Name $body.failover.enroll -ErrorAction Stop
+            Write-DhcpLog -Level Information -Step 'enroll-failover' -ScopeId $body.scope_id -Detail "relationship=$($body.failover.enroll)"
         }
 
         $scope = Get-DhcpServerv4Scope -ScopeId $body.scope_id -ErrorAction Stop
@@ -692,7 +826,7 @@ New-PSUEndpoint -Url '/api/dhcp/scopes' -Method POST @_epWrite -Endpoint ([scrip
             -ContentType 'application/json'
     }
     catch {
-        Write-ApiError -Message $_.Exception.Message -StatusCode 500
+        Write-ApiError -Message $_.Exception.Message -StatusCode 500 -ErrorRecord $_
     }
 }.ToString()))
 
@@ -720,6 +854,7 @@ New-PSUEndpoint -Url '/api/dhcp/scopes' -Method POST @_epWrite -Endpoint ([scrip
 #   }
 # ---------------------------------------------------------------------------
 New-PSUEndpoint -Url '/api/dhcp/scopes/:scope_id' -Method PUT @_epWrite -Endpoint ([scriptblock]::Create($H + {
+    $LogResource = '/api/dhcp/scopes/:scope_id:PUT'
     if (-not (Test-IPv4 $scope_id)) { Write-InvalidIPv4 'scope_id'; return }
 
     # Verify scope exists first. This check gets its own try/catch — kept separate
@@ -730,7 +865,7 @@ New-PSUEndpoint -Url '/api/dhcp/scopes/:scope_id' -Method PUT @_epWrite -Endpoin
         $null = Get-DhcpServerv4Scope -ScopeId $scope_id -ErrorAction Stop
     }
     catch [Microsoft.Management.Infrastructure.CimException] {
-        Write-ApiError -Message 'Scope not found.' -StatusCode 404
+        Write-ApiError -Message 'Scope not found.' -StatusCode 404 -ErrorRecord $_
         return
     }
 
@@ -765,6 +900,8 @@ New-PSUEndpoint -Url '/api/dhcp/scopes/:scope_id' -Method PUT @_epWrite -Endpoin
         # router/failover instructions and no scope-attribute changes.
         if ($hasScopeChanges) {
             Set-DhcpServerv4Scope @setParams
+            Write-DhcpLog -Level Information -Step 'update-scope' -ScopeId $scope_id `
+                -Detail "fields=$(($setParams.Keys | Where-Object { $_ -notin 'ScopeId', 'ErrorAction' } | Sort-Object) -join ',')"
         }
 
         # Update router (Option 3) if provided
@@ -772,11 +909,13 @@ New-PSUEndpoint -Url '/api/dhcp/scopes/:scope_id' -Method PUT @_epWrite -Endpoin
             if ($body.router) {
                 Set-DhcpServerv4OptionValue -ScopeId $scope_id `
                     -OptionId 3 -Value @($body.router) `
-                    -ErrorAction SilentlyContinue
+                    -ErrorAction SilentlyContinue -ErrorVariable stepErr
+                Write-DhcpStepResult 'set-router' $scope_id $stepErr
             }
             else {
                 Remove-DhcpServerv4OptionValue -ScopeId $scope_id `
-                    -OptionId 3 -ErrorAction SilentlyContinue
+                    -OptionId 3 -ErrorAction SilentlyContinue -ErrorVariable stepErr
+                Write-DhcpStepResult 'remove-router' $scope_id $stepErr
             }
         }
 
@@ -790,11 +929,13 @@ New-PSUEndpoint -Url '/api/dhcp/scopes/:scope_id' -Method PUT @_epWrite -Endpoin
             foreach ($opt in $body.options.set) {
                 Set-DhcpServerv4OptionValue -ScopeId $scope_id `
                     -OptionId ([int]$opt.code) -Value @($opt.value) `
-                    -Force -ErrorAction SilentlyContinue
+                    -Force -ErrorAction SilentlyContinue -ErrorVariable stepErr
+                Write-DhcpStepResult "set-option-$([int]$opt.code)" $scope_id $stepErr
             }
             foreach ($code in $body.options.remove) {
                 Remove-DhcpServerv4OptionValue -ScopeId $scope_id `
-                    -OptionId ([int]$code) -ErrorAction SilentlyContinue
+                    -OptionId ([int]$code) -ErrorAction SilentlyContinue -ErrorVariable stepErr
+                Write-DhcpStepResult "remove-option-$([int]$code)" $scope_id $stepErr
             }
         }
 
@@ -810,9 +951,11 @@ New-PSUEndpoint -Url '/api/dhcp/scopes/:scope_id' -Method PUT @_epWrite -Endpoin
                 # requires Remove-DhcpServerv4FailoverScope, which also deletes the
                 # scope from the partner server as part of deconfiguring it.
                 Remove-DhcpServerv4FailoverScope -Name $body.failover.remove -ScopeId $scope_id -Force -ErrorAction Stop
+                Write-DhcpLog -Level Information -Step 'remove-failover' -ScopeId $scope_id -Detail "relationship=$($body.failover.remove)"
             }
             if ($body.failover.enroll) {
                 Add-DhcpServerv4FailoverScope -ScopeId $scope_id -Name $body.failover.enroll -ErrorAction Stop
+                Write-DhcpLog -Level Information -Step 'enroll-failover' -ScopeId $scope_id -Detail "relationship=$($body.failover.enroll)"
             }
         }
 
@@ -820,7 +963,7 @@ New-PSUEndpoint -Url '/api/dhcp/scopes/:scope_id' -Method PUT @_epWrite -Endpoin
         ConvertTo-ScopeObject $scope | ConvertTo-Json -Depth 4 -Compress
     }
     catch {
-        Write-ApiError -Message $_.Exception.Message -StatusCode 500
+        Write-ApiError -Message $_.Exception.Message -StatusCode 500 -ErrorRecord $_
     }
 }.ToString()))
 
@@ -830,16 +973,18 @@ New-PSUEndpoint -Url '/api/dhcp/scopes/:scope_id' -Method PUT @_epWrite -Endpoin
 # Deletes a DHCP scope. Returns 204 No Content.
 # ---------------------------------------------------------------------------
 New-PSUEndpoint -Url '/api/dhcp/scopes/:scope_id' -Method DELETE @_epWrite -Endpoint ([scriptblock]::Create($H + {
+    $LogResource = '/api/dhcp/scopes/:scope_id:DELETE'
     if (-not (Test-IPv4 $scope_id)) { Write-InvalidIPv4 'scope_id'; return }
     try {
         Remove-DhcpServerv4Scope -ScopeId $scope_id -Force -ErrorAction Stop
+        Write-DhcpLog -Level Information -Step 'delete-scope' -ScopeId $scope_id
         New-PSUApiResponse -StatusCode 204
     }
     catch [Microsoft.Management.Infrastructure.CimException] {
-        Write-ApiError -Message 'Scope not found.' -StatusCode 404
+        Write-ApiError -Message 'Scope not found.' -StatusCode 404 -ErrorRecord $_
     }
     catch {
-        Write-ApiError -Message $_.Exception.Message -StatusCode 500
+        Write-ApiError -Message $_.Exception.Message -StatusCode 500 -ErrorRecord $_
     }
 }.ToString()))
 
@@ -854,6 +999,8 @@ New-PSUEndpoint -Url '/api/dhcp/scopes/:scope_id' -Method DELETE @_epWrite -Endp
 # Filters to Active and ActiveReservation address states only.
 # ---------------------------------------------------------------------------
 New-PSUEndpoint -Url '/api/dhcp/leases' -Method GET @_epRead -Endpoint ([scriptblock]::Create($H + {
+    $LogResource = '/api/dhcp/leases:GET'
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
     try {
         # $scope_id comes from the query string automatically in PSU
         if ($scope_id -and -not (Test-IPv4 $scope_id)) { Write-InvalidIPv4 'scope_id'; return }
@@ -886,10 +1033,12 @@ New-PSUEndpoint -Url '/api/dhcp/leases' -Method GET @_epRead -Endpoint ([scriptb
                 }
             }
         }
+        $items = if ($format -eq 'grouped') { ($result.Values | ForEach-Object { @($_).Count } | Measure-Object -Sum).Sum } else { @($result).Count }
+        Write-DhcpTiming 'list-leases' $sw @($targetScopes).Count $items
         ConvertTo-Json -InputObject $result -Depth 4 -Compress
     }
     catch {
-        Write-ApiError -Message $_.Exception.Message -StatusCode 500
+        Write-ApiError -Message $_.Exception.Message -StatusCode 500 -ErrorRecord $_
     }
 }.ToString()))
 
@@ -903,6 +1052,8 @@ New-PSUEndpoint -Url '/api/dhcp/leases' -Method GET @_epRead -Endpoint ([scriptb
 # Returns DHCP reservations.  scope_id query parameter is optional.
 # ---------------------------------------------------------------------------
 New-PSUEndpoint -Url '/api/dhcp/reservations' -Method GET @_epRead -Endpoint ([scriptblock]::Create($H + {
+    $LogResource = '/api/dhcp/reservations:GET'
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
     try {
         if ($scope_id -and -not (Test-IPv4 $scope_id)) { Write-InvalidIPv4 'scope_id'; return }
         $targetScopes = if ($scope_id) {
@@ -932,10 +1083,12 @@ New-PSUEndpoint -Url '/api/dhcp/reservations' -Method GET @_epRead -Endpoint ([s
                 }
             }
         }
+        $items = if ($format -eq 'grouped') { ($result.Values | ForEach-Object { @($_).Count } | Measure-Object -Sum).Sum } else { @($result).Count }
+        Write-DhcpTiming 'list-reservations' $sw @($targetScopes).Count $items
         ConvertTo-Json -InputObject $result -Depth 4 -Compress
     }
     catch {
-        Write-ApiError -Message $_.Exception.Message -StatusCode 500
+        Write-ApiError -Message $_.Exception.Message -StatusCode 500 -ErrorRecord $_
     }
 }.ToString()))
 
@@ -960,6 +1113,7 @@ New-PSUEndpoint -Url '/api/dhcp/reservations' -Method GET @_epRead -Endpoint ([s
 #                    "error"?, "reservation"? }, ... ] }
 # ---------------------------------------------------------------------------
 New-PSUEndpoint -Url '/api/dhcp/reservations' -Method POST @_epWrite -Endpoint ([scriptblock]::Create($H + {
+    $LogResource = '/api/dhcp/reservations:POST'
     try {
         if ($Body -and $Body.TrimStart().StartsWith('[')) {
             $batch = Read-BatchBody $Body
@@ -980,11 +1134,14 @@ New-PSUEndpoint -Url '/api/dhcp/reservations' -Method POST @_epWrite -Endpoint (
                     if ($item.name)        { $addParams['Name']        = $item.name }
                     if ($item.description) { $addParams['Description'] = $item.description }
                     if ($item.type)        { $addParams['Type']        = $item.type }
+                    $lease = Get-LeaseAt $item.scope_id $item.ip_address
                     Add-DhcpServerv4Reservation @addParams
+                    Write-DhcpLog -Level Information -Step 'add-reservation' -ScopeId $item.scope_id -IPAddress $item.ip_address
+                    Set-LeaseActiveReservation $lease $item.scope_id $item.ip_address $addParams.ClientId
                     $results.Add((New-BatchResult $item 'ok'))
                 }
                 catch {
-                    $results.Add((New-BatchResult $item 'error' $_.Exception.Message))
+                    $results.Add((New-BatchResult $item 'error' $_.Exception.Message -ErrorRecord $_))
                 }
             }
             Add-BatchReservationDetails $results
@@ -995,9 +1152,7 @@ New-PSUEndpoint -Url '/api/dhcp/reservations' -Method POST @_epWrite -Endpoint (
         $body = $Body | ConvertFrom-Json
 
         if (-not $body.scope_id -or -not $body.ip_address -or -not $body.client_id) {
-            New-PSUApiResponse -StatusCode 400 `
-                -Body (@{ error = 'scope_id, ip_address, and client_id are required.' } | ConvertTo-Json -Compress) `
-                -ContentType 'application/json'
+            Write-ApiError -Message 'scope_id, ip_address, and client_id are required.' -StatusCode 400
             return
         }
         if (-not (Test-IPv4 $body.scope_id))   { Write-InvalidIPv4 'scope_id'; return }
@@ -1015,7 +1170,10 @@ New-PSUEndpoint -Url '/api/dhcp/reservations' -Method POST @_epWrite -Endpoint (
         if ($body.description) { $addParams['Description'] = $body.description }
         if ($body.type)        { $addParams['Type']        = $body.type }
 
+        $lease = Get-LeaseAt $body.scope_id $body.ip_address
         Add-DhcpServerv4Reservation @addParams
+        Write-DhcpLog -Level Information -Step 'add-reservation' -ScopeId $body.scope_id -IPAddress $body.ip_address
+        Set-LeaseActiveReservation $lease $body.scope_id $body.ip_address $clientId
 
         $reservation = Get-DhcpServerv4Reservation -ScopeId $body.scope_id -ErrorAction Stop |
                        Where-Object { $_.IPAddress -eq $body.ip_address } |
@@ -1026,7 +1184,7 @@ New-PSUEndpoint -Url '/api/dhcp/reservations' -Method POST @_epWrite -Endpoint (
             -ContentType 'application/json'
     }
     catch {
-        Write-ApiError -Message $_.Exception.Message -StatusCode 500
+        Write-ApiError -Message $_.Exception.Message -StatusCode 500 -ErrorRecord $_
     }
 }.ToString()))
 
@@ -1051,6 +1209,7 @@ New-PSUEndpoint -Url '/api/dhcp/reservations' -Method POST @_epWrite -Endpoint (
 # doesn't exist). A body that isn't a JSON list is a 400.
 # ---------------------------------------------------------------------------
 New-PSUEndpoint -Url '/api/dhcp/reservations' -Method PUT @_epWrite -Endpoint ([scriptblock]::Create($H + {
+    $LogResource = '/api/dhcp/reservations:PUT'
     try {
         $batch = Read-BatchBody $Body
         if ($batch.Error) { Write-ApiError -Message $batch.Error -StatusCode 400; return }
@@ -1062,7 +1221,7 @@ New-PSUEndpoint -Url '/api/dhcp/reservations' -Method PUT @_epWrite -Endpoint ([
             if ($problem) { $results.Add((New-BatchResult $item 'error' $problem)); continue }
             try {
                 $entry = Get-ScopeReservations -Cache $cache -ScopeId $item.scope_id
-                if ($entry.Error) { $results.Add((New-BatchResult $item 'not_found' $entry.Error)); continue }
+                if ($entry.Error) { $results.Add((New-BatchResult $item 'not_found' $entry.Error -ErrorRecord $entry.ErrorRecord)); continue }
                 $ip = [System.Net.IPAddress]::Parse($item.ip_address).ToString()
                 $current = $entry.Map[$ip]
                 if (-not $current) {
@@ -1103,6 +1262,7 @@ New-PSUEndpoint -Url '/api/dhcp/reservations' -Method PUT @_epWrite -Endpoint ([
                         Set-DhcpServerv4Reservation @setParams
                     }
                     catch {
+                        $setError = $_
                         $message = $_.Exception.Message
                         if ($setParams.ContainsKey('ClientId') -and -not (Get-ReservationAt $ip)) {
                             # The failed ClientId change took the reservation with it: put the original back.
@@ -1117,30 +1277,34 @@ New-PSUEndpoint -Url '/api/dhcp/reservations' -Method PUT @_epWrite -Endpoint ([
                             if ($current.Description) { $restore['Description'] = [string]$current.Description }
                             try {
                                 Add-DhcpServerv4Reservation @restore
+                                Write-DhcpLog -Level Warning -Step 'restore-reservation' -ScopeId $item.scope_id -IPAddress $ip -Detail 'result=restored after a failed client_id change'
                                 $message += ' The original reservation was restored.'
                             }
                             catch {
                                 $entry.Map.Remove($ip)
+                                Write-DhcpLog -Level Error -Step 'restore-reservation' -ScopeId $item.scope_id -IPAddress $ip -Detail "result=NOT restored; the reservation is gone error=$($_.Exception.Message)$(Get-ErrorCodes $_)"
                                 $message += " The original reservation could not be restored: $($_.Exception.Message)"
                             }
                         }
-                        $results.Add((New-BatchResult $item 'error' $message))
+                        $results.Add((New-BatchResult $item 'error' $message -ErrorRecord $setError))
                         continue
                     }
+                    Write-DhcpLog -Level Information -Step 'update-reservation' -ScopeId $item.scope_id -IPAddress $ip `
+                        -Detail "fields=$(($setParams.Keys | Where-Object { $_ -notin 'IPAddress', 'ErrorAction' } | Sort-Object) -join ',')"
                     # Keep the scope's map current, so a later item in this batch sees the new ClientId.
                     $entry.Map[$ip] = Get-ReservationAt $ip
                 }
                 $results.Add((New-BatchResult $item 'ok'))
             }
             catch {
-                $results.Add((New-BatchResult $item 'error' $_.Exception.Message))
+                $results.Add((New-BatchResult $item 'error' $_.Exception.Message -ErrorRecord $_))
             }
         }
         Add-BatchReservationDetails $results
         Write-BatchResults $results
     }
     catch {
-        Write-ApiError -Message $_.Exception.Message -StatusCode 500
+        Write-ApiError -Message $_.Exception.Message -StatusCode 500 -ErrorRecord $_
     }
 }.ToString()))
 
@@ -1156,6 +1320,7 @@ New-PSUEndpoint -Url '/api/dhcp/reservations' -Method PUT @_epWrite -Endpoint ([
 # in the same shape as PUT. A body that isn't a JSON list is a 400.
 # ---------------------------------------------------------------------------
 New-PSUEndpoint -Url '/api/dhcp/reservations' -Method DELETE @_epWrite -Endpoint ([scriptblock]::Create($H + {
+    $LogResource = '/api/dhcp/reservations:DELETE'
     try {
         $batch = Read-BatchBody $Body
         if ($batch.Error) { Write-ApiError -Message $batch.Error -StatusCode 400; return }
@@ -1167,7 +1332,7 @@ New-PSUEndpoint -Url '/api/dhcp/reservations' -Method DELETE @_epWrite -Endpoint
             if ($problem) { $results.Add((New-BatchResult $item 'error' $problem)); continue }
             try {
                 $entry = Get-ScopeReservations -Cache $cache -ScopeId $item.scope_id
-                if ($entry.Error) { $results.Add((New-BatchResult $item 'not_found' $entry.Error)); continue }
+                if ($entry.Error) { $results.Add((New-BatchResult $item 'not_found' $entry.Error -ErrorRecord $entry.ErrorRecord)); continue }
                 $ip = [System.Net.IPAddress]::Parse($item.ip_address).ToString()
                 if (-not $entry.Map.ContainsKey($ip)) {
                     $results.Add((New-BatchResult $item 'not_found' "No reservation at $ip in scope $($item.scope_id)."))
@@ -1177,16 +1342,17 @@ New-PSUEndpoint -Url '/api/dhcp/reservations' -Method DELETE @_epWrite -Endpoint
                 # remove the reservation from whichever scope holds that IP.
                 Remove-DhcpServerv4Reservation -IPAddress $ip -Confirm:$false -ErrorAction Stop
                 $entry.Map.Remove($ip)
+                Write-DhcpLog -Level Information -Step 'delete-reservation' -ScopeId $item.scope_id -IPAddress $ip
                 $results.Add((New-BatchResult $item 'ok'))
             }
             catch {
-                $results.Add((New-BatchResult $item 'error' $_.Exception.Message))
+                $results.Add((New-BatchResult $item 'error' $_.Exception.Message -ErrorRecord $_))
             }
         }
         Write-BatchResults $results
     }
     catch {
-        Write-ApiError -Message $_.Exception.Message -StatusCode 500
+        Write-ApiError -Message $_.Exception.Message -StatusCode 500 -ErrorRecord $_
     }
 }.ToString()))
 
@@ -1200,6 +1366,7 @@ New-PSUEndpoint -Url '/api/dhcp/reservations' -Method DELETE @_epWrite -Endpoint
 # Returns all DHCP failover relationships configured on this server.
 # ---------------------------------------------------------------------------
 New-PSUEndpoint -Url '/api/dhcp/failover' -Method GET @_epRead -Endpoint ([scriptblock]::Create($H + {
+    $LogResource = '/api/dhcp/failover:GET'
     try {
         $failovers = Get-DhcpServerv4Failover -ErrorAction Stop
         $result = @(
@@ -1213,7 +1380,7 @@ New-PSUEndpoint -Url '/api/dhcp/failover' -Method GET @_epRead -Endpoint ([scrip
             '[]'
         }
         else {
-            Write-ApiError -Message $_.Exception.Message -StatusCode 500
+            Write-ApiError -Message $_.Exception.Message -StatusCode 500 -ErrorRecord $_
         }
     }
 }.ToString()))
@@ -1240,13 +1407,12 @@ New-PSUEndpoint -Url '/api/dhcp/failover' -Method GET @_epRead -Endpoint ([scrip
 #       must be reachable by name/IP from this host.
 # ---------------------------------------------------------------------------
 New-PSUEndpoint -Url '/api/dhcp/failover' -Method POST @_epWrite -Endpoint ([scriptblock]::Create($H + {
+    $LogResource = '/api/dhcp/failover:POST'
     try {
         $body = $Body | ConvertFrom-Json
 
         if (-not $body.name -or -not $body.secondary_server -or -not $body.scope_ids) {
-            New-PSUApiResponse -StatusCode 400 `
-                -Body (@{ error = 'name, secondary_server, and scope_ids are required.' } | ConvertTo-Json -Compress) `
-                -ContentType 'application/json'
+            Write-ApiError -Message 'name, secondary_server, and scope_ids are required.' -StatusCode 400
             return
         }
 
@@ -1270,6 +1436,7 @@ New-PSUEndpoint -Url '/api/dhcp/failover' -Method POST @_epWrite -Endpoint ([scr
             if ($body.shared_secret) { $addParams['SharedSecret'] = $body.shared_secret }
         }
         Add-DhcpServerv4Failover @addParams
+        Write-DhcpLog -Level Information -Step 'add-failover' -Detail "name=$($body.name) partner=$($body.secondary_server) scopes=$(@($body.scope_ids).Count)"
 
         $failover = Get-DhcpServerv4Failover -Name $body.name -ErrorAction Stop
         New-PSUApiResponse -StatusCode 201 `
@@ -1277,7 +1444,7 @@ New-PSUEndpoint -Url '/api/dhcp/failover' -Method POST @_epWrite -Endpoint ([scr
             -ContentType 'application/json'
     }
     catch {
-        Write-ApiError -Message $_.Exception.Message -StatusCode 500
+        Write-ApiError -Message $_.Exception.Message -StatusCode 500 -ErrorRecord $_
     }
 }.ToString()))
 
@@ -1294,13 +1461,12 @@ New-PSUEndpoint -Url '/api/dhcp/failover' -Method POST @_epWrite -Endpoint ([scr
 #   { "scope_ids": ["10.101.1.0", "10.101.2.0"] }
 # ---------------------------------------------------------------------------
 New-PSUEndpoint -Url '/api/dhcp/failover/replicate' -Method POST @_epWrite -Endpoint ([scriptblock]::Create($H + {
+    $LogResource = '/api/dhcp/failover/replicate:POST'
     try {
         $body = $Body | ConvertFrom-Json
 
         if (-not $body.scope_ids -or @($body.scope_ids).Count -eq 0) {
-            New-PSUApiResponse -StatusCode 400 `
-                -Body (@{ error = 'scope_ids is required and must be a non-empty array.' } | ConvertTo-Json -Compress) `
-                -ContentType 'application/json'
+            Write-ApiError -Message 'scope_ids is required and must be a non-empty array.' -StatusCode 400
             return
         }
         foreach ($sid in @($body.scope_ids)) {
@@ -1308,13 +1474,14 @@ New-PSUEndpoint -Url '/api/dhcp/failover/replicate' -Method POST @_epWrite -Endp
         }
 
         Invoke-DhcpServerv4FailoverReplication -ScopeId @($body.scope_ids) -Force -ErrorAction Stop
+        Write-DhcpLog -Level Information -Step 'replicate-failover' -Detail "scopes=$(@($body.scope_ids).Count)"
 
         New-PSUApiResponse -StatusCode 200 `
             -Body (@{ replicated = @($body.scope_ids) } | ConvertTo-Json -Compress) `
             -ContentType 'application/json'
     }
     catch {
-        Write-ApiError -Message $_.Exception.Message -StatusCode 500
+        Write-ApiError -Message $_.Exception.Message -StatusCode 500 -ErrorRecord $_
     }
 }.ToString()))
 
@@ -1334,6 +1501,8 @@ New-PSUEndpoint -Url '/api/dhcp/failover/replicate' -Method POST @_epWrite -Endp
 #   }
 # ---------------------------------------------------------------------------
 New-PSUEndpoint -Url '/api/dhcp/options' -Method GET @_epRead -Endpoint ([scriptblock]::Create($H + {
+    $LogResource = '/api/dhcp/options:GET'
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
     try {
         $scopes = Get-DhcpServerv4Scope -ErrorAction Stop
         $scopeOptions = [ordered]@{}
@@ -1344,6 +1513,7 @@ New-PSUEndpoint -Url '/api/dhcp/options' -Method GET @_epRead -Endpoint ([script
                 $options | ForEach-Object { ConvertTo-OptionValueObject $_ }
             )
         }
+        Write-DhcpTiming 'list-options' $sw @($scopes).Count (($scopeOptions.Values | ForEach-Object { @($_).Count } | Measure-Object -Sum).Sum)
         $result = [ordered]@{
             scope_options      = $scopeOptions
             server_options     = @()
@@ -1352,7 +1522,7 @@ New-PSUEndpoint -Url '/api/dhcp/options' -Method GET @_epRead -Endpoint ([script
         ConvertTo-Json -InputObject $result -Depth 5 -Compress
     }
     catch {
-        Write-ApiError -Message $_.Exception.Message -StatusCode 500
+        Write-ApiError -Message $_.Exception.Message -StatusCode 500 -ErrorRecord $_
     }
 }.ToString()))
 
@@ -1363,6 +1533,7 @@ New-PSUEndpoint -Url '/api/dhcp/options' -Method GET @_epRead -Endpoint ([script
 # Each item: { code, name, value (array), type, vendor_class }
 # ---------------------------------------------------------------------------
 New-PSUEndpoint -Url '/api/dhcp/options/server' -Method GET @_epRead -Endpoint ([scriptblock]::Create($H + {
+    $LogResource = '/api/dhcp/options/server:GET'
     try {
         $options = Get-DhcpServerv4OptionValue -All -ErrorAction Stop
         $result = @(
@@ -1371,7 +1542,7 @@ New-PSUEndpoint -Url '/api/dhcp/options/server' -Method GET @_epRead -Endpoint (
         ConvertTo-Json -InputObject $result -Depth 4 -Compress
     }
     catch {
-        Write-ApiError -Message $_.Exception.Message -StatusCode 500
+        Write-ApiError -Message $_.Exception.Message -StatusCode 500 -ErrorRecord $_
     }
 }.ToString()))
 
@@ -1381,6 +1552,7 @@ New-PSUEndpoint -Url '/api/dhcp/options/server' -Method GET @_epRead -Endpoint (
 # Returns all option values set on a specific scope.
 # ---------------------------------------------------------------------------
 New-PSUEndpoint -Url '/api/dhcp/options/scope/:scope_id' -Method GET @_epRead -Endpoint ([scriptblock]::Create($H + {
+    $LogResource = '/api/dhcp/options/scope/:scope_id:GET'
     if (-not (Test-IPv4 $scope_id)) { Write-InvalidIPv4 'scope_id'; return }
     try {
         # Verify scope exists
@@ -1393,10 +1565,10 @@ New-PSUEndpoint -Url '/api/dhcp/options/scope/:scope_id' -Method GET @_epRead -E
         ConvertTo-Json -InputObject $result -Depth 4 -Compress
     }
     catch [Microsoft.Management.Infrastructure.CimException] {
-        Write-ApiError -Message 'Scope not found.' -StatusCode 404
+        Write-ApiError -Message 'Scope not found.' -StatusCode 404 -ErrorRecord $_
     }
     catch {
-        Write-ApiError -Message $_.Exception.Message -StatusCode 500
+        Write-ApiError -Message $_.Exception.Message -StatusCode 500 -ErrorRecord $_
     }
 }.ToString()))
 
@@ -1411,6 +1583,8 @@ New-PSUEndpoint -Url '/api/dhcp/options/scope/:scope_id' -Method GET @_epRead -E
 # scope_id query parameter is required.
 # ---------------------------------------------------------------------------
 New-PSUEndpoint -Url '/api/dhcp/exclusions' -Method GET @_epRead -Endpoint ([scriptblock]::Create($H + {
+    $LogResource = '/api/dhcp/exclusions:GET'
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
     try {
         if ($scope_id) {
             # Per-scope: flat list (backward-compatible for push path / older plugin versions).
@@ -1430,14 +1604,15 @@ New-PSUEndpoint -Url '/api/dhcp/exclusions' -Method GET @_epRead -Endpoint ([scr
                 if (-not $result.ContainsKey($sid)) { $result[$sid] = @() }
                 $result[$sid] += ConvertTo-ExclusionRangeObject $ex
             }
+            Write-DhcpTiming 'list-exclusions' $sw $result.Count @($allExclusions | Where-Object { $_ -ne $null }).Count
             ConvertTo-Json -InputObject $result -Depth 4 -Compress
         }
     }
     catch [Microsoft.Management.Infrastructure.CimException] {
-        Write-ApiError -Message 'Scope not found.' -StatusCode 404
+        Write-ApiError -Message 'Scope not found.' -StatusCode 404 -ErrorRecord $_
     }
     catch {
-        Write-ApiError -Message $_.Exception.Message -StatusCode 500
+        Write-ApiError -Message $_.Exception.Message -StatusCode 500 -ErrorRecord $_
     }
 }.ToString()))
 
@@ -1454,13 +1629,12 @@ New-PSUEndpoint -Url '/api/dhcp/exclusions' -Method GET @_epRead -Endpoint ([scr
 #   }
 # ---------------------------------------------------------------------------
 New-PSUEndpoint -Url '/api/dhcp/exclusions' -Method POST @_epWrite -Endpoint ([scriptblock]::Create($H + {
+    $LogResource = '/api/dhcp/exclusions:POST'
     try {
         $body = $Body | ConvertFrom-Json
 
         if (-not $body.scope_id -or -not $body.start_ip -or -not $body.end_ip) {
-            New-PSUApiResponse -StatusCode 400 `
-                -Body (@{ error = 'scope_id, start_ip, and end_ip are required.' } | ConvertTo-Json -Compress) `
-                -ContentType 'application/json'
+            Write-ApiError -Message 'scope_id, start_ip, and end_ip are required.' -StatusCode 400
             return
         }
         if (-not (Test-IPv4 $body.scope_id)) { Write-InvalidIPv4 'scope_id'; return }
@@ -1472,20 +1646,22 @@ New-PSUEndpoint -Url '/api/dhcp/exclusions' -Method POST @_epWrite -Endpoint ([s
             -StartRange $body.start_ip `
             -EndRange   $body.end_ip `
             -ErrorAction Stop
+        Write-DhcpLog -Level Information -Step 'add-exclusion' -ScopeId $body.scope_id -Detail "range=$($body.start_ip)-$($body.end_ip)"
 
-        $exclusions = Get-DhcpServerv4ExclusionRange -ScopeId $body.scope_id -ErrorAction SilentlyContinue |
+        $exclusions = Get-DhcpServerv4ExclusionRange -ScopeId $body.scope_id -ErrorAction SilentlyContinue -ErrorVariable stepErr |
                       Where-Object { $_.StartRange -eq $body.start_ip -and $_.EndRange -eq $body.end_ip } |
                       Select-Object -First 1
+        Write-DhcpStepResult 'read-back-exclusion' $body.scope_id $stepErr
 
         New-PSUApiResponse -StatusCode 201 `
             -Body (ConvertTo-ExclusionRangeObject $exclusions | ConvertTo-Json -Depth 4 -Compress) `
             -ContentType 'application/json'
     }
     catch [Microsoft.Management.Infrastructure.CimException] {
-        Write-ApiError -Message 'Scope not found.' -StatusCode 404
+        Write-ApiError -Message 'Scope not found.' -StatusCode 404 -ErrorRecord $_
     }
     catch {
-        Write-ApiError -Message $_.Exception.Message -StatusCode 500
+        Write-ApiError -Message $_.Exception.Message -StatusCode 500 -ErrorRecord $_
     }
 }.ToString()))
 
@@ -1503,13 +1679,12 @@ New-PSUEndpoint -Url '/api/dhcp/exclusions' -Method POST @_epWrite -Endpoint ([s
 #   }
 # ---------------------------------------------------------------------------
 New-PSUEndpoint -Url '/api/dhcp/exclusions' -Method DELETE @_epWrite -Endpoint ([scriptblock]::Create($H + {
+    $LogResource = '/api/dhcp/exclusions:DELETE'
     try {
         $body = $Body | ConvertFrom-Json
 
         if (-not $body.scope_id -or -not $body.start_ip -or -not $body.end_ip) {
-            New-PSUApiResponse -StatusCode 400 `
-                -Body (@{ error = 'scope_id, start_ip, and end_ip are required.' } | ConvertTo-Json -Compress) `
-                -ContentType 'application/json'
+            Write-ApiError -Message 'scope_id, start_ip, and end_ip are required.' -StatusCode 400
             return
         }
         if (-not (Test-IPv4 $body.scope_id)) { Write-InvalidIPv4 'scope_id'; return }
@@ -1521,13 +1696,14 @@ New-PSUEndpoint -Url '/api/dhcp/exclusions' -Method DELETE @_epWrite -Endpoint (
             -StartRange $body.start_ip `
             -EndRange   $body.end_ip `
             -ErrorAction Stop
+        Write-DhcpLog -Level Information -Step 'delete-exclusion' -ScopeId $body.scope_id -Detail "range=$($body.start_ip)-$($body.end_ip)"
 
         New-PSUApiResponse -StatusCode 204
     }
     catch [Microsoft.Management.Infrastructure.CimException] {
-        Write-ApiError -Message 'Scope not found.' -StatusCode 404
+        Write-ApiError -Message 'Scope not found.' -StatusCode 404 -ErrorRecord $_
     }
     catch {
-        Write-ApiError -Message $_.Exception.Message -StatusCode 500
+        Write-ApiError -Message $_.Exception.Message -StatusCode 500 -ErrorRecord $_
     }
 }.ToString()))

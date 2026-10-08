@@ -28,6 +28,9 @@ urlpatterns = [
     path('scopes/',          include(get_model_urls('netbox_windows_dhcp', 'dhcpscope', detail=False))),
     path('scopes/<int:pk>/', include(get_model_urls('netbox_windows_dhcp', 'dhcpscope'))),
 
+    # DHCPLeaseInfo (the Leases page: a list only)
+    path('leases/',            include(get_model_urls('netbox_windows_dhcp', 'dhcpleaseinfo', detail=False))),
+
     # DHCPExclusionRange (no list view; only add + detail)
     path('exclusion-ranges/',          include(get_model_urls('netbox_windows_dhcp', 'dhcpexclusionrange', detail=False))),
     path('exclusion-ranges/<int:pk>/', include(get_model_urls('netbox_windows_dhcp', 'dhcpexclusionrange'))),

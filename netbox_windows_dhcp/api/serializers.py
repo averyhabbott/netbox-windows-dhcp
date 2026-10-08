@@ -363,5 +363,8 @@ class DHCPLeaseInfoSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = DHCPLeaseInfo
-        fields = ('id', 'url', 'ip_address', 'lease_hostname', 'active', 'lease_expiration')
+        fields = (
+            'id', 'url', 'ip_address', 'lease_hostname', 'active', 'lease_expiration',
+            'state_changed',
+        )
         read_only_fields = fields

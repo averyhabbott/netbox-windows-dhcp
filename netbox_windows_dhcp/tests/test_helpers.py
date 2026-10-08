@@ -80,7 +80,7 @@ class DnsNameTests(SimpleTestCase):
     """What the sync accepts as an IP's DNS name; anything else is blanked and tagged."""
 
     def test_clean_dns_name(self):
-        dock = '53JL2W3-Dell Pro Thunderbolt 4 Smart Dock.vuhl.root.mrc.local'
+        dock = 'Test Device With Spaces.corp.example.com'
         cases = {
             '': ('', False),
             'Desktop-ABC.corp.local': ('desktop-abc.corp.local', False),

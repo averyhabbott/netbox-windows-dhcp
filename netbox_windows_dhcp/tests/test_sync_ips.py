@@ -15,10 +15,10 @@ from ipam.models import IPAddress, VRF
 
 from ..background_tasks import INVALID_HOSTNAME_TAG_SLUG, _sync_scope_ips
 from ..models import DHCPExclusionRange, DHCPLeaseInfo
-from .base import NULL_LOGGER, get_ip, make_prefix, make_scope, make_server, managed_ip
+from .base import NULL_LOGGER, get_ip, make_prefix, make_scope, make_server, managed_ip, reserved_ip
 from .fixtures import FAKE_LEASE, FAKE_RESERVATION, lease, reservation
 
-DOCK = '53JL2W3-Dell Pro Thunderbolt 4 Smart Dock.vuhl.root.mrc.local'
+DOCK = 'Test Device With Spaces.corp.example.com'
 
 
 def _has_invalid_tag(ip):
@@ -208,6 +208,121 @@ class LeaseActiveTests(_ScopeFixture, TestCase):
         self._run(push_reservations=True)
         info = self._info('10.0.1.100')
         self.assertEqual((info.active, info.lease_expiration, info.lease_hostname), (False, None, 'old'))
+
+
+class StateSinceTests(_ScopeFixture, TestCase):
+    """Active/Inactive Since: when the IP's current state (active or not, for this client) began."""
+
+    LONG_AGO = datetime(2020, 1, 1, tzinfo=dt_timezone.utc)
+
+    def _since(self, address):
+        return DHCPLeaseInfo.objects.get(ip_address__address__net_host=address).state_changed
+
+    def _second_run_resets(self, address, first, second, **options):
+        """Run `first`, backdate the clock, run `second`: did the clock restart?"""
+        self._run(**first, **options)
+        DHCPLeaseInfo.objects.update(state_changed=self.LONG_AGO)
+        self._run(**second, **options)
+        return self._since(address) != self.LONG_AGO
+
+    def test_a_new_row_starts_its_clock(self):
+        before = timezone.now()
+        self._run(leases=[dict(FAKE_LEASE)], reservations=[dict(FAKE_RESERVATION)])
+        for address in ('10.0.1.50', '10.0.1.100'):
+            with self.subTest(address=address):
+                self.assertGreaterEqual(self._since(address), before)
+
+    def test_what_restarts_the_clock(self):
+        in_use = lease('10.0.1.100', client_id='aa-bb-cc-dd-ee-ff', address_state='ActiveReservation')
+        res = reservation('10.0.1.100')
+        cases = (
+            # name, address, first run, second run, options, clock restarts
+            ('renewal keeps it', '10.0.1.50',
+             dict(leases=[lease('10.0.1.50', lease_expiry='2030-01-01T00:00:00Z')]),
+             dict(leases=[lease('10.0.1.50', lease_expiry='2030-01-09T00:00:00Z')]), {}, False),
+            ('new client on the IP restarts it', '10.0.1.50',
+             dict(leases=[lease('10.0.1.50', client_id='aa-bb')]),
+             dict(leases=[lease('10.0.1.50', client_id='cc-dd')]), {}, True),
+            ('same client in another spelling keeps it', '10.0.1.50',
+             dict(leases=[lease('10.0.1.50', client_id='aa-bb-cc-dd-ee-ff')]),
+             dict(leases=[lease('10.0.1.50', client_id='AA:BB:CC:DD:EE:FF')]), {}, False),
+            ('reservation going unused restarts it', '10.0.1.100',
+             dict(reservations=[res], leases=[in_use]), dict(reservations=[res]), {}, True),
+            ('reservation coming into use restarts it', '10.0.1.100',
+             dict(reservations=[res]), dict(reservations=[res], leases=[in_use]), {}, True),
+            ('reservation staying in use keeps it', '10.0.1.100',
+             dict(reservations=[res], leases=[in_use]), dict(reservations=[res], leases=[in_use]), {}, False),
+            ('reservation staying unused keeps it', '10.0.1.100',
+             dict(reservations=[res]), dict(reservations=[res]), {}, False),
+            ('lease becoming a reservation in use keeps it', '10.0.1.100',
+             dict(leases=[lease('10.0.1.100', client_id='aa-bb-cc-dd-ee-ff')]),
+             dict(reservations=[res], leases=[in_use]), {}, False),
+        )
+        for name, address, first, second, options, resets in cases:
+            with self.subTest(case=name):
+                IPAddress.objects.all().delete()
+                self.assertEqual(self._second_run_resets(address, first, second, **options), resets)
+
+    def test_reservation_state_is_tracked_with_push_on(self):
+        # NetBox owns the reservation, but its in-use/unused state still comes from the leases.
+        reserved_ip('10.0.1.100', client_id='aa-bb-cc-dd-ee-ff')
+        in_use = lease('10.0.1.100', client_id='aa-bb-cc-dd-ee-ff', address_state='ActiveReservation')
+        runs = (
+            # leases, active, clock restarts
+            ([], False, True),    # first sight: the row is made
+            ([in_use], True, True),
+            ([in_use], True, False),
+            ([], False, True),
+            ([], False, False),
+        )
+        for leases, active, resets in runs:
+            with self.subTest(in_use=bool(leases), expect_restart=resets):
+                DHCPLeaseInfo.objects.update(state_changed=self.LONG_AGO)
+                self._run(reservations=[dict(FAKE_RESERVATION)], leases=leases, push_reservations=True)
+                info = DHCPLeaseInfo.objects.get(ip_address__address__net_host='10.0.1.100')
+                self.assertEqual(info.active, active)
+                self.assertEqual(info.state_changed != self.LONG_AGO, resets)
+
+    def test_an_ip_the_server_stops_reporting_restarts_the_clock_once(self):
+        ip = IPAddress.objects.create(address='10.0.1.100/24', status='reserved')
+        DHCPLeaseInfo.objects.create(ip_address=ip, active=True, state_changed=self.LONG_AGO)
+        self._run(push_reservations=True)
+        restarted = self._since('10.0.1.100')
+        self.assertGreater(restarted, self.LONG_AGO)
+        self._run(push_reservations=True)
+        self.assertEqual(self._since('10.0.1.100'), restarted)
+
+    def test_protected_ips(self):
+        tag = Tag.objects.create(name='Protected', slug='protected')
+        cases = (
+            # update_client_id, clock restarts
+            (False, False),  # the stored client ID is left alone, so nothing is seen to change
+            (True, True),
+        )
+        for update_client_id, resets in cases:
+            with self.subTest(update_client_id=update_client_id):
+                IPAddress.objects.all().delete()
+                ip = IPAddress(address='10.0.1.50/24', status='dhcp')
+                ip.custom_field_data['dhcp_client_id'] = 'aa-bb'
+                ip.save()
+                ip.tags.add(tag)
+                options = dict(protect_tag='protected', update_client_id=update_client_id)
+                self._run(leases=[lease('10.0.1.50', client_id='aa-bb')], **options)
+                DHCPLeaseInfo.objects.update(state_changed=self.LONG_AGO)
+                # The first sync after the change may restart it; the next one never does.
+                for expect_restart in (resets, False):
+                    self._run(leases=[lease('10.0.1.50', client_id='cc-dd')], **options)
+                    self.assertEqual(self._since('10.0.1.50') != self.LONG_AGO, expect_restart)
+                    DHCPLeaseInfo.objects.update(state_changed=self.LONG_AGO)
+
+    def test_a_downgrade_to_a_different_client_restarts_it(self):
+        ip = managed_ip('10.0.1.100', status='reserved')
+        ip.custom_field_data['dhcp_client_id'] = 'aa-bb'
+        ip.save()
+        DHCPLeaseInfo.objects.update(state_changed=self.LONG_AGO)
+        self._run(leases=[lease('10.0.1.100', client_id='cc-dd')])
+        self.assertEqual(get_ip('10.0.1.100').status, 'dhcp')
+        self.assertGreater(self._since('10.0.1.100'), self.LONG_AGO)
 
 
 class ReservationDescriptionTests(_ScopeFixture, TestCase):

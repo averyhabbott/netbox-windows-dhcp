@@ -1,10 +1,13 @@
 import django_tables2 as tables
+from django.urls import reverse
+from django.utils.functional import cached_property
 from django.utils.html import format_html
 from netbox.tables import NetBoxTable, BooleanColumn, ActionsColumn, TagColumn
 
 from .models import (
     DHCPExclusionRange,
     DHCPFailover,
+    DHCPLeaseInfo,
     DHCPOptionCodeDefinition,
     DHCPOptionValue,
     DHCPScope,
@@ -206,6 +209,15 @@ class DHCPScopeTable(NetBoxTable):
         order_by=('network', 'prefix_length'),
     )
     prefix = tables.Column(linkify=True)
+    # These come from the scope's prefix (a scope has none of its own).
+    site = tables.Column(accessor='prefix___site', linkify=True, verbose_name='Site', order_by=('prefix___site__name',))
+    location = tables.Column(
+        accessor='prefix___location', linkify=True, verbose_name='Location', order_by=('prefix___location__name',),
+    )
+    vrf = tables.Column(accessor='prefix__vrf', verbose_name='VRF', empty_values=(), order_by=('prefix__vrf__name',))
+    tenant = tables.Column(
+        accessor='prefix__tenant', linkify=True, verbose_name='Tenant', order_by=('prefix__tenant__name',),
+    )
     start_ip = tables.Column(verbose_name='Start IP')
     end_ip = tables.Column(verbose_name='End IP')
     router = tables.Column(verbose_name='Router')
@@ -229,6 +241,13 @@ class DHCPScopeTable(NetBoxTable):
         from .utils import lease_lifetime_display
         return lease_lifetime_display(value)
 
+    def render_vrf(self, record):
+        if record.prefix_id is None:
+            return self.default
+        if record.prefix.vrf is None:
+            return 'Global'
+        return format_html('<a href="{}">{}</a>', record.prefix.vrf.get_absolute_url(), record.prefix.vrf)
+
     def render_source(self, record):
         if record.failover_id:
             return format_html(
@@ -245,12 +264,103 @@ class DHCPScopeTable(NetBoxTable):
     class Meta(NetBoxTable.Meta):
         model = DHCPScope
         fields = (
-            'pk', 'name', 'active', 'description', 'network', 'prefix', 'start_ip', 'end_ip',
-            'router', 'source', 'lease_lifetime', 'tags', 'maintenance_mode', 'actions',
+            'pk', 'name', 'active', 'description', 'network', 'prefix', 'site', 'location', 'vrf', 'tenant',
+            'start_ip', 'end_ip', 'router', 'source', 'lease_lifetime', 'tags', 'maintenance_mode', 'actions',
         )
         default_columns = (
             'name', 'active', 'network', 'prefix', 'start_ip', 'end_ip', 'source', 'tags', 'maintenance_mode', 'actions',
         )
+
+
+# ---------------------------------------------------------------------------
+# Leases (the sync's per-IP lease details; rows come from DHCPLeaseInfo)
+# ---------------------------------------------------------------------------
+
+class DHCPLeaseTable(NetBoxTable):
+    """
+    Read-only list of the IPs the sync tracks. The queryset is annotated with the owning
+    scope's ID (utils.with_scope); the scope's name and other details come from one cached
+    lookup of all scopes, since a deployment has a few hundred at most.
+    """
+    address = tables.Column(
+        accessor='ip_address', linkify=True, verbose_name='Address',
+        order_by=('ip_address__address',),
+    )
+    status = tables.Column(
+        accessor='ip_address__status', verbose_name='Status', order_by=('ip_address__status',),
+    )
+    scope = tables.Column(accessor='scope_pk', verbose_name='Scope')
+    prefix = tables.Column(accessor='scope_pk', verbose_name='Prefix', orderable=False)
+    source = tables.Column(accessor='scope_pk', verbose_name='Server / Failover', orderable=False)
+    lease_hostname = tables.Column(verbose_name='Lease Hostname')
+    active = BooleanColumn(verbose_name='Active')
+    lease_expiration = tables.DateTimeColumn(verbose_name='Expiration')
+    state_changed = tables.DateTimeColumn(verbose_name='Active/Inactive Since')
+    vrf = tables.Column(accessor='ip_address__vrf', linkify=True, verbose_name='VRF', default='Global')
+    tenant = tables.Column(accessor='ip_address__tenant', linkify=True, verbose_name='Tenant')
+    dns_name = tables.Column(
+        accessor='ip_address__dns_name', verbose_name='DNS Name', order_by=('ip_address__dns_name',),
+    )
+    description = tables.Column(
+        accessor='ip_address__description', verbose_name='Description',
+        order_by=('ip_address__description',),
+    )
+    client_id = tables.Column(
+        accessor='ip_address__custom_field_data__dhcp_client_id', verbose_name='Client ID',
+        order_by=('ip_address__custom_field_data__dhcp_client_id',),
+    )
+    tags = TagColumn(url_name='ipam:ipaddress_list')
+    tags.accessor = tables.A('ip_address__tags')
+
+    # No row selection or actions: the page is read-only (rows belong to the sync).
+    exempt_columns = ()
+
+    class Meta(NetBoxTable.Meta):
+        model = DHCPLeaseInfo
+        fields = (
+            'address', 'status', 'scope', 'prefix', 'source', 'lease_hostname', 'active',
+            'lease_expiration', 'state_changed', 'vrf', 'tenant', 'dns_name', 'description', 'client_id', 'tags',
+        )
+        default_columns = ('address', 'status', 'scope', 'lease_hostname', 'active', 'lease_expiration')
+
+    @cached_property
+    def _scopes(self):
+        from .models import DHCPScope
+        return {
+            scope.pk: scope
+            for scope in DHCPScope.objects.select_related('prefix', 'server', 'failover')
+        }
+
+    def render_status(self, record):
+        ip = record.ip_address
+        return format_html(
+            '<span class="badge text-bg-{}">{}</span>',
+            ip.get_status_color() or 'secondary', ip.get_status_display(),
+        )
+
+    def render_scope(self, record):
+        return format_html(
+            '<a href="{}">{}</a>',
+            reverse('plugins:netbox_windows_dhcp:dhcpscope', args=[record.scope_pk]),
+            self._scopes[record.scope_pk].name,
+        )
+
+    def order_scope(self, queryset, is_descending):
+        from .utils import with_scope_name
+        return with_scope_name(queryset).order_by('-scope_name' if is_descending else 'scope_name'), True
+
+    def render_prefix(self, record):
+        prefix = self._scopes[record.scope_pk].prefix
+        if prefix is None:
+            return self.default
+        return format_html('<a href="{}">{}</a>', prefix.get_absolute_url(), prefix)
+
+    def render_source(self, record):
+        scope = self._scopes[record.scope_pk]
+        owner = scope.failover or scope.server
+        if owner is None:
+            return self.default
+        return format_html('<a href="{}">{}</a>', owner.get_absolute_url(), owner)
 
 
 # ---------------------------------------------------------------------------

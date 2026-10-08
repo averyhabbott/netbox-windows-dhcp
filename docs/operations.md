@@ -7,11 +7,13 @@ Day-to-day tasks, tools and troubleshooting.
 | Group | Pages |
 | --- | --- |
 | Infrastructure | Servers, Failover |
-| Scopes | Scopes |
+| Scopes & Leases | Leases, Scopes |
 | Options | Option Values, Option Code Definitions |
 | Admin | Current Maintenance, Schedule, Settings |
 
 The plugin also adds a **DHCP Scopes** panel to NetBox's Prefix pages, a **DHCP Lease Info** panel to IP Address pages, and an optional **Lease Hostname** column to the IP Addresses list (add it with **Configure Table**). DHCP servers, scopes and lease info show up in NetBox's global search.
+
+**Leases** lists every IP the sync tracks, one row per IP, read-only. Default columns: Address (links to the IP), Status, Scope, Lease Hostname, Active and Expiration. **Configure Table** adds Prefix, Server / Failover, Active/Inactive Since, VRF, Tenant, DNS Name, Description, Client ID and Tags. Every column can be filtered, along with the IP's VRF and Tenant, and Expiration and Active/Inactive Since take an after and a before date and time, so you can look at a window or everything before a date. Export works as on the IP Addresses list. A scope owns an IP when the IP is inside the scope's prefix and VRF (the narrowest scope wins), and IPs no scope owns show no scope. There are no permissions of their own: like the lease info API, you see the rows whose IP you may view. Like the panel on the IP page, rows exist only while **Sync IP Addresses** is on.
 
 ## Syncing
 

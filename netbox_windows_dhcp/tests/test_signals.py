@@ -2,13 +2,17 @@
 Signal-handler tests. Job enqueue methods are patched so no test reaches RQ/Redis.
 """
 
+from datetime import datetime, timezone as dt_timezone
 from unittest import mock
 
 from django.db import transaction
 from django.test import TestCase
 
-from ..models import DHCPExclusionRange, DHCPScope
-from .base import make_failover, make_prefix, make_scope, make_server, set_plugin_settings
+from ..models import DHCPExclusionRange, DHCPLeaseInfo, DHCPScope
+from ..utils import plugin_write
+from .base import (
+    make_failover, make_prefix, make_scope, make_server, managed_ip, set_plugin_settings,
+)
 
 
 ENQUEUE = 'netbox_windows_dhcp.background_tasks.DHCPScopePushJob.enqueue'
@@ -300,3 +304,65 @@ class SettingsPostSaveSignalTests(TestCase):
 
         self.assertFalse(enqueue_once.called)
         self.assertFalse(enqueue.called)
+
+
+class StateSinceEditTests(TestCase):
+    """A NetBox edit that gives a DHCP-managed IP to a different client restarts Active/Inactive Since."""
+
+    LONG_AGO = datetime(2020, 1, 1, tzinfo=dt_timezone.utc)
+
+    def _ip(self, client_id='aa-bb'):
+        ip = managed_ip('10.0.1.50')
+        if client_id:
+            ip.custom_field_data['dhcp_client_id'] = client_id
+            ip.save()
+        DHCPLeaseInfo.objects.update(state_changed=self.LONG_AGO)
+        return ip
+
+    def _restarted(self):
+        return DHCPLeaseInfo.objects.get().state_changed != self.LONG_AGO
+
+    def test_what_restarts_the_clock(self):
+        cases = (
+            # name, new client ID, restarts
+            ('a different client', 'cc-dd', True),
+            ('the client cleared', '', True),
+            ('the same client, another spelling', 'AA:BB', False),
+            ('the same client, saved again', 'aa-bb', False),
+        )
+        for name, new_id, restarts in cases:
+            with self.subTest(case=name):
+                ip = self._ip()
+                ip.custom_field_data['dhcp_client_id'] = new_id
+                ip.save()
+                self.assertEqual(self._restarted(), restarts)
+                ip.delete()
+
+    def test_a_status_change_alone_keeps_the_clock(self):
+        # Turning a lease into a reservation is a status edit; the client stays.
+        ip = self._ip()
+        ip.status = 'reserved'
+        ip.save()
+        self.assertFalse(self._restarted())
+
+    def test_a_first_client_id_keeps_the_clock(self):
+        ip = self._ip(client_id='')
+        ip.custom_field_data['dhcp_client_id'] = 'aa-bb'
+        ip.save()
+        self.assertFalse(self._restarted())
+
+    def test_the_plugins_own_write_is_left_to_the_sync(self):
+        ip = self._ip()
+        ip.custom_field_data['dhcp_client_id'] = 'cc-dd'
+        with plugin_write():
+            ip.save()
+        self.assertFalse(self._restarted())
+
+    def test_an_ip_without_lease_info_is_ignored(self):
+        from ipam.models import IPAddress
+        ip = IPAddress(address='10.0.1.60/24', status='active')
+        ip.custom_field_data['dhcp_client_id'] = 'aa-bb'
+        ip.save()
+        ip.custom_field_data['dhcp_client_id'] = 'cc-dd'
+        ip.save()
+        self.assertFalse(DHCPLeaseInfo.objects.exists())

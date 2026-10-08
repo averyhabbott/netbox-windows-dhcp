@@ -20,7 +20,7 @@
 | `test_jobs.py` | Job scheduling, who a job runs as, jobs failing or skipping |
 | `test_locks.py` | What users are refused: IP lock, range guard, Push Scope Info off (UI and API), option values in use, failovers read-only |
 | `test_api.py` | REST API: NetBox's CRUD harness plus API-only behavior |
-| `test_views.py` | Web pages: NetBox's view harness, buttons, settings and schedule pages, permissions, lease panel/column |
+| `test_views.py` | Web pages: NetBox's view harness, buttons, settings and schedule pages, permissions, lease panel/column, the Leases page |
 | `test_commands.py` | Management commands (`dhcp_apply_prefix_tenant`, `dhcp_fix_ip_vrf`) |
 
 ## Rules

@@ -23,9 +23,22 @@ The job ends as **Failed** if any step fails, so a permission or connection prob
 
 Run it on every server after each plugin upgrade (see [Upgrading](upgrading.md)).
 
+## Logging
+
+The script writes to PSU's own log, in **Platform > Logging**, as `[Level] [DHCP-/api/dhcp/<path>:<METHOD>] step=... scope=... ip=...`.
+
+| Level | What it records |
+| --- | --- |
+| Error | A request that failed with a 5xx, a batch item that failed, a `/metrics` section that couldn't be read, and a reservation that couldn't be restored. Windows error codes are included when there are any. |
+| Warning | A request refused with a 4xx (bad input, scope not found), a batch item that wasn't found, and a best-effort step that failed (a scope's router, lease time, an option value, or making a lease an active reservation). The response is the same as before. |
+| Information | Each change made to the DHCP server: scope, reservation (including making a lease an active reservation), exclusion and failover creates, updates and deletes. PSU already logs each request's status itself. |
+| Debug | How long a bulk read took, and how many scopes and items it covered. |
+
+PSU's **Database** logging target (Platform > Logging targets) defaults to Information, which hides the Debug lines. Set it to Debug to see them. Tokens and request bodies are never logged.
+
 ## Script version
 
-The script carries a version number (`$PSU_SCRIPT_VERSION`, currently **2.0.0**), returned by `GET /api/dhcp/health`. The plugin compares it with the version it expects:
+The script carries a version number (`$PSU_SCRIPT_VERSION`, currently **2.0.1**), returned by `GET /api/dhcp/health`. The plugin compares it with the version it expects:
 
 | Servers list shows | Meaning |
 | --- | --- |
@@ -184,6 +197,8 @@ All paths are under `https://<server>:<port>`. `scope_id` is always the scope's 
 | POST | `scope_id`, `ip_address`, `client_id` | `name`, `description`, `type` (`Dhcp`, `Bootp` or `Both`) |
 | PUT | `scope_id`, `ip_address` | `client_id`, `name`, `description`, `type`. Only the keys sent are changed; `""` clears `name` or `description`. |
 | DELETE | `scope_id`, `ip_address` | none |
+
+When `POST` creates a reservation for an IP that has an active lease held by the same client, it also marks that lease an active reservation, as the DHCP snap-in does. Otherwise Windows leaves it an inactive reservation. If that step fails, the reservation is still created and the failure is logged as a Warning.
 
 The response is 200 with one result per item, in order:
 

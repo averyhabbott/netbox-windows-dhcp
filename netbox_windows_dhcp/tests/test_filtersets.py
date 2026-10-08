@@ -7,7 +7,9 @@ field, and these filtersets offer a chosen few.
 """
 
 from django.test import TestCase
+from dcim.models import Location, Site
 from extras.models import SavedFilter
+from tenancy.models import Tenant
 
 from .. import _ensure_unassigned_scopes_filter
 from ..filtersets import (
@@ -144,11 +146,19 @@ class ScopeFilterTests(_FilterCases, TestCase):
     @classmethod
     def setUpTestData(cls):
         cls.server = make_server()
-        make_scope(name='Building A', prefix=make_prefix('10.0.1.0/24'), server=cls.server)
+        cls.tenant = Tenant.objects.create(name='Tenant A', slug='tenant-a')
+        cls.site = Site.objects.create(name='Site A', slug='site-a')
+        cls.location = Location.objects.create(name='Room 1', slug='room-1', site=cls.site)
         make_scope(
-            name='Building B', prefix=make_prefix('10.0.2.0/24'),
+            name='Building A', prefix=make_prefix('10.0.1.0/24', tenant=cls.tenant), server=cls.server,
+        )
+        make_scope(
+            name='Building B',
+            # Scoped to a location: the site filter finds it through the location's site.
+            prefix=make_prefix('10.0.2.0/24', scope=cls.location),
             server=make_server(name='Srv2', hostname='srv2.example.com'),
             start_ip='10.0.2.10', end_ip='10.0.2.254',
+            lease_lifetime=3600, maintenance_mode=True,
         )
         make_unassigned_scope(name='Unassigned', network='10.0.3.0', server=cls.server,
                               start_ip='10.0.3.10', end_ip='10.0.3.20')
@@ -159,6 +169,15 @@ class ScopeFilterTests(_FilterCases, TestCase):
             ({'server_id': [self.server.pk]}, 2),
             ({'within_prefix': '10.0.0.0/16'}, 2),
             ({'within_prefix': '10.0.1.0/24'}, 1),
+            ({'tenant': [self.tenant.pk]}, 1),
+            ({'site': [self.site.pk]}, 1),
+            ({'location': [self.location.pk]}, 1),
+            ({'maintenance_mode': 'true'}, 1),
+            ({'maintenance_mode': 'false'}, 2),
+            ({'lease_lifetime': [3600]}, 1),
+            ({'lease_lifetime__n': [3600]}, 2),
+            ({'lease_lifetime__gte': [3600]}, 3),
+            ({'lease_lifetime__lt': [86400]}, 1),
             ({'has_prefix': 'true'}, 2),
             ({'has_prefix': 'false'}, 1),
         ))

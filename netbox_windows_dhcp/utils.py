@@ -299,3 +299,38 @@ def maintenance_fields(enabled: bool, notes: str, user) -> dict:
         'maintenance_enabled_at': None,
         'maintenance_enabled_by': None,
     }
+
+
+def with_scope(queryset):
+    """
+    Annotate a DHCPLeaseInfo queryset with the scope each IP belongs to: `scope_pk`. A scope owns an IP when the IP is inside the scope's prefix and in the
+    same VRF, the same rule the sync uses. When scopes are nested, the narrowest wins.
+    IPs no scope owns get None.
+    """
+    from django.db.models import Func, OuterRef, Subquery
+    from django.db.models.functions import Cast, Coalesce
+    from ipam.fields import IPAddressField
+
+    from .models import DHCPScope
+
+    # The IP without its mask length: with the mask, "inside a /28" would test the IP's own /24.
+    host = Cast(Func(OuterRef('ip_address__address'), function='host'), output_field=IPAddressField())
+    owning = (
+        DHCPScope.objects
+        .filter(prefix__isnull=False, prefix__prefix__net_contains_or_equals=host)
+        .annotate(_vrf_key=Coalesce('prefix__vrf_id', 0))
+        .filter(_vrf_key=Coalesce(OuterRef('ip_address__vrf_id'), 0))
+        .order_by('-prefix_length', 'pk')
+    )
+    return queryset.annotate(scope_pk=Subquery(owning.values('pk')[:1]))
+
+
+def with_scope_name(queryset):
+    """Add `scope_name` to a queryset already annotated by with_scope (only needed to sort by it)."""
+    from django.db.models import OuterRef, Subquery
+
+    from .models import DHCPScope
+
+    return queryset.annotate(
+        scope_name=Subquery(DHCPScope.objects.filter(pk=OuterRef('scope_pk')).values('name')[:1])
+    )

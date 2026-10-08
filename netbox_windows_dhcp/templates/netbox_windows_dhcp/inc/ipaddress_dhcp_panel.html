@@ -18,6 +18,16 @@
         </td>
       </tr>
       <tr>
+        <th scope="row">{% if dhcp_info.active %}Active{% else %}Inactive{% endif %} Since ({{ current_tz }})</th>
+        <td>
+          {% if dhcp_info.state_changed %}
+            {{ dhcp_info.state_changed }}
+          {% else %}
+            <span class="text-muted">—</span>
+          {% endif %}
+        </td>
+      </tr>
+      <tr>
         <th scope="row">Lease Expiration ({{ current_tz }})</th>
         <td>
           {% if dhcp_info.lease_expiration %}

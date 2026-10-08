@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.0.1] - 2026-10-08
+
+### Added
+
+- **Active/Inactive Since** on an IP's DHCP lease details (`state_changed` in the API, with `state_changed_after` / `state_changed_before` filters). It records when the IP's current state began: it restarts when Active flips, or when the IP's client ID changes to a different one, whether the sync or someone in NetBox made the change. Rows that exist at upgrade start at the upgrade time.
+- **Leases page** (Windows DHCP > Leases): a read-only list of every IP the sync tracks, with Address, Status, Scope, Prefix, Server / Failover, Lease Hostname, Active, Expiration, Active/Inactive Since, VRF, Tenant, DNS Name, Description, Client ID and Tags columns. Each column can be filtered (plus VRF and Tenant), with after/before filters for Expiration and Active/Inactive Since, and the list exports like the IP Addresses list.
+- **Scopes list: new filters and columns.** Filters for Tenant (`tenant` in the API), Lease Lifetime (in seconds, with is / is not / greater / less) and Maintenance Mode; optional Site, Location, VRF and Tenant columns. Site, Location, VRF and Tenant come from the scope's prefix. The Site and Location filters now match the way NetBox's own Prefix filters do: a prefix scoped to a location also matches that location's site.
+
+### Changed
+
+- **Creating a reservation for an IP with an active lease now makes an active reservation**, like the DHCP snap-in's Add to Reservation (script version 2.0.1). Before, the lease turned into an inactive reservation and stayed that way until the reservation was removed. The script now reads the lease first and, when the same client holds it, marks it an active reservation after the create. It never removes the lease. This applies to every caller of `POST /api/dhcp/reservations`, single or bulk. If that step fails, it is logged as a Warning and the reservation is still created. Run **Update PSU Scripts** to get it.
+- **PSU script logging** (script version 2.0.1). The script now writes to PSU's own log (Platform > Logging) under the `DHCP` feature: failures at Error or Warning, each change made to the DHCP server at Information, and bulk-read timings at Debug. Before, errors went only to the caller and `/metrics` swallowed its read errors silently. Responses are unchanged. Run **Update PSU Scripts** to get it, and set PSU's Database logging target to Debug to see the Debug lines. See [PSU setup](docs/psu.md#logging).
+
 ## [2.0.0] - 2026-09-30
 
 > ⚠️ **WARNING:** This version makes significant changes to how the plugin behaves. Do not upgrade without following the upgrade checklist below. Skipping steps can cause data loss.

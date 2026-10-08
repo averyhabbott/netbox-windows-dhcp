@@ -7,6 +7,7 @@ GraphQL, which the plugin doesn't offer.
 """
 
 import json
+from datetime import datetime, timezone
 from unittest import mock
 
 from django.urls import reverse
@@ -482,8 +483,10 @@ class LeaseInfoAPITests(APITestCase):
         super().setUp()
         self.ip_a = IPAddress.objects.create(address='10.9.0.1/24', status='dhcp')
         self.ip_b = IPAddress.objects.create(address='10.9.0.2/24', status='reserved')
-        DHCPLeaseInfo.objects.create(ip_address=self.ip_a, lease_hostname='alpha', active=True)
-        self.info_b = DHCPLeaseInfo.objects.create(ip_address=self.ip_b, lease_hostname='beta', active=False)
+        DHCPLeaseInfo.objects.create(ip_address=self.ip_a, lease_hostname='alpha', active=True,
+                                     state_changed='2026-01-10T00:00:00Z')
+        self.info_b = DHCPLeaseInfo.objects.create(ip_address=self.ip_b, lease_hostname='beta', active=False,
+                                                   state_changed='2026-03-10T00:00:00Z')
 
     def test_lists_only_entries_for_viewable_ips(self):
         grant(self.user, IPAddress, ['view'], pk=self.ip_a.pk)
@@ -499,10 +502,18 @@ class LeaseInfoAPITests(APITestCase):
     def test_filters(self):
         self.add_permissions('ipam.view_ipaddress')
         for query, expected in (('active=false', ['beta']), ('lease_hostname=alp', ['alpha']),
-                                ('address=10.9.0.2', ['beta']), (f'ip_address_id={self.ip_a.pk}', ['alpha'])):
+                                ('address=10.9.0.2', ['beta']), (f'ip_address_id={self.ip_a.pk}', ['alpha']),
+                                ('state_changed_before=2026-02-01T00:00:00Z', ['alpha']),
+                                ('state_changed_after=2026-02-01T00:00:00Z', ['beta'])):
             with self.subTest(query=query):
                 data = self.client.get(api_url('dhcpleaseinfo') + '?' + query, **self.header).json()
                 self.assertEqual([r['lease_hostname'] for r in data['results']], expected)
+
+    def test_state_since_is_returned(self):
+        self.add_permissions('ipam.view_ipaddress')
+        data = self.client.get(api_url('dhcpleaseinfo', self.info_b.pk), **self.header).json()
+        self.assertEqual(datetime.fromisoformat(data['state_changed']),
+                         datetime(2026, 3, 10, tzinfo=timezone.utc))
 
     def test_read_only(self):
         self.add_permissions('ipam.view_ipaddress', 'ipam.change_ipaddress')

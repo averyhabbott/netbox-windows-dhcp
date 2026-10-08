@@ -305,6 +305,23 @@ def _sync_scope_ips(job_logger, scope, leases: list, reservations: list,
         except ValueError:
             return False
 
+    # IPs whose client ID the sync changed to a different device's (see _client_changed).
+    # Pass 3 resets their lease info's state_changed; a change after Pass 3 (a Pass 4
+    # downgrade) is applied by _flush_late_client_changes instead.
+    client_changed_pks: set[int] = set()
+    _late_client_changed: set[int] = set()
+    _pass3_done = []
+
+    def _client_changed(ip_obj, stored, new) -> None:
+        """Record ip_obj as having a new device on it, if `stored` and `new` are different IDs."""
+        from .utils import normalize_client_id
+        stored_norm = normalize_client_id(stored)
+        # A first-time fill (nothing stored) isn't a different device.
+        if stored_norm and stored_norm != normalize_client_id(new):
+            client_changed_pks.add(ip_obj.pk)
+            if _pass3_done:
+                _late_client_changed.add(ip_obj.pk)
+
     _hostname_tag = []  # lazily-resolved invalid-client-hostname Tag (only when needed)
 
     def _get_hostname_tag():
@@ -379,6 +396,7 @@ def _sync_scope_ips(job_logger, scope, leases: list, reservations: list,
         if 'description' in fields_changed:
             ip_obj.description = description
         if 'custom_field_data' in fields_changed:
+            _client_changed(ip_obj, stored_client_id, client_id)
             ip_obj.custom_field_data['dhcp_client_id'] = client_id
         # last_updated is auto_now, which Django only writes when it's listed in update_fields.
         # Also saved on a tag-only change, matching a UI edit.
@@ -486,6 +504,7 @@ def _sync_scope_ips(job_logger, scope, leases: list, reservations: list,
                     stored = ip_obj.custom_field_data.get('dhcp_client_id')
                     if client_id != stored:
                         ip_obj.snapshot()
+                        _client_changed(ip_obj, stored, client_id)
                         ip_obj.custom_field_data['dhcp_client_id'] = client_id
                         ip_obj.save(update_fields=['custom_field_data', 'last_updated'])
                         _n_changed += 1
@@ -556,25 +575,34 @@ def _sync_scope_ips(job_logger, scope, leases: list, reservations: list,
         try:
             to_create = []
             to_update = []
+            now = timezone.now()
             for pk, li in lease_info_map.items():
                 if pk in _existing_lease_info:
                     existing_li = _existing_lease_info[pk]
+                    # The state's clock restarts when Active flips or a different device
+                    # has the IP; a renewal changes neither, so the clock keeps running.
+                    if (existing_li.state_changed is None or existing_li.active != li.active
+                            or pk in client_changed_pks):
+                        existing_li.state_changed = now
                     existing_li.lease_hostname = li.lease_hostname
                     existing_li.active = li.active
                     existing_li.lease_expiration = li.lease_expiration
                     to_update.append(existing_li)
                 else:
+                    li.state_changed = now
                     to_create.append(li)
             if to_create:
                 DHCPLeaseInfo.objects.bulk_create(to_create)
             if to_update:
                 DHCPLeaseInfo.objects.bulk_update(
-                    to_update, ['lease_hostname', 'active', 'lease_expiration']
+                    to_update, ['lease_hostname', 'active', 'lease_expiration', 'state_changed']
                 )
         except Exception as exc:
             job_logger.warning(f'Scope {scope.name}: DHCPLeaseInfo bulk write failed: {exc}', exc_info=True)
             from django.db import connection
             connection.close()
+
+    _pass3_done.append(True)
 
     # ------------------------------------------------------------------ #
     # Pass 4 — cleanup stale IPs                                          #
@@ -667,6 +695,17 @@ def _sync_scope_ips(job_logger, scope, leases: list, reservations: list,
 
         except Exception as exc:
             job_logger.warning(f'Failed to clean up IP {ip_str}: {exc}', exc_info=True)
+            from django.db import connection
+            connection.close()
+
+    if _late_client_changed:
+        # A Pass 4 downgrade gave the IP a different client ID after Pass 3 had written.
+        try:
+            DHCPLeaseInfo.objects.filter(ip_address_id__in=_late_client_changed).update(
+                state_changed=timezone.now()
+            )
+        except Exception as exc:
+            job_logger.warning(f'Scope {scope.name}: Active/Inactive Since reset failed: {exc}', exc_info=True)
             from django.db import connection
             connection.close()
 
@@ -1619,7 +1658,7 @@ def _sync_server(job_logger, server, sync_ip_addresses: bool, push_reservations:
                         )
                         continue
                     if not failover.sync_enabled:
-                        job_logger.debug(
+                        job_logger.info(
                             f'Remote scope {scope_id}: failover {remote_failover_name!r} has sync '
                             f'disabled — skipping cleanup'
                         )
@@ -1661,7 +1700,7 @@ def _sync_server(job_logger, server, sync_ip_addresses: bool, push_reservations:
                     )
                     continue
                 if not failover.sync_enabled:
-                    job_logger.debug(
+                    job_logger.info(
                         f'Remote scope {scope_id}: failover {remote_failover_name!r} has sync '
                         f'disabled — not importing it'
                     )
@@ -1712,7 +1751,7 @@ def _sync_server(job_logger, server, sync_ip_addresses: bool, push_reservations:
                 )
                 continue
             if not scope.failover.sync_enabled:
-                job_logger.debug(
+                job_logger.info(
                     f'Scope "{scope.name}": failover "{scope.failover.name}" has sync disabled — skipping'
                 )
                 continue
@@ -1835,7 +1874,7 @@ def _sync_server(job_logger, server, sync_ip_addresses: bool, push_reservations:
                 )
                 continue
             if not scope.failover.sync_enabled:
-                job_logger.debug(
+                job_logger.info(
                     f'Scope "{scope.name}": failover "{scope.failover.name}" has sync disabled — '
                     f'skipping missing-scope handling'
                 )
@@ -2843,7 +2882,7 @@ def _delete_scopes(job_logger, client, server, deletes):
                 job_logger.warning(f'Scope "{scope_name}": {exc} — skipping delete')
                 continue
             if failover is not None and not failover.sync_enabled:
-                job_logger.debug(
+                job_logger.info(
                     f'Scope "{scope_name}": failover "{failover_name}" has sync disabled — skipping delete'
                 )
                 continue

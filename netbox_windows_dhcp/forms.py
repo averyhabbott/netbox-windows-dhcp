@@ -2,7 +2,9 @@ from django import forms
 from django.utils.html import format_html
 
 from extras.models import Tag
+from ipam.choices import IPAddressStatusChoices
 from ipam.models import VRF, Prefix
+from tenancy.models import Tenant
 from netbox.forms import NetBoxModelBulkEditForm, NetBoxModelForm, NetBoxModelFilterSetForm
 from utilities.forms.utils import add_blank_choice
 from utilities.forms.fields import (
@@ -12,13 +14,14 @@ from utilities.forms.fields import (
 )
 from utilities.forms.constants import BOOLEAN_WITH_BLANK_CHOICES
 from utilities.forms.rendering import FieldSet, InlineFields
-from utilities.forms.widgets import BulkEditNullBooleanSelect
+from utilities.forms.widgets import BulkEditNullBooleanSelect, DateTimePicker
 
 from .choices import DHCPOptionDataTypeChoices, DHCPServerAccessChoices, DHCPServerHealthChoices
 from .locks import check_option_codes, server_owns_scope_info
 from .models import (
     DHCPExclusionRange,
     DHCPFailover,
+    DHCPLeaseInfo,
     DHCPOptionCodeDefinition,
     DHCPOptionValue,
     DHCPPluginSettings,
@@ -492,6 +495,12 @@ class DHCPScopeFilterForm(NetBoxModelFilterSetForm):
         label='Active',
         widget=forms.Select(choices=BOOLEAN_WITH_BLANK_CHOICES),
     )
+    maintenance_mode = forms.NullBooleanField(
+        required=False,
+        label='Maintenance Mode',
+        widget=forms.Select(choices=BOOLEAN_WITH_BLANK_CHOICES),
+    )
+    lease_lifetime = forms.IntegerField(required=False, label='Lease Lifetime (seconds)')
     tag = TagFilterField(model)
 
     def __init__(self, *args, **kwargs):
@@ -507,6 +516,61 @@ class DHCPScopeFilterForm(NetBoxModelFilterSetForm):
         self.fields['vrf'] = DynamicModelMultipleChoiceField(
             queryset=VRF.objects.all(), required=False, label='VRF',
         )
+        self.fields['tenant'] = DynamicModelMultipleChoiceField(
+            queryset=Tenant.objects.all(), required=False, label='Tenant',
+        )
+
+
+class DHCPLeaseFilterForm(NetBoxModelFilterSetForm):
+    model = DHCPLeaseInfo
+    fieldsets = (
+        FieldSet('q', 'filter_id', 'tag'),
+        FieldSet('parent', 'status', 'active', 'lease_hostname', 'dns_name', 'client_id', 'description',
+                 name='Address'),
+        FieldSet('vrf_id', 'tenant_id', name='VRF / Tenant'),
+        FieldSet('scope_id', 'server_id', 'failover_id', name='Scope'),
+        FieldSet('expiration_after', 'expiration_before', name='Expiration'),
+        FieldSet('state_changed_after', 'state_changed_before', name='Active/Inactive Since'),
+    )
+    parent = forms.CharField(
+        required=False,
+        label='Parent Prefix',
+        widget=forms.TextInput(attrs={'placeholder': 'Prefix'}),
+    )
+    status = forms.MultipleChoiceField(
+        required=False, label='Status', choices=IPAddressStatusChoices,
+    )
+    active = forms.NullBooleanField(
+        required=False,
+        label='Active',
+        widget=forms.Select(choices=BOOLEAN_WITH_BLANK_CHOICES),
+    )
+    lease_hostname = forms.CharField(required=False, label='Lease Hostname')
+    dns_name = forms.CharField(required=False, label='DNS Name')
+    client_id = forms.CharField(required=False, label='Client ID')
+    description = forms.CharField(required=False, label='Description')
+    vrf_id = DynamicModelMultipleChoiceField(
+        queryset=VRF.objects.all(), required=False, label='VRF', null_option='Global',
+    )
+    tenant_id = DynamicModelMultipleChoiceField(
+        queryset=Tenant.objects.all(), required=False, label='Tenant', null_option='None',
+    )
+    scope_id = DynamicModelMultipleChoiceField(
+        queryset=DHCPScope.objects.all(), required=False, label='Scope',
+    )
+    server_id = DynamicModelMultipleChoiceField(
+        queryset=DHCPServer.objects.all(), required=False, label='Server',
+    )
+    failover_id = DynamicModelMultipleChoiceField(
+        queryset=DHCPFailover.objects.all(), required=False, label='Failover',
+    )
+    expiration_after = forms.DateTimeField(required=False, label='After', widget=DateTimePicker())
+    expiration_before = forms.DateTimeField(required=False, label='Before', widget=DateTimePicker())
+    state_changed_after = forms.DateTimeField(required=False, label='After', widget=DateTimePicker())
+    state_changed_before = forms.DateTimeField(required=False, label='Before', widget=DateTimePicker())
+    tag = DynamicModelMultipleChoiceField(
+        queryset=Tag.objects.all(), to_field_name='slug', required=False, label='Tag',
+    )
 
 
 class DHCPScopeBulkEditForm(NetBoxModelBulkEditForm):

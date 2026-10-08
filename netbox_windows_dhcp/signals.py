@@ -348,6 +348,48 @@ def ipaddress_post_save(sender, instance, **kwargs):
         logger.warning(f'Failed to enqueue reservation push after save of {instance}: {exc}')
 
 
+@receiver(pre_save, sender='ipam.IPAddress')
+def ipaddress_client_id_pre_save(sender, instance, **kwargs):
+    """
+    Remember the stored DHCP client ID of a DHCP-managed IP, so post_save can tell when
+    someone in NetBox gave it to a different device. One query, and only for an existing
+    IP; the sync's own writes are left to the sync (see _sync_scope_ips).
+    """
+    instance._dhcp_client_id_before = None
+    if not instance.pk:
+        return
+    from .utils import plugin_write_active
+    if plugin_write_active():
+        return
+    from .models import DHCPLeaseInfo
+    row = DHCPLeaseInfo.objects.filter(ip_address_id=instance.pk).values_list(
+        'ip_address__custom_field_data', flat=True,
+    ).first()
+    if row is not None:
+        instance._dhcp_client_id_before = (row.get('dhcp_client_id') or '',)
+
+
+@receiver(post_save, sender='ipam.IPAddress')
+def ipaddress_client_id_post_save(sender, instance, **kwargs):
+    """Restart the Active/Inactive Since clock when a NetBox edit changed the IP's client ID."""
+    before = getattr(instance, '_dhcp_client_id_before', None)
+    instance._dhcp_client_id_before = None
+    if before is None:
+        return
+    from django.utils import timezone
+
+    from .models import DHCPLeaseInfo
+    from .utils import normalize_client_id
+    stored = normalize_client_id(before[0])
+    # As in the sync, a first-time fill (nothing stored) isn't a different device.
+    if not stored or stored == normalize_client_id(instance.custom_field_data.get('dhcp_client_id')):
+        return
+    try:
+        DHCPLeaseInfo.objects.filter(ip_address_id=instance.pk).update(state_changed=timezone.now())
+    except Exception as exc:
+        logger.warning(f'Failed to reset Active/Inactive Since after a client ID change on {instance}: {exc}')
+
+
 @receiver(pre_delete, sender='ipam.IPAddress')
 def ipaddress_pre_delete(sender, instance, **kwargs):
     """When push_reservations is on and a reservation-status IP is deleted, push its scope."""
